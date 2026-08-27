@@ -19,6 +19,7 @@ pub enum AppType {
     OpenCode,
     OpenClaw,
     Hermes,
+    Pi,
 }
 
 impl AppType {
@@ -33,12 +34,24 @@ impl AppType {
             Self::OpenCode => "opencode",
             Self::OpenClaw => "openclaw",
             Self::Hermes => "hermes",
+            Self::Pi => "pi",
         }
     }
 
     /// Returns whether every provider coexists in the application's live file.
     pub fn is_additive_mode(&self) -> bool {
-        matches!(self, Self::OpenCode | Self::OpenClaw | Self::Hermes)
+        matches!(
+            self,
+            Self::OpenCode | Self::OpenClaw | Self::Hermes | Self::Pi
+        )
+    }
+
+    /// Returns whether the application can be routed through the local proxy.
+    pub fn supports_local_proxy(&self) -> bool {
+        matches!(
+            self,
+            Self::Claude | Self::Codex | Self::Gemini | Self::GrokBuild
+        )
     }
 
     /// Iterates over all built-in application types in display order.
@@ -52,6 +65,7 @@ impl AppType {
             Self::OpenCode,
             Self::OpenClaw,
             Self::Hermes,
+            Self::Pi,
         ]
         .into_iter()
     }
@@ -74,7 +88,7 @@ impl fmt::Display for ParseAppTypeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "不支持的应用标识: '{}'。可选值: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes。 (Unsupported app id: '{}'. Allowed: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes.)",
+            "不支持的应用标识: '{}'。可选值: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi。 (Unsupported app id: '{}'. Allowed: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi.)",
             self.app_id, self.app_id
         )
     }
@@ -96,6 +110,7 @@ impl FromStr for AppType {
             "opencode" => Ok(Self::OpenCode),
             "openclaw" => Ok(Self::OpenClaw),
             "hermes" => Ok(Self::Hermes),
+            "pi" => Ok(Self::Pi),
             _ => Err(ParseAppTypeError { app_id: normalized }),
         }
     }
@@ -121,6 +136,7 @@ mod tests {
                 "opencode",
                 "openclaw",
                 "hermes",
+                "pi",
             ]
         );
     }
@@ -141,6 +157,7 @@ mod tests {
             ("opencode", AppType::OpenCode),
             ("openclaw", AppType::OpenClaw),
             ("hermes", AppType::Hermes),
+            ("pi", AppType::Pi),
         ];
 
         for (input, expected) in cases {
@@ -155,7 +172,7 @@ mod tests {
         assert_eq!(error.app_id(), "unknown");
         assert_eq!(
             error.to_string(),
-            "不支持的应用标识: 'unknown'。可选值: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes。 (Unsupported app id: 'unknown'. Allowed: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes.)"
+            "不支持的应用标识: 'unknown'。可选值: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi。 (Unsupported app id: 'unknown'. Allowed: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi.)"
         );
     }
 
@@ -184,8 +201,22 @@ mod tests {
     #[test]
     fn additive_mode_matches_existing_app_semantics() {
         for app in AppType::all() {
-            let expected = matches!(app, AppType::OpenCode | AppType::OpenClaw | AppType::Hermes);
+            let expected = matches!(
+                app,
+                AppType::OpenCode | AppType::OpenClaw | AppType::Hermes | AppType::Pi
+            );
             assert_eq!(app.is_additive_mode(), expected);
+        }
+    }
+
+    #[test]
+    fn local_proxy_support_matches_existing_app_semantics() {
+        for app in AppType::all() {
+            let expected = matches!(
+                app,
+                AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
+            );
+            assert_eq!(app.supports_local_proxy(), expected);
         }
     }
 }
