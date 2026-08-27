@@ -11,6 +11,7 @@
 //! ```
 
 mod app_type;
+pub mod claude;
 pub mod fs;
 
 pub use app_type::{AppType, ParseAppTypeError};
