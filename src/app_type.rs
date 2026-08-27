@@ -77,13 +77,6 @@ pub struct ParseAppTypeError {
     app_id: String,
 }
 
-impl ParseAppTypeError {
-    /// Returns the normalized identifier that failed to parse.
-    pub fn app_id(&self) -> &str {
-        &self.app_id
-    }
-}
-
 impl fmt::Display for ParseAppTypeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -169,7 +162,6 @@ mod tests {
     fn parse_error_preserves_the_existing_message() {
         let error = " Unknown ".parse::<AppType>().expect_err("invalid app id");
 
-        assert_eq!(error.app_id(), "unknown");
         assert_eq!(
             error.to_string(),
             "不支持的应用标识: 'unknown'。可选值: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi。 (Unsupported app id: 'unknown'. Allowed: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi.)"
