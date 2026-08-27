@@ -104,11 +104,16 @@ pub fn write_text_file(path: &Path, data: &str) -> Result<(), FileError> {
 }
 
 /// Replaces a file atomically after writing its complete contents beside it.
+///
+/// On Unix, replacements preserve the destination mode and new files start at
+/// `0600`.
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), FileError> {
     atomic_write_with_unix_mode(path, data, None)
 }
 
 /// Atomically writes a credential file, using mode `0600` on Unix.
+///
+/// Windows access is governed by the destination directory's inherited ACL.
 pub fn atomic_write_private(path: &Path, data: &[u8]) -> Result<(), FileError> {
     atomic_write_with_unix_mode(path, data, Some(0o600))
 }
@@ -127,6 +132,8 @@ fn atomic_write_with_unix_mode(
     path.file_name().ok_or_else(|| FileError::InvalidPath {
         path: path.to_path_buf(),
     })?;
+    #[cfg(unix)]
+    let final_mode = destination_unix_mode(path, unix_mode)?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -145,7 +152,7 @@ fn atomic_write_with_unix_mode(
     drop(file);
 
     #[cfg(unix)]
-    set_unix_permissions(path, &temporary, unix_mode)?;
+    set_unix_permissions(&temporary, final_mode)?;
 
     replace_file(&temporary, path)
 }
@@ -191,18 +198,23 @@ fn create_temporary_file(parent: &Path, timestamp: u128) -> Result<(PathBuf, fs:
 }
 
 #[cfg(unix)]
-fn set_unix_permissions(
-    destination: &Path,
-    temporary: &Path,
-    unix_mode: Option<u32>,
-) -> Result<(), FileError> {
+fn destination_unix_mode(path: &Path, unix_mode: Option<u32>) -> Result<Option<u32>, FileError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let mode = unix_mode.or_else(|| {
-        fs::metadata(destination)
-            .ok()
-            .map(|metadata| metadata.permissions().mode())
-    });
+    if unix_mode.is_some() {
+        return Ok(unix_mode);
+    }
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.permissions().mode())),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(FileError::io(path, source)),
+    }
+}
+
+#[cfg(unix)]
+fn set_unix_permissions(temporary: &Path, mode: Option<u32>) -> Result<(), FileError> {
+    use std::os::unix::fs::PermissionsExt;
+
     if let Some(mode) = mode {
         if let Err(source) = fs::set_permissions(temporary, fs::Permissions::from_mode(mode)) {
             let _ = fs::remove_file(temporary);
@@ -212,74 +224,6 @@ fn set_unix_permissions(
     Ok(())
 }
 
-#[cfg(windows)]
-fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::{Foundation::ERROR_NOT_SUPPORTED, Storage::FileSystem::ReplaceFileW};
-
-    let replaced: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let replacement: Vec<u16> = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut last_error = None;
-
-    for _ in 0..3 {
-        // SAFETY: both buffers are NUL-terminated UTF-16 and live for the call.
-        let replaced_ok = unsafe {
-            ReplaceFileW(
-                replaced.as_ptr(),
-                replacement.as_ptr(),
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        if replaced_ok != 0 {
-            return Ok(());
-        }
-
-        let replace_error = std::io::Error::last_os_error();
-        let replace_not_supported =
-            replace_error.raw_os_error() == Some(ERROR_NOT_SUPPORTED as i32);
-        if replace_error.kind() != std::io::ErrorKind::NotFound && !replace_not_supported {
-            last_error = Some(replace_error);
-            break;
-        }
-
-        match fs::rename(temporary, destination) {
-            Ok(()) => return Ok(()),
-            Err(source)
-                if matches!(
-                    source.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                last_error = Some(source);
-            }
-            Err(source) => {
-                last_error = Some(source);
-                break;
-            }
-        }
-    }
-
-    let source = last_error.unwrap_or_else(std::io::Error::last_os_error);
-    let _ = fs::remove_file(temporary);
-    Err(FileError::AtomicReplace {
-        temporary: temporary.to_path_buf(),
-        destination: destination.to_path_buf(),
-        source,
-    })
-}
-
-#[cfg(not(windows))]
 fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
     if let Err(source) = fs::rename(temporary, destination) {
         let _ = fs::remove_file(temporary);
@@ -360,6 +304,72 @@ mod tests {
         assert!(temporary_files(dir.path()).is_empty());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn failed_windows_replace_preserves_existing_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 1;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.json");
+        fs::write(&path, b"old").expect("seed file");
+        let held_file = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .expect("hold destination without delete sharing");
+
+        let result = atomic_write(&path, b"new");
+
+        assert!(result.is_err());
+        drop(held_file);
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert!(temporary_files(dir.path()).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_an_internal_nul_without_touching_its_prefix() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let prefix = dir.path().join("victim");
+        fs::write(&prefix, b"old").expect("seed prefix file");
+        let invalid_name = OsString::from_wide(&[
+            b'v' as u16,
+            b'i' as u16,
+            b'c' as u16,
+            b't' as u16,
+            b'i' as u16,
+            b'm' as u16,
+            0,
+            b'x' as u16,
+        ]);
+
+        let result = atomic_write(&dir.path().join(invalid_name), b"new");
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(prefix).unwrap(), b"old");
+        assert!(temporary_files(dir.path()).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_supports_windows_long_paths() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut path = dir.path().to_path_buf();
+        for index in 0..8 {
+            path.push(format!("segment-{index}-012345678901234567890123456789"));
+        }
+        path.push("config.json");
+
+        atomic_write(&path, b"old").expect("create long path");
+        atomic_write(&path, b"new").expect("replace long path");
+
+        assert_eq!(fs::read(path).unwrap(), b"new");
+    }
+
     #[cfg(unix)]
     #[test]
     fn atomic_write_supports_long_valid_file_names() {
@@ -387,6 +397,22 @@ mod tests {
             0o600
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_unix_files_start_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.json");
+
+        atomic_write(&path, b"contents").expect("create file");
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[cfg(unix)]
