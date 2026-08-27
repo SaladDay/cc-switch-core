@@ -140,19 +140,22 @@ fn atomic_write_with_unix_mode(
         .as_nanos();
     let (temporary, mut file) = create_temporary_file(parent, timestamp)?;
 
-    if let Err(source) = file
-        .write_all(data)
-        .and_then(|_| file.flush())
-        .and_then(|_| file.sync_all())
-    {
+    let prepared = (|| -> std::io::Result<()> {
+        file.write_all(data)?;
+        file.flush()?;
+        #[cfg(unix)]
+        if let Some(mode) = final_mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+        file.sync_all()
+    })();
+    if let Err(source) = prepared {
         drop(file);
         let _ = fs::remove_file(&temporary);
         return Err(FileError::io(&temporary, source));
     }
     drop(file);
-
-    #[cfg(unix)]
-    set_unix_permissions(&temporary, final_mode)?;
 
     replace_file(&temporary, path)
 }
@@ -209,19 +212,6 @@ fn destination_unix_mode(path: &Path, unix_mode: Option<u32>) -> Result<Option<u
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(FileError::io(path, source)),
     }
-}
-
-#[cfg(unix)]
-fn set_unix_permissions(temporary: &Path, mode: Option<u32>) -> Result<(), FileError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    if let Some(mode) = mode {
-        if let Err(source) = fs::set_permissions(temporary, fs::Permissions::from_mode(mode)) {
-            let _ = fs::remove_file(temporary);
-            return Err(FileError::io(temporary, source));
-        }
-    }
-    Ok(())
 }
 
 fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
