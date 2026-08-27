@@ -1,7 +1,7 @@
 //! Shared domain primitives for CC Switch applications.
 //!
-//! The crate starts with the application identifiers used by CC Switch. More
-//! behavior will move here only when both desktop applications need it.
+//! The crate contains application identifiers and safe file-writing primitives
+//! shared by CC Switch applications.
 //!
 //! ```
 //! use cc_switch_core::AppType;
@@ -11,5 +11,6 @@
 //! ```
 
 mod app_type;
+pub mod fs;
 
 pub use app_type::{AppType, ParseAppTypeError};
