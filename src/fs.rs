@@ -61,19 +61,22 @@ impl FileError {
 
 /// Reads and deserializes a JSON file.
 pub fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T, FileError> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Err(FileError::NotFound {
-                path: path.to_path_buf(),
-            });
-        }
-        Err(source) => return Err(FileError::io(path, source)),
-    };
+    let content = read_text_file(path)?;
     serde_json::from_str(&content).map_err(|source| FileError::JsonParse {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Reads a UTF-8 text file.
+pub fn read_text_file(path: &Path) -> Result<String, FileError> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Err(FileError::NotFound {
+            path: path.to_path_buf(),
+        }),
+        Err(source) => Err(FileError::io(path, source)),
+    }
 }
 
 /// Writes deterministic, pretty-printed JSON and returns the bytes written.
@@ -121,17 +124,14 @@ fn atomic_write_with_unix_mode(
     let parent = usable_parent(path)?;
     fs::create_dir_all(parent).map_err(|source| FileError::io(parent, source))?;
 
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| FileError::InvalidPath {
-            path: path.to_path_buf(),
-        })?
-        .to_os_string();
+    path.file_name().ok_or_else(|| FileError::InvalidPath {
+        path: path.to_path_buf(),
+    })?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let (temporary, mut file) = create_temporary_file(parent, &file_name, timestamp, unix_mode)?;
+    let (temporary, mut file) = create_temporary_file(parent, timestamp)?;
 
     if let Err(source) = file
         .write_all(data)
@@ -161,27 +161,20 @@ fn usable_parent(path: &Path) -> Result<&Path, FileError> {
     }
 }
 
-fn create_temporary_file(
-    parent: &Path,
-    file_name: &std::ffi::OsStr,
-    timestamp: u128,
-    unix_mode: Option<u32>,
-) -> Result<(PathBuf, fs::File), FileError> {
-    #[cfg(not(unix))]
-    let _ = unix_mode;
-
+fn create_temporary_file(parent: &Path, timestamp: u128) -> Result<(PathBuf, fs::File), FileError> {
     let mut last_collision = None;
     for _ in 0..16 {
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut temporary_name = file_name.to_os_string();
-        temporary_name.push(format!(".tmp.{}.{timestamp}.{counter}", std::process::id()));
-        let candidate = parent.join(temporary_name);
+        let candidate = parent.join(format!(
+            ".cc-switch.tmp.{}.{timestamp}.{counter}",
+            std::process::id()
+        ));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        if let Some(mode) = unix_mode {
+        {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(mode);
+            options.mode(0o600);
         }
 
         match options.open(&candidate) {
@@ -320,12 +313,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn temporary_files(dir: &Path, file_name: &str) -> Vec<PathBuf> {
-        let prefix = format!("{file_name}.tmp.");
+    fn temporary_files(dir: &Path) -> Vec<PathBuf> {
         fs::read_dir(dir)
             .expect("read test directory")
             .map(|entry| entry.expect("read entry"))
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".cc-switch.tmp.")
+            })
             .map(|entry| entry.path())
             .collect()
     }
@@ -339,7 +336,7 @@ mod tests {
         atomic_write(&path, b"new").expect("replace file");
 
         assert_eq!(fs::read(&path).expect("read file"), b"new");
-        assert!(temporary_files(path.parent().unwrap(), "config.json").is_empty());
+        assert!(temporary_files(path.parent().unwrap()).is_empty());
     }
 
     #[test]
@@ -360,7 +357,36 @@ mod tests {
 
         assert!(matches!(error, FileError::AtomicReplace { .. }));
         assert!(destination.is_dir());
-        assert!(temporary_files(dir.path(), "config.json").is_empty());
+        assert!(temporary_files(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_supports_long_valid_file_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("a".repeat(240));
+        fs::write(&path, b"old").expect("seed long file name");
+
+        atomic_write(&path, b"new").expect("replace long file name");
+
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert!(temporary_files(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_files_start_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (path, file) = create_temporary_file(dir.path(), 0).expect("create temporary file");
+        drop(file);
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[cfg(unix)]
@@ -427,5 +453,18 @@ mod tests {
             read_json_file::<Value>(&path),
             Err(FileError::JsonParse { .. })
         ));
+    }
+
+    #[test]
+    fn text_read_and_write_share_file_errors() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("notes.txt");
+
+        assert!(matches!(
+            read_text_file(&path),
+            Err(FileError::NotFound { .. })
+        ));
+        write_text_file(&path, "hello").expect("write text");
+        assert_eq!(read_text_file(&path).unwrap(), "hello");
     }
 }
