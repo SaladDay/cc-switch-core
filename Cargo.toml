@@ -1,6 +1,6 @@
 [package]
 name = "cc-switch-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 description = "Shared core primitives for CC Switch applications"
 license = "MIT"
 repository = "https://github.com/SaladDay/cc-switch-core"

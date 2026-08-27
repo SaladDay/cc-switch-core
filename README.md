@@ -1,9 +1,15 @@
 # CC Switch Core
 
-Shared Rust primitives for CC Switch applications.
+Small, reusable Rust primitives shared by CC Switch applications.
 
-The initial API contains only the built-in application identifiers and their
-existing parsing and serialization behavior. Configuration I/O and adapters
-will be added in separate, reviewable changes.
+The `0.1` API contains:
 
-This crate is under early development. Its API may change before `1.0.0`.
+- built-in application identifiers and their existing serialization behavior;
+- deterministic JSON and atomic file-writing primitives;
+- a Claude live-settings projection;
+- preparation of the values consumed by the Codex live-write pipeline.
+
+Business state, databases, UI, provider-specific TOML migrations, OAuth flows,
+catalog generation, and the plugin system remain outside this crate.
+
+The API may change before `1.0.0`.
