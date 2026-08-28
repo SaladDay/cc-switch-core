@@ -14,10 +14,16 @@ pub enum ApplyCommonConfigError {
     JsonNotObject,
     #[error("provider settings must be a JSON object")]
     SettingsNotObject,
+    #[error("Codex provider config must be a TOML string")]
+    ConfigNotString,
     #[error("Codex provider config must be valid TOML")]
     InvalidCodexConfig,
     #[error("Codex common configuration must be valid TOML")]
     InvalidCodexSnippet,
+    #[error("Gemini common configuration contains a provider endpoint or credential key")]
+    GeminiForbiddenKey,
+    #[error("Gemini common configuration values must be strings")]
+    GeminiValueNotString,
 }
 
 /// Applies a shared-database common configuration snippet to one provider.
@@ -57,10 +63,11 @@ pub fn apply(
             let object = result
                 .as_object_mut()
                 .ok_or(ApplyCommonConfigError::SettingsNotObject)?;
-            let config = object
-                .get("config")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let config = match object.get("config") {
+                Some(Value::String(config)) => config.as_str(),
+                Some(Value::Null) | None => "",
+                Some(_) => return Err(ApplyCommonConfigError::ConfigNotString),
+            };
             let mut target = if config.trim().is_empty() {
                 DocumentMut::new()
             } else {
@@ -80,6 +87,14 @@ pub fn apply(
                 serde_json::from_str(snippet).map_err(|_| ApplyCommonConfigError::InvalidJson)?;
             if !source.is_object() {
                 return Err(ApplyCommonConfigError::JsonNotObject);
+            }
+            for (key, value) in source.as_object().expect("object checked above") {
+                if key == "GOOGLE_GEMINI_BASE_URL" || is_sensitive_config_key(key) {
+                    return Err(ApplyCommonConfigError::GeminiForbiddenKey);
+                }
+                if !value.is_string() {
+                    return Err(ApplyCommonConfigError::GeminiValueNotString);
+                }
             }
             let object = settings
                 .as_object()
@@ -102,6 +117,48 @@ pub fn apply(
         | AppType::Hermes
         | AppType::Pi => Ok(settings.clone()),
     }
+}
+
+fn is_sensitive_config_key(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "APIKEY",
+        "API_KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "CREDENTIALS",
+    ];
+    const SUFFIXES: &[&str] = &[
+        "_KEY",
+        "_API_KEY",
+        "_ACCESS_KEY",
+        "_ACCESS_KEY_ID",
+        "_KEY_ID",
+        "_PRIVATE_KEY",
+        "_APIKEY",
+        "_ACCESSKEY",
+        "_SECRETKEY",
+        "_APITOKEN",
+        "_AUTH_TOKEN",
+        "_TOKEN",
+        "_PAT",
+        "_PWD",
+        "_PASS",
+        "_PASSPHRASE",
+        "_CREDS",
+    ];
+    const CONTAINS: &[&str] = &[
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "PRIVATE_KEY",
+        "BEARER_TOKEN",
+    ];
+    let upper = name.to_ascii_uppercase();
+    EXACT.contains(&upper.as_str())
+        || SUFFIXES.iter().any(|suffix| upper.ends_with(suffix))
+        || CONTAINS.iter().any(|part| upper.contains(part))
 }
 
 fn json_deep_merge(target: &mut Value, source: &Value) {
@@ -197,5 +254,40 @@ mod tests {
         assert_eq!(result["env"]["GEMINI_MODEL"], "provider");
         assert_eq!(result["env"]["HTTPS_PROXY"], "http://127.0.0.1:8080");
         assert_eq!(result["settings"]["keep"], true);
+    }
+
+    #[test]
+    fn rejects_non_string_codex_config_instead_of_overwriting_it() {
+        assert_eq!(
+            apply(
+                &AppType::Codex,
+                &json!({"auth": {}, "config": {"future": true}}),
+                Some("model = \"new\""),
+                true,
+            ),
+            Err(ApplyCommonConfigError::ConfigNotString)
+        );
+    }
+
+    #[test]
+    fn rejects_gemini_endpoints_credentials_and_non_string_values() {
+        for snippet in [
+            r#"{"GOOGLE_GEMINI_BASE_URL":"https://attacker.example"}"#,
+            r#"{"GOOGLE_API_KEY":"secret"}"#,
+        ] {
+            assert_eq!(
+                apply(&AppType::Gemini, &json!({"env": {}}), Some(snippet), true),
+                Err(ApplyCommonConfigError::GeminiForbiddenKey)
+            );
+        }
+        assert_eq!(
+            apply(
+                &AppType::Gemini,
+                &json!({"env": {}}),
+                Some(r#"{"GEMINI_MODEL":42}"#),
+                true,
+            ),
+            Err(ApplyCommonConfigError::GeminiValueNotString)
+        );
     }
 }

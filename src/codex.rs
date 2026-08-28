@@ -23,6 +23,7 @@ const WEB_SEARCH_REJECT_HOSTS: &[&str] = &[
     "minimaxi.com",
 ];
 const WEB_SEARCH_REJECT_MODEL_PREFIXES: &[&str] = &["mimo", "longcat", "minimax", "qwen3-coder"];
+const DEEPSEEK_OFFICIAL_CATALOG_HOSTS: &[&str] = &["deepseek.com"];
 const CONFIRMED_TEXT_ONLY_MODELS: &[&str] = &[
     "ark-code-latest",
     "deepseek-chat",
@@ -89,6 +90,7 @@ impl fmt::Display for PrepareLiveSnapshotError {
 impl Error for PrepareLiveSnapshotError {}
 
 /// Extracts the values consumed by the Codex live-write pipeline.
+#[deprecated(note = "use prepare_strict_live_snapshot for shared live writers")]
 pub fn prepare_live_snapshot(
     settings: &Value,
 ) -> Result<PreparedLiveSnapshot, PrepareLiveSnapshotError> {
@@ -170,6 +172,13 @@ pub struct PreparedNativeCatalog {
     pub managed: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeCatalogOwnership {
+    /// True only when the caller has durable evidence that CC Switch wrote the
+    /// current `web_search = "disabled"` sentinel.
+    pub web_search_disabled: bool,
+}
+
 impl fmt::Debug for PreparedNativeCatalog {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -191,6 +200,8 @@ pub enum PrepareNativeLiveError {
     ModelCatalogNotObject,
     #[error("Codex modelCatalog.models must be an array")]
     ModelsNotArray,
+    #[error("every Codex modelCatalog row must contain a non-empty string model id")]
+    InvalidCatalogModel,
     #[error("bundled Codex model catalog template is invalid")]
     InvalidCatalogTemplate,
 }
@@ -260,12 +271,14 @@ pub fn prepare_provider_live_config(
     auth: &Value,
     config: &str,
 ) -> Result<String, PrepareNativeLiveError> {
-    let Some(token) = auth
+    let token = auth
         .get("OPENAI_API_KEY")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|token| !token.is_empty())
-    else {
+        .map(str::to_owned)
+        .or_else(|| extract_experimental_bearer_token(config));
+    let Some(token) = token else {
         return Ok(config.to_owned());
     };
     if config.trim().is_empty() {
@@ -282,11 +295,11 @@ pub fn prepare_provider_live_config(
             .and_then(|providers| providers.get_mut(&provider_id))
             .and_then(|item| item.as_table_mut())
         {
-            provider["experimental_bearer_token"] = toml_edit::value(token);
+            provider["experimental_bearer_token"] = toml_edit::value(&token);
             return Ok(document.to_string());
         }
     }
-    document["experimental_bearer_token"] = toml_edit::value(token);
+    document["experimental_bearer_token"] = toml_edit::value(&token);
     Ok(document.to_string())
 }
 
@@ -295,6 +308,7 @@ pub fn prepare_provider_live_config(
 pub fn prepare_native_model_catalog(
     settings: &Value,
     config: &str,
+    ownership: NativeCatalogOwnership,
 ) -> Result<PreparedNativeCatalog, PrepareNativeLiveError> {
     let Some(catalog_settings) = settings.get("modelCatalog") else {
         return Ok(PreparedNativeCatalog {
@@ -310,7 +324,7 @@ pub fn prepare_native_model_catalog(
         .get("models")
         .and_then(Value::as_array)
         .ok_or(PrepareNativeLiveError::ModelsNotArray)?;
-    let specs = catalog_specs(models);
+    let specs = catalog_specs(models)?;
     let mut document = if config.trim().is_empty() {
         DocumentMut::new()
     } else {
@@ -321,7 +335,9 @@ pub fn prepare_native_model_catalog(
 
     if specs.is_empty() {
         remove_owned_catalog_pointer(&mut document);
-        remove_owned_web_search_sentinel(&mut document);
+        if ownership.web_search_disabled {
+            remove_owned_web_search_sentinel(&mut document);
+        }
         return Ok(PreparedNativeCatalog {
             config: document.to_string(),
             catalog: None,
@@ -332,7 +348,7 @@ pub fn prepare_native_model_catalog(
     set_owned_catalog_pointer(&mut document);
     if native_gateway_rejects_web_search(&document.to_string()) {
         document["web_search"] = toml_edit::value("disabled");
-    } else {
+    } else if ownership.web_search_disabled {
         remove_owned_web_search_sentinel(&mut document);
     }
     let default_context_window = document
@@ -341,15 +357,24 @@ pub fn prepare_native_model_catalog(
         .and_then(|value| u64::try_from(value).ok())
         .filter(|value| *value > 0)
         .unwrap_or(128_000);
-    let template: Value = serde_json::from_str(include_str!(
-        "resources/codex_native_responses_template.json"
-    ))
-    .map_err(|_| PrepareNativeLiveError::InvalidCatalogTemplate)?;
-    let entries: Vec<Value> = specs
-        .iter()
-        .enumerate()
-        .map(|(index, spec)| catalog_entry(&template, spec, index, default_context_window))
-        .collect();
+    let entries: Vec<Value> = if let Some(vendor_models) = official_vendor_catalog_models(&document)
+    {
+        specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| vendor_catalog_entry(&vendor_models, spec, index))
+            .collect()
+    } else {
+        let template: Value = serde_json::from_str(include_str!(
+            "resources/codex_native_responses_template.json"
+        ))
+        .map_err(|_| PrepareNativeLiveError::InvalidCatalogTemplate)?;
+        specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| catalog_entry(&template, spec, index, default_context_window))
+            .collect()
+    };
     Ok(PreparedNativeCatalog {
         config: document.to_string(),
         catalog: Some(json!({"models": entries})),
@@ -373,6 +398,33 @@ fn active_provider_id(document: &DocumentMut) -> Option<String> {
         .and_then(|item| item.as_str())
         .map(str::trim)
         .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+fn extract_experimental_bearer_token(config: &str) -> Option<String> {
+    if !config.contains("experimental_bearer_token") {
+        return None;
+    }
+    let document = config.parse::<DocumentMut>().ok()?;
+    let top_level = || {
+        document
+            .get("experimental_bearer_token")
+            .and_then(|item| item.as_str())
+    };
+    let token = match active_provider_id(&document) {
+        Some(id) if is_custom_provider_id(&id) => document
+            .get("model_providers")
+            .and_then(|item| item.as_table_like())
+            .and_then(|providers| providers.get(&id))
+            .and_then(|item| item.as_table_like())
+            .and_then(|provider| provider.get("experimental_bearer_token"))
+            .and_then(|item| item.as_str())
+            .or_else(top_level),
+        _ => top_level(),
+    };
+    token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
         .map(str::to_owned)
 }
 
@@ -447,6 +499,75 @@ fn native_gateway_rejects_web_search(config: &str) -> bool {
         })
 }
 
+fn official_vendor_catalog_models(document: &DocumentMut) -> Option<Vec<Value>> {
+    let provider_id = document
+        .get("model_provider")
+        .and_then(|item| item.as_str());
+    let provider_base_url = provider_id.and_then(|id| {
+        document
+            .get("model_providers")
+            .and_then(|item| item.as_table_like())
+            .and_then(|providers| providers.get(id))
+            .and_then(|item| item.as_table_like())
+            .and_then(|provider| provider.get("base_url"))
+            .and_then(|item| item.as_str())
+    });
+    let base_url = provider_base_url
+        .or_else(|| document.get("base_url").and_then(|item| item.as_str()))?
+        .to_ascii_lowercase();
+    if !DEEPSEEK_OFFICIAL_CATALOG_HOSTS
+        .iter()
+        .any(|host| base_url.contains(host))
+    {
+        return None;
+    }
+    let catalog: Value = serde_json::from_str(include_str!(
+        "resources/codex_deepseek_catalog_template.json"
+    ))
+    .ok()?;
+    catalog.get("models")?.as_array().cloned()
+}
+
+fn vendor_catalog_entry(vendor_models: &[Value], spec: &CatalogSpec, priority: usize) -> Value {
+    let matched = vendor_models.iter().find(|entry| {
+        entry
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| slug.eq_ignore_ascii_case(&spec.model))
+    });
+    let mut entry = matched
+        .cloned()
+        .or_else(|| vendor_models.first().cloned())
+        .unwrap_or_else(|| json!({}));
+    let Some(object) = entry.as_object_mut() else {
+        return json!({});
+    };
+    if matched.is_none() {
+        let display_name = spec.display_name.as_deref().unwrap_or(&spec.model);
+        object.insert("slug".to_owned(), json!(spec.model));
+        object.insert("display_name".to_owned(), json!(display_name));
+        object.insert("description".to_owned(), json!(display_name));
+        object.insert("priority".to_owned(), json!(1000 + priority));
+    }
+    if let Some(display_name) = &spec.display_name {
+        object.insert("display_name".to_owned(), json!(display_name));
+    }
+    if let Some(context_window) = spec.context_window {
+        object.insert("context_window".to_owned(), json!(context_window));
+        object.insert("max_context_window".to_owned(), json!(context_window));
+    }
+    if let Some(parallel) = spec.parallel_tools {
+        object.insert("supports_parallel_tool_calls".to_owned(), json!(parallel));
+    }
+    if let Some(modalities) = &spec.modalities {
+        object.insert("input_modalities".to_owned(), json!(modalities));
+    }
+    if let Some(instructions) = &spec.base_instructions {
+        object.insert("base_instructions".to_owned(), json!(instructions));
+    }
+    entry
+}
+
 #[derive(Debug)]
 struct CatalogSpec {
     model: String,
@@ -457,43 +578,43 @@ struct CatalogSpec {
     base_instructions: Option<String>,
 }
 
-fn catalog_specs(models: &[Value]) -> Vec<CatalogSpec> {
+fn catalog_specs(models: &[Value]) -> Result<Vec<CatalogSpec>, PrepareNativeLiveError> {
     let mut seen = HashSet::new();
-    models
-        .iter()
-        .filter_map(|model| {
-            let id = model
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())?;
-            if !seen.insert(id.to_owned()) {
-                return None;
-            }
-            Some(CatalogSpec {
-                model: id.to_owned(),
-                display_name: string_alias(model, "displayName", "display_name"),
-                context_window: positive_u64_alias(model, "contextWindow", "context_window"),
-                parallel_tools: model
-                    .get("supportsParallelToolCalls")
-                    .or_else(|| model.get("supports_parallel_tool_calls"))
-                    .and_then(Value::as_bool),
-                modalities: model
-                    .get("inputModalities")
-                    .or_else(|| model.get("input_modalities"))
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|items| !items.is_empty()),
-                base_instructions: string_alias(model, "baseInstructions", "base_instructions"),
-            })
-        })
-        .collect()
+    let mut specs = Vec::with_capacity(models.len());
+    for model in models {
+        let id = model
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or(PrepareNativeLiveError::InvalidCatalogModel)?;
+        if !seen.insert(id.to_owned()) {
+            continue;
+        }
+        specs.push(CatalogSpec {
+            model: id.to_owned(),
+            display_name: string_alias(model, "displayName", "display_name"),
+            context_window: positive_u64_alias(model, "contextWindow", "context_window"),
+            parallel_tools: model
+                .get("supportsParallelToolCalls")
+                .or_else(|| model.get("supports_parallel_tool_calls"))
+                .and_then(Value::as_bool),
+            modalities: model
+                .get("inputModalities")
+                .or_else(|| model.get("input_modalities"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty()),
+            base_instructions: string_alias(model, "baseInstructions", "base_instructions"),
+        });
+    }
+    Ok(specs)
 }
 
 fn string_alias(value: &Value, first: &str, second: &str) -> Option<String> {
@@ -509,7 +630,7 @@ fn string_alias(value: &Value, first: &str, second: &str) -> Option<String> {
 fn positive_u64_alias(value: &Value, first: &str, second: &str) -> Option<u64> {
     match value.get(first).or_else(|| value.get(second)) {
         Some(Value::Number(value)) => value.as_u64().filter(|value| *value > 0),
-        Some(Value::String(value)) => value.parse().ok().filter(|value| *value > 0),
+        Some(Value::String(value)) => value.trim().parse().ok().filter(|value| *value > 0),
         _ => None,
     }
 }
@@ -569,6 +690,7 @@ fn catalog_modalities(model: &str, declared: Option<&[String]>) -> Vec<&'static 
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -697,6 +819,7 @@ mod tests {
         let projection = prepare_native_model_catalog(
             &settings,
             "model = \"qwen3-coder-plus\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com\"\n",
+            NativeCatalogOwnership::default(),
         )
         .expect("valid catalog");
 
@@ -721,7 +844,9 @@ mod tests {
     #[test]
     fn absent_catalog_does_not_claim_or_remove_existing_projection() {
         let config = "model_catalog_json = \"user-catalog.json\"\n";
-        let projection = prepare_native_model_catalog(&json!({}), config).expect("valid config");
+        let projection =
+            prepare_native_model_catalog(&json!({}), config, NativeCatalogOwnership::default())
+                .expect("valid config");
 
         assert!(!projection.managed);
         assert_eq!(projection.config, config);
@@ -738,5 +863,79 @@ mod tests {
         let debug = format!("{projection:?}");
         assert!(!debug.contains("secret"));
         assert!(!debug.contains("experimental_bearer_token"));
+    }
+
+    #[test]
+    fn legacy_top_level_bearer_token_is_projected_into_the_active_provider() {
+        let config = "model_provider = \"custom\"\nexperimental_bearer_token = \"legacy\"\n[model_providers.custom]\nbase_url = \"https://example.com\"\n";
+        let projected = prepare_provider_live_config(&json!({}), config).expect("valid config");
+        let document = projected.parse::<DocumentMut>().expect("TOML");
+        assert_eq!(
+            document["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+            Some("legacy")
+        );
+    }
+
+    #[test]
+    fn invalid_nonempty_catalog_rows_are_rejected_instead_of_clearing_state() {
+        assert_eq!(
+            prepare_native_model_catalog(
+                &json!({"modelCatalog": {"models": [{"model": 42}]}}),
+                "model_catalog_json = \"cc-switch-model-catalog.json\"\n",
+                NativeCatalogOwnership::default(),
+            ),
+            Err(PrepareNativeLiveError::InvalidCatalogModel)
+        );
+    }
+
+    #[test]
+    fn manual_web_search_setting_is_preserved_without_ownership_evidence() {
+        let projection = prepare_native_model_catalog(
+            &json!({"modelCatalog": {"models": [{"model": "gpt-compatible"}]}}),
+            "model = \"gpt-compatible\"\nweb_search = \"disabled\"\n",
+            NativeCatalogOwnership::default(),
+        )
+        .expect("valid catalog");
+        assert_eq!(
+            projection.config.parse::<DocumentMut>().unwrap()["web_search"].as_str(),
+            Some("disabled")
+        );
+
+        let cleared = prepare_native_model_catalog(
+            &json!({"modelCatalog": {"models": []}}),
+            "model_catalog_json = \"cc-switch-model-catalog.json\"\nweb_search = \"disabled\"\n",
+            NativeCatalogOwnership {
+                web_search_disabled: true,
+            },
+        )
+        .expect("owned cleanup");
+        assert!(cleared
+            .config
+            .parse::<DocumentMut>()
+            .unwrap()
+            .get("web_search")
+            .is_none());
+    }
+
+    #[test]
+    fn deepseek_uses_the_official_catalog_and_trimmed_context_overrides() {
+        let projection = prepare_native_model_catalog(
+            &json!({"modelCatalog": {"models": [{
+                "model": "deepseek-v4-pro",
+                "contextWindow": " 64000 "
+            }]}}),
+            "model = \"deepseek-v4-pro\"\nmodel_provider = \"deepseek\"\n[model_providers.deepseek]\nbase_url = \"https://api.deepseek.com\"\n",
+            NativeCatalogOwnership::default(),
+        )
+        .expect("official DeepSeek catalog");
+        let models = projection.catalog.unwrap()["models"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(models[0]["context_window"], 64000);
+        assert_eq!(models[0]["apply_patch_tool_type"], "freeform");
+        assert!(models[0]["base_instructions"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
     }
 }
