@@ -23,6 +23,11 @@ pub mod openclaw;
 pub mod opencode;
 pub mod pi;
 mod provider;
+mod registry;
 
 pub use app_type::{AppType, ParseAppTypeError};
 pub use provider::{ProviderEntry, ProviderSnapshot};
+pub use registry::{
+    builtin_app_registry, AppCapability, AppDescriptor, BuiltinAppRegistry,
+    ProviderConfigurationMode,
+};

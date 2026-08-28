@@ -5,6 +5,7 @@ Small, reusable Rust primitives shared by CC Switch applications.
 The `0.1` API contains:
 
 - built-in application identifiers and their existing serialization behavior;
+- a built-in application registry with product-neutral metadata and capabilities;
 - source-neutral, lossless provider snapshots;
 - redacted provider entries for additive application configs;
 - deterministic JSON and atomic file-writing primitives;
