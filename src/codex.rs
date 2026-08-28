@@ -2,6 +2,7 @@
 
 use std::{collections::HashSet, error::Error, fmt};
 
+use http::Uri;
 use serde_json::{json, Value};
 use thiserror::Error;
 use toml_edit::DocumentMut;
@@ -204,6 +205,8 @@ pub enum PrepareNativeLiveError {
     InvalidCatalogModel,
     #[error("bundled Codex model catalog template is invalid")]
     InvalidCatalogTemplate,
+    #[error("Codex web_search is user-managed and conflicts with the required gateway setting")]
+    WebSearchConflict,
 }
 
 /// Whether an auth object carries material that can authenticate Codex.
@@ -211,12 +214,9 @@ pub fn auth_has_login_material(auth: &Value) -> bool {
     let Some(object) = auth.as_object() else {
         return false;
     };
-    object.iter().any(|(key, value)| {
-        if key == "auth_mode" {
-            return false;
-        }
-        value_is_present(value)
-    })
+    object
+        .iter()
+        .any(|(key, value)| auth_field_has_login_material(key, value, true))
 }
 
 /// Returns true for first-class login credentials, excluding a provider API
@@ -225,20 +225,57 @@ pub fn auth_has_credential_login_material(auth: &Value) -> bool {
     let Some(object) = auth.as_object() else {
         return false;
     };
-    if ["personal_access_token", "agent_identity", "bedrock_api_key"]
+    object
         .iter()
-        .any(|key| object.get(*key).is_some_and(value_is_present))
-    {
+        .any(|(key, value)| auth_field_has_login_material(key, value, false))
+}
+
+fn auth_field_has_login_material(key: &str, value: &Value, include_provider_api_key: bool) -> bool {
+    match key {
+        "auth_mode" | "last_refresh" => false,
+        "OPENAI_API_KEY" => include_provider_api_key && nonempty_string(value),
+        "tokens" => token_map_has_login_material(value),
+        "personal_access_token" => nonempty_string(value),
+        "agent_identity" => agent_identity_has_login_material(value),
+        "bedrock_api_key" => bedrock_api_key_has_login_material(value),
+        // Unknown non-empty fields may be new official credential carriers.
+        // Both predicates preserve them so cleanup cannot destroy future auth.
+        _ => value_is_present(value),
+    }
+}
+
+fn nonempty_string(value: &Value) -> bool {
+    value
+        .as_str()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn token_map_has_login_material(value: &Value) -> bool {
+    value.as_object().is_some_and(|tokens| {
+        ["id_token", "access_token", "refresh_token"]
+            .iter()
+            .any(|key| tokens.get(*key).is_some_and(nonempty_string))
+    })
+}
+
+fn agent_identity_has_login_material(value: &Value) -> bool {
+    if nonempty_string(value) {
         return true;
     }
-    object
-        .get("tokens")
-        .and_then(Value::as_object)
-        .is_some_and(|tokens| {
-            ["id_token", "access_token", "refresh_token"]
-                .iter()
-                .any(|key| tokens.get(*key).is_some_and(value_is_present))
-        })
+    value.as_object().is_some_and(|identity| {
+        ["agent_runtime_id", "agent_private_key"]
+            .iter()
+            .all(|key| identity.get(*key).is_some_and(nonempty_string))
+    })
+}
+
+fn bedrock_api_key_has_login_material(value: &Value) -> bool {
+    value.as_object().is_some_and(|auth| {
+        ["api_key", "region"]
+            .iter()
+            .all(|key| auth.get(*key).is_some_and(nonempty_string))
+    })
 }
 
 /// Identifies the residue produced by an API-key switch without mistaking an
@@ -347,7 +384,13 @@ pub fn prepare_native_model_catalog(
 
     set_owned_catalog_pointer(&mut document);
     if native_gateway_rejects_web_search(&document.to_string()) {
-        document["web_search"] = toml_edit::value("disabled");
+        match document.get("web_search") {
+            None => document["web_search"] = toml_edit::value("disabled"),
+            Some(item) if item.as_str() == Some("disabled") => {
+                document["web_search"] = toml_edit::value("disabled");
+            }
+            Some(_) => return Err(PrepareNativeLiveError::WebSearchConflict),
+        }
     } else if ownership.web_search_disabled {
         remove_owned_web_search_sentinel(&mut document);
     }
@@ -438,7 +481,7 @@ fn set_owned_catalog_pointer(document: &mut DocumentMut) {
     let owned_or_absent = document
         .get("model_catalog_json")
         .and_then(|item| item.as_str())
-        .map(|path| path.rsplit(['/', '\\']).next() == Some(MODEL_CATALOG_FILENAME))
+        .map(|path| path == MODEL_CATALOG_FILENAME)
         .unwrap_or(true);
     if owned_or_absent {
         document["model_catalog_json"] = toml_edit::value(MODEL_CATALOG_FILENAME);
@@ -449,7 +492,7 @@ fn remove_owned_catalog_pointer(document: &mut DocumentMut) {
     let owned = document
         .get("model_catalog_json")
         .and_then(|item| item.as_str())
-        .is_some_and(|path| path.rsplit(['/', '\\']).next() == Some(MODEL_CATALOG_FILENAME));
+        .is_some_and(|path| path == MODEL_CATALOG_FILENAME);
     if owned {
         document.as_table_mut().remove("model_catalog_json");
     }
@@ -479,12 +522,7 @@ fn native_gateway_rejects_web_search(config: &str) -> bool {
     });
     let base_url =
         provider_base_url.or_else(|| document.get("base_url").and_then(|item| item.as_str()));
-    if base_url.is_some_and(|url| {
-        let url = url.to_ascii_lowercase();
-        WEB_SEARCH_REJECT_HOSTS
-            .iter()
-            .any(|host| url.contains(host))
-    }) {
+    if base_url.is_some_and(|url| endpoint_matches_any_domain(url, WEB_SEARCH_REJECT_HOSTS)) {
         return true;
     }
     document
@@ -512,13 +550,9 @@ fn official_vendor_catalog_models(document: &DocumentMut) -> Option<Vec<Value>> 
             .and_then(|provider| provider.get("base_url"))
             .and_then(|item| item.as_str())
     });
-    let base_url = provider_base_url
-        .or_else(|| document.get("base_url").and_then(|item| item.as_str()))?
-        .to_ascii_lowercase();
-    if !DEEPSEEK_OFFICIAL_CATALOG_HOSTS
-        .iter()
-        .any(|host| base_url.contains(host))
-    {
+    let base_url =
+        provider_base_url.or_else(|| document.get("base_url").and_then(|item| item.as_str()))?;
+    if !endpoint_matches_any_domain(base_url, DEEPSEEK_OFFICIAL_CATALOG_HOSTS) {
         return None;
     }
     let catalog: Value = serde_json::from_str(include_str!(
@@ -526,6 +560,24 @@ fn official_vendor_catalog_models(document: &DocumentMut) -> Option<Vec<Value>> 
     ))
     .ok()?;
     catalog.get("models")?.as_array().cloned()
+}
+
+fn endpoint_matches_any_domain(endpoint: &str, domains: &[&str]) -> bool {
+    let Ok(uri) = endpoint.trim().parse::<Uri>() else {
+        return false;
+    };
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return false;
+    }
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    !host.is_empty()
+        && domains.iter().any(|domain| {
+            let domain = domain.to_ascii_lowercase();
+            host == domain || host.ends_with(&format!(".{domain}"))
+        })
 }
 
 fn vendor_catalog_entry(vendor_models: &[Value], spec: &CatalogSpec, priority: usize) -> Value {
@@ -806,6 +858,41 @@ mod tests {
         assert!(!should_write_auth(Some("official"), &json!({}), true));
         assert!(!live_auth_is_stale_third_party_residue(&oauth));
         assert!(live_auth_is_stale_third_party_residue(&stale));
+
+        for malformed in [json!(42), json!({"unexpected": true}), json!(["value"])] {
+            assert!(!auth_has_login_material(
+                &json!({"OPENAI_API_KEY": malformed})
+            ));
+        }
+        for malformed in [
+            json!({"tokens": {"access_token": 42}}),
+            json!({"personal_access_token": 42}),
+            json!({"agent_identity": {"agent_runtime_id": "id"}}),
+            json!({"bedrock_api_key": {"api_key": "secret"}}),
+        ] {
+            assert!(!auth_has_login_material(&malformed));
+            assert!(!auth_has_credential_login_material(&malformed));
+        }
+        assert!(auth_has_login_material(&json!({"future_auth": true})));
+        assert!(auth_has_credential_login_material(
+            &json!({"future_auth": true})
+        ));
+        assert!(!auth_has_login_material(
+            &json!({"last_refresh": "2026-08-28T00:00:00Z"})
+        ));
+        assert!(!live_auth_is_stale_third_party_residue(&json!({
+            "OPENAI_API_KEY": "old",
+            "future_auth": {"session": "valid"}
+        })));
+        assert!(auth_has_login_material(&json!({
+            "agent_identity": {
+                "agent_runtime_id": "runtime",
+                "agent_private_key": "private"
+            }
+        })));
+        assert!(auth_has_login_material(&json!({
+            "bedrock_api_key": {"api_key": "secret", "region": "us-east-1"}
+        })));
     }
 
     #[test]
@@ -851,6 +938,23 @@ mod tests {
         assert!(!projection.managed);
         assert_eq!(projection.config, config);
         assert!(projection.catalog.is_none());
+    }
+
+    #[test]
+    fn catalog_pointer_ownership_requires_the_exact_written_value() {
+        let custom = "/user/custom/cc-switch-model-catalog.json";
+        for models in [json!([]), json!([{"model": "custom"}])] {
+            let projection = prepare_native_model_catalog(
+                &json!({"modelCatalog": {"models": models}}),
+                &format!("model_catalog_json = {custom:?}\n"),
+                NativeCatalogOwnership::default(),
+            )
+            .expect("valid custom pointer");
+            assert_eq!(
+                projection.config.parse::<DocumentMut>().unwrap()["model_catalog_json"].as_str(),
+                Some(custom)
+            );
+        }
     }
 
     #[test]
@@ -918,6 +1022,41 @@ mod tests {
     }
 
     #[test]
+    fn gateway_sentinel_does_not_overwrite_user_web_search_without_ownership() {
+        let settings = json!({"modelCatalog": {"models": [{"model": "qwen3-coder-plus"}]}});
+        assert_eq!(
+            prepare_native_model_catalog(
+                &settings,
+                "model = \"qwen3-coder-plus\"\nweb_search = \"enabled\"\n",
+                NativeCatalogOwnership::default(),
+            ),
+            Err(PrepareNativeLiveError::WebSearchConflict)
+        );
+        assert_eq!(
+            prepare_native_model_catalog(
+                &settings,
+                "model = \"qwen3-coder-plus\"\nweb_search = \"enabled\"\n",
+                NativeCatalogOwnership {
+                    web_search_disabled: true,
+                },
+            ),
+            Err(PrepareNativeLiveError::WebSearchConflict)
+        );
+        let owned = prepare_native_model_catalog(
+            &settings,
+            "model = \"qwen3-coder-plus\"\nweb_search = \"disabled\"\n",
+            NativeCatalogOwnership {
+                web_search_disabled: true,
+            },
+        )
+        .expect("owned sentinel remains disabled");
+        assert_eq!(
+            owned.config.parse::<DocumentMut>().unwrap()["web_search"].as_str(),
+            Some("disabled")
+        );
+    }
+
+    #[test]
     fn deepseek_uses_the_official_catalog_and_trimmed_context_overrides() {
         let projection = prepare_native_model_catalog(
             &json!({"modelCatalog": {"models": [{
@@ -937,5 +1076,38 @@ mod tests {
         assert!(models[0]["base_instructions"]
             .as_str()
             .is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
+    fn vendor_capabilities_require_a_real_domain_boundary() {
+        for endpoint in [
+            "https://deepseek.com.evil.example/v1",
+            "https://evil.example/v1?upstream=deepseek.com",
+            "https://deepseek.com@evil.example/v1",
+            "https://evil.example\\@api.deepseek.com/v1",
+        ] {
+            let config = format!(
+                "model = \"deepseek-v4-pro\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = {endpoint:?}\n"
+            );
+            let projection = prepare_native_model_catalog(
+                &json!({"modelCatalog": {"models": [{"model": "deepseek-v4-pro"}]}}),
+                &config,
+                NativeCatalogOwnership::default(),
+            )
+            .expect("neutral catalog");
+            assert_ne!(
+                projection.catalog.unwrap()["models"][0]["apply_patch_tool_type"],
+                "freeform"
+            );
+        }
+
+        assert!(endpoint_matches_any_domain(
+            "https://api.deepseek.com/v1",
+            DEEPSEEK_OFFICIAL_CATALOG_HOSTS
+        ));
+        assert!(!endpoint_matches_any_domain(
+            "https://xiaomimimo.com.evil.example/v1",
+            WEB_SEARCH_REJECT_HOSTS
+        ));
     }
 }

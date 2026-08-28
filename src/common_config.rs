@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 use thiserror::Error;
-use toml_edit::{DocumentMut, Item, TableLike};
+use toml_edit::{DocumentMut, Item, TableLike, Value as TomlValue};
 
 use crate::AppType;
 
@@ -20,6 +20,12 @@ pub enum ApplyCommonConfigError {
     InvalidCodexConfig,
     #[error("Codex common configuration must be valid TOML")]
     InvalidCodexSnippet,
+    #[error("Claude common configuration contains a provider-specific or credential key")]
+    ClaudeForbiddenKey,
+    #[error("Claude common configuration env must be a JSON object")]
+    ClaudeEnvNotObject,
+    #[error("Codex common configuration contains a provider-specific or credential key")]
+    CodexForbiddenKey,
     #[error("Gemini common configuration contains a provider endpoint or credential key")]
     GeminiForbiddenKey,
     #[error("Gemini common configuration values must be strings")]
@@ -51,6 +57,7 @@ pub fn apply(
             if !source.is_object() {
                 return Err(ApplyCommonConfigError::JsonNotObject);
             }
+            validate_claude_snippet(&source)?;
             let mut result = settings.clone();
             if !result.is_object() {
                 return Err(ApplyCommonConfigError::SettingsNotObject);
@@ -78,6 +85,7 @@ pub fn apply(
             let source = snippet
                 .parse::<DocumentMut>()
                 .map_err(|_| ApplyCommonConfigError::InvalidCodexSnippet)?;
+            validate_codex_snippet(&source)?;
             merge_toml_table_like(target.as_table_mut(), source.as_table());
             object.insert("config".to_owned(), Value::String(target.to_string()));
             Ok(result)
@@ -89,7 +97,7 @@ pub fn apply(
                 return Err(ApplyCommonConfigError::JsonNotObject);
             }
             for (key, value) in source.as_object().expect("object checked above") {
-                if key == "GOOGLE_GEMINI_BASE_URL" || is_sensitive_config_key(key) {
+                if is_gemini_route_key(key) || is_sensitive_config_key(key) {
                     return Err(ApplyCommonConfigError::GeminiForbiddenKey);
                 }
                 if !value.is_string() {
@@ -119,6 +127,124 @@ pub fn apply(
     }
 }
 
+fn validate_claude_snippet(source: &Value) -> Result<(), ApplyCommonConfigError> {
+    const TOP_LEVEL_FORBIDDEN: &[&str] = &["apiBaseUrl", "primaryModel", "smallFastModel"];
+
+    let object = source
+        .as_object()
+        .ok_or(ApplyCommonConfigError::JsonNotObject)?;
+    if json_contains_sensitive_key(source)
+        || object
+            .keys()
+            .any(|key| TOP_LEVEL_FORBIDDEN.contains(&key.as_str()))
+    {
+        return Err(ApplyCommonConfigError::ClaudeForbiddenKey);
+    }
+    let Some(env) = object.get("env") else {
+        return Ok(());
+    };
+    let env = env
+        .as_object()
+        .ok_or(ApplyCommonConfigError::ClaudeEnvNotObject)?;
+    if env.keys().any(|key| is_claude_route_key(key)) {
+        return Err(ApplyCommonConfigError::ClaudeForbiddenKey);
+    }
+    Ok(())
+}
+
+fn validate_codex_snippet(source: &DocumentMut) -> Result<(), ApplyCommonConfigError> {
+    const FORBIDDEN: &[&str] = &[
+        "model",
+        "model_provider",
+        "base_url",
+        "wire_api",
+        "model_providers",
+        "experimental_bearer_token",
+        "model_catalog_json",
+        "mcp_servers",
+        "profile",
+        "profiles",
+        "review_model",
+    ];
+    let root = source.as_table();
+    if root.iter().any(|(key, _)| FORBIDDEN.contains(&key))
+        || root.iter().any(|(key, item)| {
+            is_sensitive_config_key(key) || toml_item_contains_sensitive_key(item)
+        })
+        || root
+            .get("mcp")
+            .and_then(Item::as_table_like)
+            .is_some_and(|mcp| mcp.contains_key("servers"))
+        || root.get("web_search").and_then(Item::as_str) == Some("disabled")
+    {
+        return Err(ApplyCommonConfigError::CodexForbiddenKey);
+    }
+    Ok(())
+}
+
+fn is_claude_route_key(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.ends_with("_BASE_URL")
+        || upper == "ENDPOINT_ID"
+        || upper.starts_with("CLAUDE_CODE_USE_")
+        || upper.starts_with("AWS_")
+        || upper.starts_with("GOOGLE_")
+        || upper.contains("VERTEX")
+        || upper.contains("FOUNDRY")
+        || ((upper.starts_with("ANTHROPIC_") || upper.starts_with("CLAUDE_CODE_"))
+            && (upper.contains("MODEL")
+                || matches!(
+                    upper.as_str(),
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS" | "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+                )))
+}
+
+fn is_gemini_route_key(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "GEMINI_MODEL"
+        || upper.ends_with("_BASE_URL")
+        || upper == "GOOGLE_GENAI_USE_VERTEXAI"
+        || upper.starts_with("GOOGLE_CLOUD_")
+        || upper.contains("VERTEX")
+}
+
+fn json_contains_sensitive_key(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| is_sensitive_config_key(key) || json_contains_sensitive_key(value)),
+        Value::Array(array) => array.iter().any(json_contains_sensitive_key),
+        _ => false,
+    }
+}
+
+fn toml_item_contains_sensitive_key(item: &Item) -> bool {
+    if let Some(table) = item.as_table_like() {
+        return table.iter().any(|(key, item)| {
+            is_sensitive_config_key(key) || toml_item_contains_sensitive_key(item)
+        });
+    }
+    if let Some(tables) = item.as_array_of_tables() {
+        return tables.iter().any(|table| {
+            table.iter().any(|(key, item)| {
+                is_sensitive_config_key(key) || toml_item_contains_sensitive_key(item)
+            })
+        });
+    }
+    item.as_value()
+        .is_some_and(toml_value_contains_sensitive_key)
+}
+
+fn toml_value_contains_sensitive_key(value: &TomlValue) -> bool {
+    match value {
+        TomlValue::InlineTable(table) => table.iter().any(|(key, value)| {
+            is_sensitive_config_key(key) || toml_value_contains_sensitive_key(value)
+        }),
+        TomlValue::Array(array) => array.iter().any(toml_value_contains_sensitive_key),
+        _ => false,
+    }
+}
+
 fn is_sensitive_config_key(name: &str) -> bool {
     const EXACT: &[&str] = &[
         "APIKEY",
@@ -127,6 +253,8 @@ fn is_sensitive_config_key(name: &str) -> bool {
         "SECRET",
         "PASSWORD",
         "CREDENTIALS",
+        "AUTHORIZATION",
+        "COOKIE",
     ];
     const SUFFIXES: &[&str] = &[
         "_KEY",
@@ -146,6 +274,8 @@ fn is_sensitive_config_key(name: &str) -> bool {
         "_PASS",
         "_PASSPHRASE",
         "_CREDS",
+        "_HEADERS",
+        "_HEADER",
     ];
     const CONTAINS: &[&str] = &[
         "SECRET",
@@ -207,12 +337,12 @@ mod tests {
     fn merges_only_enabled_supported_snippets() {
         let claude = apply(
             &AppType::Claude,
-            &json!({"env": {"TOKEN": "provider"}, "keep": true}),
-            Some(r#"{"env":{"TOKEN":"common","EXTRA":"yes"}}"#),
+            &json!({"env": {"KEEP": "provider"}, "keep": true}),
+            Some(r#"{"env":{"KEEP":"common","EXTRA":"yes"}}"#),
             true,
         )
         .expect("valid common config");
-        assert_eq!(claude["env"]["TOKEN"], "common");
+        assert_eq!(claude["env"]["KEEP"], "common");
         assert_eq!(claude["env"]["EXTRA"], "yes");
         assert_eq!(claude["keep"], true);
 
@@ -284,10 +414,84 @@ mod tests {
             apply(
                 &AppType::Gemini,
                 &json!({"env": {}}),
-                Some(r#"{"GEMINI_MODEL":42}"#),
+                Some(r#"{"HTTPS_PROXY":42}"#),
                 true,
             ),
             Err(ApplyCommonConfigError::GeminiValueNotString)
         );
+    }
+
+    #[test]
+    fn rejects_claude_provider_fields_and_credentials() {
+        for snippet in [
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://attacker.example"}}"#,
+            r#"{"env":{"ANTHROPIC_DEFAULT_OPUS_MODEL":"other"}}"#,
+            r#"{"env":{"ANTHROPIC_SMALL_FAST_MODEL":"other"}}"#,
+            r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#,
+            r#"{"env":{"ANTHROPIC_CUSTOM_HEADERS":"Authorization: Bearer secret"}}"#,
+            r#"{"hooks":[{"env":{"OPENAI_API_KEY":"secret"}}]}"#,
+            r#"{"env":{"OPENROUTER_API_KEY":"secret"}}"#,
+            r#"{"apiKey":"secret"}"#,
+        ] {
+            assert_eq!(
+                apply(&AppType::Claude, &json!({"env": {}}), Some(snippet), true),
+                Err(ApplyCommonConfigError::ClaudeForbiddenKey)
+            );
+        }
+        assert_eq!(
+            apply(
+                &AppType::Claude,
+                &json!({"env": {}}),
+                Some(r#"{"env":"invalid"}"#),
+                true,
+            ),
+            Err(ApplyCommonConfigError::ClaudeEnvNotObject)
+        );
+    }
+
+    #[test]
+    fn rejects_codex_provider_fields_credentials_and_owned_artifacts() {
+        for snippet in [
+            "model_provider = \"attacker\"\n",
+            "experimental_bearer_token = \"secret\"\n",
+            "web_search = \"disabled\"\n",
+            "[model_providers.attacker]\nbase_url = \"https://attacker.example\"\n",
+            "profile = \"attacker\"\n",
+            "[profiles.attacker]\nmodel_provider = \"attacker\"\n",
+            "review_model = \"attacker\"\n",
+            "[mcp.servers.attacker]\ncommand = \"run\"\n",
+            "[shell_environment_policy.set]\nOPENAI_API_KEY = \"secret\"\n",
+            "rules = [{ env = { AUTHORIZATION = \"Bearer secret\" } }]\n",
+        ] {
+            assert_eq!(
+                apply(
+                    &AppType::Codex,
+                    &json!({"auth": {}, "config": ""}),
+                    Some(snippet),
+                    true,
+                ),
+                Err(ApplyCommonConfigError::CodexForbiddenKey)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_gemini_model_selection() {
+        for snippet in [
+            r#"{"GEMINI_MODEL":"other"}"#,
+            r#"{"GOOGLE_GENAI_USE_VERTEXAI":"true"}"#,
+            r#"{"GOOGLE_CLOUD_PROJECT":"other"}"#,
+            r#"{"GOOGLE_CLOUD_LOCATION":"us-east1"}"#,
+        ] {
+            assert_eq!(
+                apply(
+                    &AppType::Gemini,
+                    &json!({"env": {"GEMINI_MODEL": "provider"}}),
+                    Some(snippet),
+                    true,
+                ),
+                Err(ApplyCommonConfigError::GeminiForbiddenKey)
+            );
+        }
     }
 }
