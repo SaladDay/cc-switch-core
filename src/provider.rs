@@ -21,6 +21,34 @@ pub struct ProviderSnapshot {
     pub settings: Value,
 }
 
+/// One validated provider fragment ready to be merged into an additive live
+/// configuration by a consumer-owned file writer.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderEntry {
+    pub key: String,
+    pub config: Value,
+}
+
+impl ProviderEntry {
+    pub fn new(key: impl Into<String>, config: Value) -> Self {
+        Self {
+            key: key.into(),
+            config,
+        }
+    }
+}
+
+impl fmt::Debug for ProviderEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderEntry")
+            .field("key", &self.key)
+            .field("config", &"<redacted>")
+            .finish()
+    }
+}
+
 impl fmt::Debug for ProviderSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -105,5 +133,19 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("do-not-log"));
         assert!(!debug.contains("ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    #[test]
+    fn provider_entry_debug_output_redacts_config() {
+        let entry = ProviderEntry::new(
+            "example",
+            json!({"apiKey": "do-not-log", "baseUrl": "https://example.com"}),
+        );
+
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("example"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("do-not-log"));
+        assert!(!debug.contains("apiKey"));
     }
 }

@@ -49,13 +49,66 @@ pub fn prepare_live_snapshot(
     let auth = object
         .get("auth")
         .ok_or(PrepareLiveSnapshotError::MissingAuth)?;
-
     Ok(PreparedLiveSnapshot {
         auth: auth.clone(),
         config: object
             .get("config")
             .and_then(Value::as_str)
             .map(str::to_owned),
+    })
+}
+
+/// Errors returned by the strict Codex projection used by new live writers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareStrictLiveSnapshotError {
+    SettingsNotObject,
+    MissingAuth,
+    AuthNotObject,
+    ConfigNotString,
+    InvalidConfig,
+}
+
+impl fmt::Display for PrepareStrictLiveSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::SettingsNotObject => "Codex settings must be a JSON object",
+            Self::MissingAuth => "Codex settings are missing the 'auth' field",
+            Self::AuthNotObject => "Codex 'auth' must be a JSON object",
+            Self::ConfigNotString => "Codex 'config' must be a TOML string",
+            Self::InvalidConfig => "Codex 'config' must be valid TOML",
+        })
+    }
+}
+
+impl Error for PrepareStrictLiveSnapshotError {}
+
+/// Validates the native Codex shapes before preparing a live snapshot.
+pub fn prepare_strict_live_snapshot(
+    settings: &Value,
+) -> Result<PreparedLiveSnapshot, PrepareStrictLiveSnapshotError> {
+    let object = settings
+        .as_object()
+        .ok_or(PrepareStrictLiveSnapshotError::SettingsNotObject)?;
+    let auth = object
+        .get("auth")
+        .ok_or(PrepareStrictLiveSnapshotError::MissingAuth)?;
+    if !auth.is_object() {
+        return Err(PrepareStrictLiveSnapshotError::AuthNotObject);
+    }
+    let config = match object.get("config") {
+        Some(Value::String(config)) => {
+            config
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|_| PrepareStrictLiveSnapshotError::InvalidConfig)?;
+            Some(config.clone())
+        }
+        Some(Value::Null) | None => None,
+        Some(_) => return Err(PrepareStrictLiveSnapshotError::ConfigNotString),
+    };
+
+    Ok(PreparedLiveSnapshot {
+        auth: auth.clone(),
+        config,
     })
 }
 
@@ -102,6 +155,33 @@ mod tests {
             prepare_live_snapshot(&json!({"config": "model = \"gpt-5\""})),
             Err(PrepareLiveSnapshotError::MissingAuth)
         );
+    }
+
+    #[test]
+    fn strict_snapshot_rejects_invalid_auth_and_config_shapes() {
+        assert_eq!(
+            prepare_strict_live_snapshot(&json!({"auth": null})),
+            Err(PrepareStrictLiveSnapshotError::AuthNotObject)
+        );
+        assert_eq!(
+            prepare_strict_live_snapshot(&json!({"auth": {}, "config": 1})),
+            Err(PrepareStrictLiveSnapshotError::ConfigNotString)
+        );
+        assert_eq!(
+            prepare_strict_live_snapshot(&json!({"auth": {}, "config": "not = [toml"})),
+            Err(PrepareStrictLiveSnapshotError::InvalidConfig)
+        );
+    }
+
+    #[test]
+    fn strict_snapshot_accepts_valid_native_values() {
+        let snapshot = prepare_strict_live_snapshot(&json!({
+            "auth": {"OPENAI_API_KEY": "secret"},
+            "config": "model = \"gpt-5\""
+        }))
+        .expect("valid strict snapshot");
+
+        assert_eq!(snapshot.config.as_deref(), Some("model = \"gpt-5\""));
     }
 
     #[test]
