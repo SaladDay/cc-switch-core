@@ -24,6 +24,14 @@ pub enum PrepareProviderEntryError {
     InvalidModels,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PrepareModelDefaultsError {
+    #[error("Hermes provider key cannot be empty")]
+    EmptyProviderKey,
+    #[error("Hermes model configuration must be a JSON object")]
+    ModelNotObject,
+}
+
 /// Normalizes one provider into Hermes' writable `custom_providers` shape.
 ///
 /// Historical camelCase aliases are healed, UI-only fields are removed, and
@@ -76,6 +84,52 @@ pub fn prepare_provider_entry(
         }
     }
     Ok(ProviderEntry::new(provider_key, Value::Object(config)))
+}
+
+/// Selects the provider and its first declared model while preserving every
+/// other key in Hermes' top-level `model` section.
+pub fn prepare_model_defaults(
+    provider_key: &str,
+    settings: &Value,
+    current: Option<&Value>,
+) -> Result<Value, PrepareModelDefaultsError> {
+    if provider_key.trim().is_empty() {
+        return Err(PrepareModelDefaultsError::EmptyProviderKey);
+    }
+    let mut model = match current {
+        Some(value) => value
+            .as_object()
+            .cloned()
+            .ok_or(PrepareModelDefaultsError::ModelNotObject)?,
+        None => Map::new(),
+    };
+    model.insert(
+        "provider".to_owned(),
+        Value::String(provider_key.to_owned()),
+    );
+    if let Some(first_model) = first_model_id(settings) {
+        model.insert("default".to_owned(), Value::String(first_model));
+    }
+    Ok(Value::Object(model))
+}
+
+fn first_model_id(settings: &Value) -> Option<String> {
+    match settings.get("models")? {
+        Value::Array(models) => models
+            .first()
+            .and_then(|model| model.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        Value::Object(models) => models
+            .keys()
+            .map(String::as_str)
+            .map(str::trim)
+            .find(|id| !id.is_empty())
+            .map(str::to_owned),
+        _ => None,
+    }
 }
 
 fn models_array_to_map(entries: Vec<Value>) -> Map<String, Value> {
@@ -137,5 +191,34 @@ mod tests {
             prepare_provider_entry("example", &json!({"models": {"model": "invalid"}})),
             Err(PrepareProviderEntryError::InvalidModels)
         );
+    }
+
+    #[test]
+    fn model_defaults_switch_provider_and_preserve_other_fields() {
+        let current = json!({
+            "provider": "old",
+            "default": "old-model",
+            "context_length": 32000
+        });
+        let result = prepare_model_defaults(
+            "new",
+            &json!({"models": [{"id": "new-model"}]}),
+            Some(&current),
+        )
+        .expect("valid defaults");
+
+        assert_eq!(result["provider"], "new");
+        assert_eq!(result["default"], "new-model");
+        assert_eq!(result["context_length"], 32000);
+    }
+
+    #[test]
+    fn model_defaults_keep_existing_default_without_models() {
+        let result =
+            prepare_model_defaults("new", &json!({}), Some(&json!({"default": "keep-me"})))
+                .expect("valid defaults");
+
+        assert_eq!(result["provider"], "new");
+        assert_eq!(result["default"], "keep-me");
     }
 }

@@ -1,0 +1,201 @@
+//! Pure projection of CC Switch common configuration snippets.
+
+use serde_json::Value;
+use thiserror::Error;
+use toml_edit::{DocumentMut, Item, TableLike};
+
+use crate::AppType;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ApplyCommonConfigError {
+    #[error("common configuration must be valid JSON")]
+    InvalidJson,
+    #[error("common configuration must be a JSON object")]
+    JsonNotObject,
+    #[error("provider settings must be a JSON object")]
+    SettingsNotObject,
+    #[error("Codex provider config must be valid TOML")]
+    InvalidCodexConfig,
+    #[error("Codex common configuration must be valid TOML")]
+    InvalidCodexSnippet,
+}
+
+/// Applies a shared-database common configuration snippet to one provider.
+///
+/// Only Claude, Codex, and Gemini have common snippets in CC Switch. The
+/// caller owns the enablement decision from provider metadata; disabled or
+/// empty snippets are returned unchanged.
+pub fn apply(
+    app: &AppType,
+    settings: &Value,
+    snippet: Option<&str>,
+    enabled: bool,
+) -> Result<Value, ApplyCommonConfigError> {
+    let Some(snippet) = snippet.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(settings.clone());
+    };
+    if !enabled {
+        return Ok(settings.clone());
+    }
+
+    match app {
+        AppType::Claude => {
+            let source: Value =
+                serde_json::from_str(snippet).map_err(|_| ApplyCommonConfigError::InvalidJson)?;
+            if !source.is_object() {
+                return Err(ApplyCommonConfigError::JsonNotObject);
+            }
+            let mut result = settings.clone();
+            if !result.is_object() {
+                return Err(ApplyCommonConfigError::SettingsNotObject);
+            }
+            json_deep_merge(&mut result, &source);
+            Ok(result)
+        }
+        AppType::Codex => {
+            let mut result = settings.clone();
+            let object = result
+                .as_object_mut()
+                .ok_or(ApplyCommonConfigError::SettingsNotObject)?;
+            let config = object
+                .get("config")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut target = if config.trim().is_empty() {
+                DocumentMut::new()
+            } else {
+                config
+                    .parse::<DocumentMut>()
+                    .map_err(|_| ApplyCommonConfigError::InvalidCodexConfig)?
+            };
+            let source = snippet
+                .parse::<DocumentMut>()
+                .map_err(|_| ApplyCommonConfigError::InvalidCodexSnippet)?;
+            merge_toml_table_like(target.as_table_mut(), source.as_table());
+            object.insert("config".to_owned(), Value::String(target.to_string()));
+            Ok(result)
+        }
+        AppType::Gemini => {
+            let source: Value =
+                serde_json::from_str(snippet).map_err(|_| ApplyCommonConfigError::InvalidJson)?;
+            if !source.is_object() {
+                return Err(ApplyCommonConfigError::JsonNotObject);
+            }
+            let object = settings
+                .as_object()
+                .ok_or(ApplyCommonConfigError::SettingsNotObject)?;
+            let mut result = Value::Object(object.clone());
+            if let Some(env) = result.get_mut("env") {
+                if !env.is_object() {
+                    return Err(ApplyCommonConfigError::SettingsNotObject);
+                }
+                json_deep_merge(env, &source);
+            } else if let Some(result) = result.as_object_mut() {
+                result.insert("env".to_owned(), source);
+            }
+            Ok(result)
+        }
+        AppType::GrokBuild
+        | AppType::OpenCode
+        | AppType::OpenClaw
+        | AppType::ClaudeDesktop
+        | AppType::Hermes
+        | AppType::Pi => Ok(settings.clone()),
+    }
+}
+
+fn json_deep_merge(target: &mut Value, source: &Value) {
+    match (target, source) {
+        (Value::Object(target), Value::Object(source)) => {
+            for (key, source_value) in source {
+                match target.get_mut(key) {
+                    Some(target_value) => json_deep_merge(target_value, source_value),
+                    None => {
+                        target.insert(key.clone(), source_value.clone());
+                    }
+                }
+            }
+        }
+        (target, source) => *target = source.clone(),
+    }
+}
+
+fn merge_toml_item(target: &mut Item, source: &Item) {
+    if let Some(source_table) = source.as_table_like() {
+        if let Some(target_table) = target.as_table_like_mut() {
+            merge_toml_table_like(target_table, source_table);
+            return;
+        }
+    }
+    *target = source.clone();
+}
+
+fn merge_toml_table_like(target: &mut dyn TableLike, source: &dyn TableLike) {
+    for (key, source_item) in source.iter() {
+        match target.get_mut(key) {
+            Some(target_item) => merge_toml_item(target_item, source_item),
+            None => {
+                target.insert(key, source_item.clone());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn merges_only_enabled_supported_snippets() {
+        let claude = apply(
+            &AppType::Claude,
+            &json!({"env": {"TOKEN": "provider"}, "keep": true}),
+            Some(r#"{"env":{"TOKEN":"common","EXTRA":"yes"}}"#),
+            true,
+        )
+        .expect("valid common config");
+        assert_eq!(claude["env"]["TOKEN"], "common");
+        assert_eq!(claude["env"]["EXTRA"], "yes");
+        assert_eq!(claude["keep"], true);
+
+        let unchanged = apply(
+            &AppType::Claude,
+            &json!({"keep": true}),
+            Some(r#"{"added":true}"#),
+            false,
+        )
+        .expect("disabled snippet");
+        assert_eq!(unchanged, json!({"keep": true}));
+    }
+
+    #[test]
+    fn merges_codex_toml_without_dropping_provider_fields() {
+        let result = apply(
+            &AppType::Codex,
+            &json!({"auth": {}, "config": "model = \"provider\"\n[features]\na = true\n"}),
+            Some("[features]\nb = true\n"),
+            true,
+        )
+        .expect("valid TOML");
+        let config = result["config"].as_str().expect("config text");
+        let parsed = config.parse::<toml_edit::DocumentMut>().expect("TOML");
+        assert_eq!(parsed["model"].as_str(), Some("provider"));
+        assert_eq!(parsed["features"]["a"].as_bool(), Some(true));
+        assert_eq!(parsed["features"]["b"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn merges_gemini_snippet_into_env_only() {
+        let result = apply(
+            &AppType::Gemini,
+            &json!({"env": {"GEMINI_MODEL": "provider"}, "settings": {"keep": true}}),
+            Some(r#"{"HTTPS_PROXY":"http://127.0.0.1:8080"}"#),
+            true,
+        )
+        .expect("valid common config");
+        assert_eq!(result["env"]["GEMINI_MODEL"], "provider");
+        assert_eq!(result["env"]["HTTPS_PROXY"], "http://127.0.0.1:8080");
+        assert_eq!(result["settings"]["keep"], true);
+    }
+}

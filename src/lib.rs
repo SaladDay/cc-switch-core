@@ -14,6 +14,7 @@ mod app_type;
 pub mod claude;
 pub mod claude_desktop;
 pub mod codex;
+pub mod common_config;
 pub mod fs;
 pub mod gemini;
 pub mod grokbuild;
