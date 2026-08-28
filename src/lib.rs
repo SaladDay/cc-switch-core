@@ -14,5 +14,7 @@ mod app_type;
 pub mod claude;
 pub mod codex;
 pub mod fs;
+mod provider;
 
 pub use app_type::{AppType, ParseAppTypeError};
+pub use provider::ProviderSnapshot;
