@@ -141,6 +141,7 @@ pub(crate) fn required_native_targets(
     declared_targets: &[LogicalTarget],
     action: NativeAction,
     provider: &ProviderSnapshot,
+    mode: NativeProviderMode,
 ) -> Result<Vec<LogicalTarget>, NativePlanError> {
     if provider.app != *adapter_app {
         return Err(NativePlanError::WrongProviderApp {
@@ -156,11 +157,13 @@ pub(crate) fn required_native_targets(
     }
 
     let mut targets = declared_targets.to_vec();
-    if *adapter_app == AppType::Codex
-        && action == NativeAction::Apply
-        && provider.settings.get("modelCatalog").is_none()
-    {
-        targets.retain(|target| *target != LogicalTarget::CodexModelCatalog);
+    if *adapter_app == AppType::Codex && action == NativeAction::Apply {
+        if mode == NativeProviderMode::Custom {
+            targets.retain(|target| *target != LogicalTarget::CodexAuth);
+        }
+        if provider.settings.get("modelCatalog").is_none() {
+            targets.retain(|target| *target != LogicalTarget::CodexModelCatalog);
+        }
     }
     Ok(targets)
 }
@@ -218,6 +221,9 @@ pub(crate) fn plan_native(
 
 fn validate_request_input(request: &NativePlanRequest<'_>) -> Result<(), NativePlanError> {
     ensure_input_size("provider id", request.provider.id.len())?;
+    if request.action == NativeAction::Remove {
+        return Ok(());
+    }
     ensure_input_size("provider name", request.provider.name.len())?;
 
     let mut writer = SizeLimitedWriter::new(MAX_NATIVE_PLAN_INPUT_BYTES);
@@ -392,7 +398,6 @@ fn codex_plan(
     let snapshot = codex::prepare_strict_live_snapshot(settings)
         .map_err(|error| invalid_provider(&request.provider.app, error.to_string()))?;
     let config_original = contents(request.documents, LogicalTarget::CodexConfig)?;
-    let auth_original = contents(request.documents, LogicalTarget::CodexAuth)?;
     let config = codex::prepare_provider_live_config(
         &snapshot.auth,
         snapshot.config.as_deref().unwrap_or_default(),
@@ -409,19 +414,20 @@ fn codex_plan(
         preserve_live_mcp_toml(config_original, &catalog.config, LogicalTarget::CodexConfig)?;
     let mut writes = Vec::with_capacity(3);
     let official = request.mode == NativeProviderMode::Official;
-    let category = official.then_some("official");
-    if codex::should_write_auth(category, &snapshot.auth, true) {
-        writes.push(planned(
-            LogicalTarget::CodexAuth,
-            auth_original,
-            Some(pretty_json(&snapshot.auth, LogicalTarget::CodexAuth)?),
-        ));
-    } else if official
-        && parse_optional_json_object(auth_original, LogicalTarget::CodexAuth)?
+    if official {
+        let auth_original = contents(request.documents, LogicalTarget::CodexAuth)?;
+        if codex::should_write_auth(Some("official"), &snapshot.auth, true) {
+            writes.push(planned(
+                LogicalTarget::CodexAuth,
+                auth_original,
+                Some(pretty_json(&snapshot.auth, LogicalTarget::CodexAuth)?),
+            ));
+        } else if parse_optional_json_object(auth_original, LogicalTarget::CodexAuth)?
             .as_ref()
             .is_some_and(codex::live_auth_is_stale_third_party_residue)
-    {
-        writes.push(planned(LogicalTarget::CodexAuth, auth_original, None));
+        {
+            writes.push(planned(LogicalTarget::CodexAuth, auth_original, None));
+        }
     }
     writes.push(planned(
         LogicalTarget::CodexConfig,
@@ -804,12 +810,6 @@ fn parse_json5_object(
             .cloned()
             .ok_or_else(|| invalid_document(target, "default root is not an object"));
     };
-    if contents.iter().all(u8::is_ascii_whitespace) {
-        return default
-            .as_object()
-            .cloned()
-            .ok_or_else(|| invalid_document(target, "default root is not an object"));
-    }
     let text = std::str::from_utf8(contents)
         .map_err(|_| invalid_document(target, "contents are not UTF-8"))?;
     let value: Value =
@@ -827,9 +827,6 @@ fn parse_json_object_or_empty(
     let Some(contents) = contents else {
         return Ok(Map::new());
     };
-    if contents.iter().all(u8::is_ascii_whitespace) {
-        return Ok(Map::new());
-    }
     parse_json_value(contents, target)?
         .as_object()
         .cloned()
@@ -1569,6 +1566,28 @@ mod tests {
                 ..
             })
         ));
+
+        let pi_documents = document_set(
+            AppType::Pi,
+            &[(
+                LogicalTarget::PiModels,
+                r#"{"providers":{"remove":{"models":[]}}}"#,
+            )],
+        );
+        let removal = standard_plan(
+            AppType::Pi,
+            NativeAction::Remove,
+            "remove",
+            json!({"unused": "x".repeat(MAX_NATIVE_PLAN_INPUT_BYTES + 1)}),
+            NativeProviderMode::Custom,
+            &pi_documents,
+            None,
+        )
+        .expect("removal only validates the provider id it consumes");
+        let removed: Value =
+            serde_json::from_str(write_contents(&removal, LogicalTarget::PiModels))
+                .expect("Pi JSON");
+        assert!(removed["providers"].get("remove").is_none());
     }
 
     #[test]
@@ -1667,18 +1686,28 @@ mod tests {
         );
 
         let unmanaged_targets = adapter
-            .required_native_targets(NativeAction::Apply, &unmanaged)
+            .required_native_targets(NativeAction::Apply, &unmanaged, NativeProviderMode::Custom)
             .expect("unmanaged target set");
+        assert!(!unmanaged_targets.contains(&LogicalTarget::CodexAuth));
         assert!(!unmanaged_targets.contains(&LogicalTarget::CodexModelCatalog));
         let managed_targets = adapter
-            .required_native_targets(NativeAction::Apply, &managed)
+            .required_native_targets(NativeAction::Apply, &managed, NativeProviderMode::Custom)
             .expect("managed target set");
+        assert!(!managed_targets.contains(&LogicalTarget::CodexAuth));
         assert!(managed_targets.contains(&LogicalTarget::CodexModelCatalog));
+        let official_targets = adapter
+            .required_native_targets(
+                NativeAction::Apply,
+                &unmanaged,
+                NativeProviderMode::Official,
+            )
+            .expect("official target set");
+        assert!(official_targets.contains(&LogicalTarget::CodexAuth));
 
         let documents = LiveDocumentSet::try_new(
             AppType::Codex,
             [
-                ObservedDocument::missing(LogicalTarget::CodexAuth),
+                ObservedDocument::unobserved(LogicalTarget::CodexAuth),
                 ObservedDocument::missing(LogicalTarget::CodexConfig),
                 ObservedDocument::unobserved(LogicalTarget::CodexModelCatalog),
             ],
@@ -2155,6 +2184,56 @@ mod tests {
             ),
             Err(NativePlanError::InvalidDocument {
                 target: LogicalTarget::HermesConfig,
+                ..
+            })
+        ));
+
+        let blank_json5 = document_set(
+            AppType::OpenCode,
+            &[(LogicalTarget::OpenCodeConfig, " \n\t")],
+        );
+        assert!(matches!(
+            standard_plan(
+                AppType::OpenCode,
+                NativeAction::Apply,
+                "custom",
+                json!({"npm": "@ai-sdk/openai-compatible"}),
+                NativeProviderMode::Custom,
+                &blank_json5,
+                None,
+            ),
+            Err(NativePlanError::InvalidDocument {
+                target: LogicalTarget::OpenCodeConfig,
+                ..
+            })
+        ));
+
+        let blank_desktop = document_set(
+            AppType::ClaudeDesktop,
+            &[(LogicalTarget::ClaudeDesktopNormalConfig, "")],
+        );
+        let desktop = ProviderSnapshot::new(
+            "desktop",
+            AppType::ClaudeDesktop,
+            "Desktop",
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://example.com",
+                    "ANTHROPIC_AUTH_TOKEN": "secret"
+                }
+            }),
+        );
+        assert!(matches!(
+            builtin_app_adapter(&AppType::ClaudeDesktop).plan_native(&NativePlanRequest {
+                action: NativeAction::Apply,
+                provider: &desktop,
+                documents: &blank_desktop,
+                mode: NativeProviderMode::Custom,
+                access: NativeProviderAccess::Writable,
+                context: NativePlanContext::ClaudeDesktop { routes: &[] },
+            }),
+            Err(NativePlanError::InvalidDocument {
+                target: LogicalTarget::ClaudeDesktopNormalConfig,
                 ..
             })
         ));

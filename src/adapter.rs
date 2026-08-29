@@ -27,12 +27,14 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
         &self,
         action: NativeAction,
         provider: &ProviderSnapshot,
+        mode: crate::NativeProviderMode,
     ) -> Result<Vec<LogicalTarget>, NativePlanError> {
         projection::required_native_targets(
             self.descriptor().app(),
             self.targets(),
             action,
             provider,
+            mode,
         )
     }
 
