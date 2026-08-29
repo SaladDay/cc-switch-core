@@ -3,8 +3,9 @@
 use std::fmt;
 
 use crate::{
-    builtin_app_registry, projection, AppDescriptor, AppType, LogicalTarget, NativeAction,
-    NativePlanError, NativePlanRequest, OperationPlan, OperationPlanError, ProviderSnapshot,
+    builtin_app_registry, native_import, projection, AppDescriptor, AppType, LiveDocumentSet,
+    LogicalTarget, NativeAction, NativeImportError, NativeImportStep, NativePlanError,
+    NativePlanRequest, OperationPlan, OperationPlanError, ProviderSnapshot,
 };
 
 mod sealed {
@@ -60,6 +61,14 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
         let plan = projection::plan_native(self.descriptor().app(), request)?;
         self.validate_plan(&plan)?;
         Ok(plan)
+    }
+
+    /// Advances a pure native import projection by one observation step.
+    fn project_native_import(
+        &self,
+        documents: &LiveDocumentSet,
+    ) -> Result<NativeImportStep, NativeImportError> {
+        native_import::project_native_import(self.descriptor().app(), documents)
     }
 }
 
