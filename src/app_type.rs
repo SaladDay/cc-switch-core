@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+use crate::registry::{
+    builtin_app_registry, descriptor_for, AppCapability, ProviderConfigurationMode,
+};
+
 /// An application whose provider configuration can be managed by CC Switch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -25,49 +29,24 @@ pub enum AppType {
 impl AppType {
     /// Returns the stable identifier used in storage and IPC payloads.
     pub fn as_str(&self) -> &str {
-        match self {
-            Self::Claude => "claude",
-            Self::ClaudeDesktop => "claude-desktop",
-            Self::Codex => "codex",
-            Self::Gemini => "gemini",
-            Self::GrokBuild => "grokbuild",
-            Self::OpenCode => "opencode",
-            Self::OpenClaw => "openclaw",
-            Self::Hermes => "hermes",
-            Self::Pi => "pi",
-        }
+        descriptor_for(self).id()
     }
 
     /// Returns whether every provider coexists in the application's live file.
     pub fn is_additive_mode(&self) -> bool {
-        matches!(
-            self,
-            Self::OpenCode | Self::OpenClaw | Self::Hermes | Self::Pi
-        )
+        descriptor_for(self).configuration_mode() == ProviderConfigurationMode::Additive
     }
 
     /// Returns whether the application can be routed through the local proxy.
     pub fn supports_local_proxy(&self) -> bool {
-        matches!(
-            self,
-            Self::Claude | Self::Codex | Self::Gemini | Self::GrokBuild
-        )
+        descriptor_for(self).supports(AppCapability::LocalProxy)
     }
 
     /// Iterates over all built-in application types in display order.
     pub fn all() -> impl Iterator<Item = Self> {
-        [
-            Self::Claude,
-            Self::ClaudeDesktop,
-            Self::Codex,
-            Self::Gemini,
-            Self::GrokBuild,
-            Self::OpenCode,
-            Self::OpenClaw,
-            Self::Hermes,
-            Self::Pi,
-        ]
-        .into_iter()
+        builtin_app_registry()
+            .descriptors()
+            .map(|descriptor| descriptor.app().clone())
     }
 }
 
@@ -94,18 +73,10 @@ impl FromStr for AppType {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let normalized = value.trim().to_lowercase();
-        match normalized.as_str() {
-            "claude" => Ok(Self::Claude),
-            "claude-desktop" | "claude_desktop" | "claudedesktop" => Ok(Self::ClaudeDesktop),
-            "codex" => Ok(Self::Codex),
-            "gemini" => Ok(Self::Gemini),
-            "grokbuild" | "grok-build" | "grok_build" | "grok" => Ok(Self::GrokBuild),
-            "opencode" => Ok(Self::OpenCode),
-            "openclaw" => Ok(Self::OpenClaw),
-            "hermes" => Ok(Self::Hermes),
-            "pi" => Ok(Self::Pi),
-            _ => Err(ParseAppTypeError { app_id: normalized }),
-        }
+        builtin_app_registry()
+            .find(&normalized)
+            .map(|descriptor| descriptor.app().clone())
+            .ok_or(ParseAppTypeError { app_id: normalized })
     }
 }
 
