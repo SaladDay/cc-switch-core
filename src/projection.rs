@@ -6,6 +6,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fmt,
+    io::{self, Write},
 };
 
 use json_five::rt::parser::{
@@ -18,15 +19,20 @@ use thiserror::Error;
 use crate::{
     claude, claude_desktop, codex, common_config, gemini, grokbuild, hermes, openclaw, opencode,
     pi, AppType, ContentExpectation, LiveDocumentSet, LogicalTarget, OperationPlan,
-    OperationPlanError, PlannedWrite, ProviderEntry, ProviderSnapshot, OPERATION_CONTRACT_MAJOR,
+    OperationPlanError, PlannedWrite, ProviderEntry, ProviderSnapshot, MAX_OPERATION_CONTENT_BYTES,
+    OPERATION_CONTRACT_MAJOR,
 };
 
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000157210";
 const CLAUDE_DESKTOP_PROFILE_NAME: &str = "CC Switch";
-const HERMES_SOURCE_FIELD: &str = "_cc_source";
-const HERMES_DICT_SOURCE: &str = "providers_dict";
 const OPENCLAW_DEFAULT_SOURCE: &str =
     "{\n  models: {\n    mode: 'merge',\n    providers: {},\n  },\n}\n";
+
+/// Maximum encoded bytes accepted for each non-document plan input.
+pub const MAX_NATIVE_PLAN_INPUT_BYTES: usize = MAX_OPERATION_CONTENT_BYTES;
+
+/// Maximum number of typed Claude Desktop model routes accepted in one plan.
+pub const MAX_NATIVE_PLAN_ROUTES: usize = 4096;
 
 /// Native operation requested by a consumer-owned host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +128,10 @@ pub enum NativePlanError {
         target: LogicalTarget,
         message: String,
     },
+    #[error("native plan {field} exceeds the {limit}-byte input limit")]
+    InputTooLarge { field: &'static str, limit: usize },
+    #[error("native plan route count exceeds the {limit}-route input limit")]
+    TooManyRoutes { limit: usize },
     #[error(transparent)]
     InvalidPlan(#[from] OperationPlanError),
 }
@@ -142,6 +152,7 @@ pub(crate) fn plan_native(
             actual: request.documents.app().as_str().to_owned(),
         });
     }
+    validate_request_input(request)?;
     if request.access == NativeProviderAccess::ReadOnly {
         return Err(NativePlanError::ReadOnlyProvider {
             provider_id: request.provider.id.clone(),
@@ -173,6 +184,91 @@ pub(crate) fn plan_native(
     match request.action {
         NativeAction::Apply => prepare_apply(request),
         NativeAction::Remove => prepare_remove(request),
+    }
+}
+
+fn validate_request_input(request: &NativePlanRequest<'_>) -> Result<(), NativePlanError> {
+    ensure_input_size("provider id", request.provider.id.len())?;
+    ensure_input_size("provider name", request.provider.name.len())?;
+
+    let mut writer = SizeLimitedWriter::new(MAX_NATIVE_PLAN_INPUT_BYTES);
+    if serde_json::to_writer(&mut writer, &request.provider.settings).is_err() {
+        if writer.exceeded {
+            return Err(input_too_large("provider settings"));
+        }
+        return Err(invalid_provider(
+            &request.provider.app,
+            "provider settings could not be serialized",
+        ));
+    }
+
+    match request.context {
+        NativePlanContext::Standard {
+            common_config: Some(common_config),
+        } => ensure_input_size("common configuration", common_config.len()),
+        NativePlanContext::Standard {
+            common_config: None,
+        } => Ok(()),
+        NativePlanContext::ClaudeDesktop { routes } => {
+            if routes.len() > MAX_NATIVE_PLAN_ROUTES {
+                return Err(NativePlanError::TooManyRoutes {
+                    limit: MAX_NATIVE_PLAN_ROUTES,
+                });
+            }
+            let bytes = routes.iter().fold(0usize, |total, route| {
+                total
+                    .saturating_add(route.route_id.len())
+                    .saturating_add(route.upstream_model.len())
+                    .saturating_add(route.label_override.as_deref().map_or(0, str::len))
+            });
+            ensure_input_size("Claude Desktop routes", bytes)
+        }
+    }
+}
+
+fn ensure_input_size(field: &'static str, bytes: usize) -> Result<(), NativePlanError> {
+    if bytes > MAX_NATIVE_PLAN_INPUT_BYTES {
+        Err(input_too_large(field))
+    } else {
+        Ok(())
+    }
+}
+
+fn input_too_large(field: &'static str) -> NativePlanError {
+    NativePlanError::InputTooLarge {
+        field,
+        limit: MAX_NATIVE_PLAN_INPUT_BYTES,
+    }
+}
+
+struct SizeLimitedWriter {
+    written: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl SizeLimitedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            written: 0,
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for SizeLimitedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.written) {
+            self.exceeded = true;
+            return Err(io::Error::other("size limit exceeded"));
+        }
+        self.written += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -553,12 +649,6 @@ fn hermes_plan(
     request: &NativePlanRequest<'_>,
     settings: &Value,
 ) -> Result<OperationPlan, NativePlanError> {
-    if settings.get(HERMES_SOURCE_FIELD).and_then(Value::as_str) == Some(HERMES_DICT_SOURCE) {
-        return Err(invalid_provider(
-            &request.provider.app,
-            "provider is managed by the native providers dictionary",
-        ));
-    }
     let entry = hermes::prepare_provider_entry(&request.provider.id, settings)
         .map_err(|error| invalid_provider(&request.provider.app, error.to_string()))?;
     let target = LogicalTarget::HermesConfig;
@@ -608,18 +698,6 @@ fn hermes_plan(
 }
 
 fn hermes_remove_plan(request: &NativePlanRequest<'_>) -> Result<OperationPlan, NativePlanError> {
-    if request
-        .provider
-        .settings
-        .get(HERMES_SOURCE_FIELD)
-        .and_then(Value::as_str)
-        == Some(HERMES_DICT_SOURCE)
-    {
-        return Err(invalid_provider(
-            &request.provider.app,
-            "provider is managed by the native providers dictionary",
-        ));
-    }
     let target = LogicalTarget::HermesConfig;
     let original = contents(request.documents, target)?;
     let raw = optional_utf8(original, target)?;
@@ -699,8 +777,8 @@ fn parse_json5_object(
     }
     let text = std::str::from_utf8(contents)
         .map_err(|_| invalid_document(target, "contents are not UTF-8"))?;
-    let value: Value = json_five::from_str(text)
-        .map_err(|_| invalid_document(target, "JSON5 could not be parsed"))?;
+    let value: Value =
+        json5::from_str(text).map_err(|_| invalid_document(target, "JSON5 could not be parsed"))?;
     value
         .as_object()
         .cloned()
@@ -1338,6 +1416,127 @@ mod tests {
     }
 
     #[test]
+    fn request_size_limits_run_before_projection() {
+        let claude_documents = document_set(AppType::Claude, &[]);
+        let oversized = "x".repeat(MAX_NATIVE_PLAN_INPUT_BYTES + 1);
+
+        assert!(matches!(
+            standard_plan(
+                AppType::Claude,
+                NativeAction::Apply,
+                &oversized,
+                json!({}),
+                NativeProviderMode::Custom,
+                &claude_documents,
+                None,
+            ),
+            Err(NativePlanError::InputTooLarge {
+                field: "provider id",
+                ..
+            })
+        ));
+
+        let provider = ProviderSnapshot::new("claude", AppType::Claude, &oversized, json!({}));
+        assert!(matches!(
+            builtin_app_adapter(&AppType::Claude).plan_native(&NativePlanRequest {
+                action: NativeAction::Apply,
+                provider: &provider,
+                documents: &claude_documents,
+                mode: NativeProviderMode::Custom,
+                access: NativeProviderAccess::Writable,
+                context: NativePlanContext::Standard {
+                    common_config: None,
+                },
+            }),
+            Err(NativePlanError::InputTooLarge {
+                field: "provider name",
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            standard_plan(
+                AppType::Claude,
+                NativeAction::Apply,
+                "claude",
+                json!({"oversized": oversized}),
+                NativeProviderMode::Custom,
+                &claude_documents,
+                None,
+            ),
+            Err(NativePlanError::InputTooLarge {
+                field: "provider settings",
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            standard_plan(
+                AppType::Claude,
+                NativeAction::Apply,
+                "claude",
+                json!({}),
+                NativeProviderMode::Custom,
+                &claude_documents,
+                Some(&"x".repeat(MAX_NATIVE_PLAN_INPUT_BYTES + 1)),
+            ),
+            Err(NativePlanError::InputTooLarge {
+                field: "common configuration",
+                ..
+            })
+        ));
+
+        let desktop_documents = document_set(AppType::ClaudeDesktop, &[]);
+        let desktop =
+            ProviderSnapshot::new("desktop", AppType::ClaudeDesktop, "Desktop", json!({}));
+        let too_many_routes = vec![
+            claude_desktop::DirectModelRoute {
+                route_id: String::new(),
+                upstream_model: String::new(),
+                label_override: None,
+                supports_1m: false,
+            };
+            MAX_NATIVE_PLAN_ROUTES + 1
+        ];
+        assert!(matches!(
+            builtin_app_adapter(&AppType::ClaudeDesktop).plan_native(&NativePlanRequest {
+                action: NativeAction::Apply,
+                provider: &desktop,
+                documents: &desktop_documents,
+                mode: NativeProviderMode::Custom,
+                access: NativeProviderAccess::Writable,
+                context: NativePlanContext::ClaudeDesktop {
+                    routes: &too_many_routes,
+                },
+            }),
+            Err(NativePlanError::TooManyRoutes { .. })
+        ));
+
+        let oversized_route = [claude_desktop::DirectModelRoute {
+            route_id: "x".repeat(MAX_NATIVE_PLAN_INPUT_BYTES + 1),
+            upstream_model: String::new(),
+            label_override: None,
+            supports_1m: false,
+        }];
+        assert!(matches!(
+            builtin_app_adapter(&AppType::ClaudeDesktop).plan_native(&NativePlanRequest {
+                action: NativeAction::Apply,
+                provider: &desktop,
+                documents: &desktop_documents,
+                mode: NativeProviderMode::Custom,
+                access: NativeProviderAccess::Writable,
+                context: NativePlanContext::ClaudeDesktop {
+                    routes: &oversized_route,
+                },
+            }),
+            Err(NativePlanError::InputTooLarge {
+                field: "Claude Desktop routes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn claude_apply_projects_common_config_and_strips_internal_keys() {
         let documents = document_set(AppType::Claude, &[]);
         let plan = standard_plan(
@@ -1410,6 +1609,45 @@ mod tests {
             serde_json::from_str(write_contents(&plan, LogicalTarget::CodexModelCatalog))
                 .expect("Codex catalog JSON");
         assert_eq!(catalog["models"][0]["slug"], "qwen3-coder-plus");
+    }
+
+    #[test]
+    fn toml_1_1_mcp_tables_survive_codex_and_grok_projection() {
+        let live_mcp =
+            "[mcp_servers.keep]\ncommand = \"keep\"\nenv = {\n  TOKEN = \"preserved\",\n}\n";
+        let codex_documents =
+            document_set(AppType::Codex, &[(LogicalTarget::CodexConfig, live_mcp)]);
+        let codex = standard_plan(
+            AppType::Codex,
+            NativeAction::Apply,
+            "custom",
+            json!({
+                "auth": {},
+                "config": "model = \"gpt-5\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com\"\n"
+            }),
+            NativeProviderMode::Custom,
+            &codex_documents,
+            None,
+        )
+        .expect("Codex accepts TOML 1.1 MCP syntax");
+        let codex_config = write_contents(&codex, LogicalTarget::CodexConfig);
+        assert!(codex_config.contains("TOKEN = \"preserved\""));
+
+        let grok_documents =
+            document_set(AppType::GrokBuild, &[(LogicalTarget::GrokConfig, live_mcp)]);
+        let grok = standard_plan(
+            AppType::GrokBuild,
+            NativeAction::Apply,
+            "custom",
+            json!({
+                "config": "[models]\ndefault = \"grok-custom\"\n\n[model.grok-custom]\nmodel = \"grok-4.5\"\nbase_url = \"https://example.com/v1\"\nname = \"Example\"\napi_key = \"secret\"\napi_backend = \"responses\"\ncontext_window = 500000\n"
+            }),
+            NativeProviderMode::Custom,
+            &grok_documents,
+            None,
+        )
+        .expect("Grok accepts TOML 1.1 MCP syntax");
+        assert!(write_contents(&grok, LogicalTarget::GrokConfig).contains("TOKEN = \"preserved\""));
     }
 
     #[test]
@@ -1556,6 +1794,43 @@ mod tests {
     }
 
     #[test]
+    fn additive_json_semantics_accept_utf16_surrogate_pair_escapes() {
+        let cases = [
+            (
+                AppType::OpenCode,
+                LogicalTarget::OpenCodeConfig,
+                r#"{provider:{existing:{npm:"package",label:"\uD83D\uDE00"}}}"#,
+                json!({"npm": "new-package"}),
+                "/provider/existing/label",
+            ),
+            (
+                AppType::Pi,
+                LogicalTarget::PiModels,
+                r#"{providers:{existing:{label:"\uD83D\uDE00"}}}"#,
+                json!({"models": []}),
+                "/providers/existing/label",
+            ),
+        ];
+
+        for (app, target, source, settings, pointer) in cases {
+            let documents = document_set(app.clone(), &[(target, source)]);
+            let plan = standard_plan(
+                app,
+                NativeAction::Apply,
+                "new",
+                settings,
+                NativeProviderMode::Custom,
+                &documents,
+                None,
+            )
+            .expect("legacy JSON5 input remains accepted");
+            let value: Value =
+                serde_json::from_str(write_contents(&plan, target)).expect("projected JSON");
+            assert_eq!(value.pointer(pointer), Some(&json!("😀")));
+        }
+    }
+
+    #[test]
     fn openclaw_round_trip_keeps_comments_and_removes_only_the_selected_provider() {
         let documents = document_set(
             AppType::OpenClaw,
@@ -1684,6 +1959,7 @@ mod tests {
             NativeAction::Apply,
             "new",
             json!({
+                "_cc_source": "providers_dict",
                 "base_url": "https://new.example.com",
                 "models": [{"id": "new-model"}]
             }),
@@ -1701,6 +1977,15 @@ mod tests {
             Some(32000)
         );
         assert_eq!(applied_yaml["future"]["enabled"].as_bool(), Some(true));
+        let projected = applied_yaml["custom_providers"]
+            .as_sequence()
+            .and_then(|providers| {
+                providers.iter().find(|provider| {
+                    provider.get("name").and_then(serde_yaml::Value::as_str) == Some("new")
+                })
+            })
+            .expect("projected Hermes provider");
+        assert!(projected.get("_cc_source").is_none());
 
         let after_apply = document_set(
             AppType::Hermes,

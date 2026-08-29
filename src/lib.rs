@@ -39,7 +39,7 @@ pub use operation::{
 };
 pub use projection::{
     NativeAction, NativePlanContext, NativePlanError, NativePlanRequest, NativeProviderAccess,
-    NativeProviderMode,
+    NativeProviderMode, MAX_NATIVE_PLAN_INPUT_BYTES, MAX_NATIVE_PLAN_ROUTES,
 };
 pub use provider::{ProviderEntry, ProviderSnapshot};
 pub use registry::{
