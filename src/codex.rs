@@ -5,10 +5,20 @@ use std::{error::Error, fmt};
 use serde_json::Value;
 
 /// Owned values required by the Codex live-write pipeline.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PreparedLiveSnapshot {
     pub auth: Value,
     pub config: Option<String>,
+}
+
+impl fmt::Debug for PreparedLiveSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedLiveSnapshot")
+            .field("auth", &"<redacted>")
+            .field("config", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Validation errors returned while preparing a Codex live snapshot.
@@ -92,5 +102,25 @@ mod tests {
             prepare_live_snapshot(&json!({"config": "model = \"gpt-5\""})),
             Err(PrepareLiveSnapshotError::MissingAuth)
         );
+    }
+
+    #[test]
+    fn debug_output_redacts_live_values() {
+        let snapshot = prepare_live_snapshot(&json!({
+            "auth": {"OPENAI_API_KEY": "do-not-log"},
+            "config": "experimental_bearer_token = \"also-private\""
+        }))
+        .expect("valid settings");
+
+        let debug = format!("{snapshot:?}");
+        assert!(debug.contains("<redacted>"));
+        for private in [
+            "OPENAI_API_KEY",
+            "do-not-log",
+            "experimental_bearer_token",
+            "also-private",
+        ] {
+            assert!(!debug.contains(private));
+        }
     }
 }
