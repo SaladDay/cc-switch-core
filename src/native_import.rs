@@ -232,8 +232,14 @@ fn import_gemini(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportC
     } else {
         gemini::AuthMode::ApiKey
     };
-    gemini::prepare_live_snapshot(&settings, None, mode)
-        .map_err(|error| invalid_document(LogicalTarget::GeminiSettings, error.to_string()))?;
+    gemini::prepare_live_snapshot(&settings, None, mode).map_err(|error| {
+        let target = if matches!(&error, gemini::PrepareLiveSnapshotError::MissingApiKey) {
+            LogicalTarget::GeminiEnv
+        } else {
+            LogicalTarget::GeminiSettings
+        };
+        invalid_document(target, error.to_string())
+    })?;
     let official = mode == gemini::AuthMode::OAuthPersonal;
     Ok(vec![candidate(
         AppType::Gemini,
@@ -1021,6 +1027,50 @@ mod tests {
         .remove(0);
         assert_eq!(grok.provider.id, "grokbuild-official");
         assert_eq!(grok.classification, Some(NativeProviderMode::Official));
+    }
+
+    #[test]
+    fn gemini_validation_errors_identify_the_source_document() {
+        let missing_key = project_native_import(
+            &AppType::Gemini,
+            &documents(
+                AppType::Gemini,
+                &[
+                    (LogicalTarget::GeminiEnv, Some("OTHER=value\n")),
+                    (LogicalTarget::GeminiSettings, Some("{}")),
+                ],
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            missing_key,
+            NativeImportError::InvalidDocument {
+                target: LogicalTarget::GeminiEnv,
+                ..
+            }
+        ));
+
+        let invalid_settings = project_native_import(
+            &AppType::Gemini,
+            &documents(
+                AppType::Gemini,
+                &[
+                    (LogicalTarget::GeminiEnv, Some("GEMINI_API_KEY=secret\n")),
+                    (
+                        LogicalTarget::GeminiSettings,
+                        Some(r#"{"security":"invalid"}"#),
+                    ),
+                ],
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            invalid_settings,
+            NativeImportError::InvalidDocument {
+                target: LogicalTarget::GeminiSettings,
+                ..
+            }
+        ));
     }
 
     #[test]
