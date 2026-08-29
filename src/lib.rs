@@ -21,6 +21,7 @@ pub mod fs;
 pub mod gemini;
 pub mod grokbuild;
 pub mod hermes;
+mod native_import;
 pub mod openclaw;
 pub mod opencode;
 mod operation;
@@ -32,6 +33,10 @@ mod registry;
 pub use adapter::{builtin_app_adapter, builtin_app_adapters, AppAdapter};
 pub use app_type::{AppType, ParseAppTypeError};
 pub use document::{LiveDocumentSet, LiveDocumentSetError, ObservedDocument};
+pub use native_import::{
+    HermesProviderSource, NativeImportCandidate, NativeImportContext, NativeImportError,
+    NativeImportStep,
+};
 pub use operation::{
     ConfigFormat, ContentExpectation, LogicalTarget, OperationPlan, OperationPlanDecodeError,
     OperationPlanError, PlannedWrite, MAX_OPERATION_CONTENT_BYTES, MAX_OPERATION_PLAN_WIRE_BYTES,
