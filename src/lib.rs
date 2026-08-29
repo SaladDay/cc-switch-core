@@ -35,7 +35,7 @@ pub use app_type::{AppType, ParseAppTypeError};
 pub use document::{LiveDocumentSet, LiveDocumentSetError, ObservedDocument};
 pub use native_import::{
     HermesProviderSource, NativeImportCandidate, NativeImportContext, NativeImportError,
-    NativeImportStep, MAX_NATIVE_IMPORT_CANDIDATES,
+    NativeImportStep,
 };
 pub use operation::{
     ConfigFormat, ContentExpectation, LogicalTarget, OperationPlan, OperationPlanDecodeError,

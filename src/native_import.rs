@@ -19,9 +19,6 @@ use crate::{
 
 const CLAUDE_DESKTOP_OFFICIAL_ID: &str = "claude-desktop-official";
 
-/// Maximum number of providers returned by one native import projection.
-pub const MAX_NATIVE_IMPORT_CANDIDATES: usize = 4096;
-
 /// Native Hermes section from which an imported provider originated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HermesProviderSource {
@@ -30,7 +27,7 @@ pub enum HermesProviderSource {
 }
 
 /// Typed app-specific context accompanying an imported provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum NativeImportContext {
     None,
     ClaudeDesktopDirect {
@@ -39,6 +36,22 @@ pub enum NativeImportContext {
     Hermes {
         source: HermesProviderSource,
     },
+}
+
+impl fmt::Debug for NativeImportContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => formatter.write_str("None"),
+            Self::ClaudeDesktopDirect { routes } => formatter
+                .debug_struct("ClaudeDesktopDirect")
+                .field("route_count", &routes.len())
+                .finish(),
+            Self::Hermes { source } => formatter
+                .debug_struct("Hermes")
+                .field("source", source)
+                .finish(),
+        }
+    }
 }
 
 /// One native provider candidate ready for consumer-owned persistence.
@@ -88,8 +101,6 @@ pub enum NativeImportError {
     },
     #[error("native import for '{app_id}' is invalid: {message}")]
     InvalidCandidate { app_id: String, message: String },
-    #[error("native import for '{app_id}' exceeds the {limit}-provider limit")]
-    TooManyCandidates { app_id: String, limit: usize },
 }
 
 enum ProjectError {
@@ -117,12 +128,6 @@ pub(crate) fn project_native_import(
     }
 
     match project(adapter_app, documents) {
-        Ok(candidates) if candidates.len() > MAX_NATIVE_IMPORT_CANDIDATES => {
-            Err(NativeImportError::TooManyCandidates {
-                app_id: adapter_app.as_str().to_owned(),
-                limit: MAX_NATIVE_IMPORT_CANDIDATES,
-            })
-        }
         Ok(candidates) => Ok(NativeImportStep::Ready { candidates }),
         Err(ProjectError::Observe(target)) => Ok(NativeImportStep::Observe { target }),
         Err(ProjectError::Rejected(error)) => Err(error),
@@ -292,7 +297,7 @@ fn import_json_entries(
 ) -> ProjectResult<Vec<NativeImportCandidate>> {
     let root = required_json5_object(documents, target, label)?;
     let entries = nested_object(&root, keys).ok_or_else(|| missing(label))?;
-    let mut candidates = Vec::with_capacity(entries.len().min(MAX_NATIVE_IMPORT_CANDIDATES + 1));
+    let mut candidates = Vec::with_capacity(entries.len());
     for (key, settings) in entries {
         let valid = match app {
             AppType::OpenCode => opencode::prepare_provider_entry(key, settings).is_ok(),
@@ -320,13 +325,6 @@ fn import_json_entries(
             None,
             NativeImportContext::None,
         )?);
-        if candidates.len() > MAX_NATIVE_IMPORT_CANDIDATES {
-            return Err(NativeImportError::TooManyCandidates {
-                app_id: app.as_str().to_owned(),
-                limit: MAX_NATIVE_IMPORT_CANDIDATES,
-            }
-            .into());
-        }
     }
     if candidates.is_empty() {
         return Err(missing(format!("{label} providers")));
@@ -346,15 +344,20 @@ fn import_claude_desktop(documents: &LiveDocumentSet) -> ProjectResult<Vec<Nativ
             LogicalTarget::ClaudeDesktopNormalConfig,
             "Claude Desktop",
         )?;
-        let threep = optional_json_object(
-            documents,
-            LogicalTarget::ClaudeDesktopThreepConfig,
-            "Claude Desktop",
-        )?;
-        let official = [normal.as_ref(), threep.as_ref()]
-            .into_iter()
-            .flatten()
-            .any(|value| value.get("deploymentMode").and_then(Value::as_str) == Some("1p"));
+        let normal_is_official = normal
+            .as_ref()
+            .is_some_and(|value| value.get("deploymentMode").and_then(Value::as_str) == Some("1p"));
+        let official = if normal_is_official {
+            true
+        } else {
+            optional_json_object(
+                documents,
+                LogicalTarget::ClaudeDesktopThreepConfig,
+                "Claude Desktop",
+            )?
+            .as_ref()
+            .is_some_and(|value| value.get("deploymentMode").and_then(Value::as_str) == Some("1p"))
+        };
         if !official {
             return Err(missing("Claude Desktop direct profile"));
         }
@@ -493,7 +496,7 @@ fn import_hermes(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportC
         }
     }
 
-    let mut candidates = Vec::with_capacity(providers.len().min(MAX_NATIVE_IMPORT_CANDIDATES + 1));
+    let mut candidates = Vec::with_capacity(providers.len());
     for (name, settings) in providers {
         if hermes::prepare_provider_entry(&name, &settings).is_err() {
             return Err(invalid_document(
@@ -515,13 +518,6 @@ fn import_hermes(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportC
             None,
             NativeImportContext::Hermes { source },
         )?);
-        if candidates.len() > MAX_NATIVE_IMPORT_CANDIDATES {
-            return Err(NativeImportError::TooManyCandidates {
-                app_id: AppType::Hermes.as_str().to_owned(),
-                limit: MAX_NATIVE_IMPORT_CANDIDATES,
-            }
-            .into());
-        }
     }
     if candidates.is_empty() {
         return Err(missing("Hermes providers"));
@@ -942,7 +938,7 @@ mod tests {
             }
         );
         let normal = documents(
-            app,
+            app.clone(),
             &[
                 (LogicalTarget::ClaudeDesktopProfile, None),
                 (
@@ -951,8 +947,23 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(
+        assert!(matches!(
             adapter.project_native_import(&normal).unwrap(),
+            NativeImportStep::Ready { .. }
+        ));
+
+        let undecided_normal = documents(
+            app,
+            &[
+                (LogicalTarget::ClaudeDesktopProfile, None),
+                (
+                    LogicalTarget::ClaudeDesktopNormalConfig,
+                    Some(r#"{"deploymentMode":"3p"}"#),
+                ),
+            ],
+        );
+        assert_eq!(
+            adapter.project_native_import(&undecided_normal).unwrap(),
             NativeImportStep::Observe {
                 target: LogicalTarget::ClaudeDesktopThreepConfig
             }
@@ -1041,6 +1052,21 @@ mod tests {
     }
 
     #[test]
+    fn additive_import_preserves_all_candidates_from_a_bounded_document() {
+        let providers = (0..=4096)
+            .map(|index| (format!("p{index}"), json!({})))
+            .collect::<Map<_, _>>();
+        let source = json!({"providers": providers}).to_string();
+
+        let imported = ready(
+            AppType::Pi,
+            &[(LogicalTarget::PiModels, Some(source.as_str()))],
+        );
+
+        assert_eq!(imported.len(), 4097);
+    }
+
+    #[test]
     fn desktop_and_hermes_return_typed_app_context() {
         let desktop = ready(
             AppType::ClaudeDesktop,
@@ -1100,6 +1126,21 @@ mod tests {
         let debug = format!("{candidates:?}");
         assert!(!debug.contains("do-not-log"));
         assert!(debug.contains("<redacted>"));
+
+        let desktop = ready(
+            AppType::ClaudeDesktop,
+            &[(
+                LogicalTarget::ClaudeDesktopProfile,
+                Some(
+                    r#"{"inferenceGatewayBaseUrl":"https://example.com","inferenceGatewayApiKey":"do-not-log","inferenceModels":[{"name":"claude-sonnet-private-model","labelOverride":"private-label"}]}"#,
+                ),
+            )],
+        );
+        let desktop_debug = format!("{desktop:?}");
+        assert!(!desktop_debug.contains("do-not-log"));
+        assert!(!desktop_debug.contains("private-model"));
+        assert!(!desktop_debug.contains("private-label"));
+        assert!(desktop_debug.contains("route_count: 1"));
 
         assert!(matches!(
             project_native_import(
