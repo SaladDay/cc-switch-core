@@ -3,8 +3,8 @@
 use std::fmt;
 
 use crate::{
-    builtin_app_registry, projection, AppDescriptor, AppType, LogicalTarget, NativePlanError,
-    NativePlanRequest, OperationPlan, OperationPlanError,
+    builtin_app_registry, projection, AppDescriptor, AppType, LogicalTarget, NativeAction,
+    NativePlanError, NativePlanRequest, OperationPlan, OperationPlanError, ProviderSnapshot,
 };
 
 mod sealed {
@@ -21,6 +21,20 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
 
     /// Returns every logical native document this adapter may manage.
     fn targets(&self) -> &'static [LogicalTarget];
+
+    /// Returns the targets a host must observe for this native action.
+    fn required_native_targets(
+        &self,
+        action: NativeAction,
+        provider: &ProviderSnapshot,
+    ) -> Result<Vec<LogicalTarget>, NativePlanError> {
+        projection::required_native_targets(
+            self.descriptor().app(),
+            self.targets(),
+            action,
+            provider,
+        )
+    }
 
     /// Validates that an operation plan belongs to this adapter.
     fn validate_plan(&self, plan: &OperationPlan) -> Result<(), OperationPlanError> {

@@ -136,6 +136,35 @@ pub enum NativePlanError {
     InvalidPlan(#[from] OperationPlanError),
 }
 
+pub(crate) fn required_native_targets(
+    adapter_app: &AppType,
+    declared_targets: &[LogicalTarget],
+    action: NativeAction,
+    provider: &ProviderSnapshot,
+) -> Result<Vec<LogicalTarget>, NativePlanError> {
+    if provider.app != *adapter_app {
+        return Err(NativePlanError::WrongProviderApp {
+            expected: adapter_app.as_str().to_owned(),
+            actual: provider.app.as_str().to_owned(),
+        });
+    }
+    if action == NativeAction::Remove && !adapter_app.is_additive_mode() {
+        return Err(NativePlanError::UnsupportedAction {
+            app_id: adapter_app.as_str().to_owned(),
+            action,
+        });
+    }
+
+    let mut targets = declared_targets.to_vec();
+    if *adapter_app == AppType::Codex
+        && action == NativeAction::Apply
+        && provider.settings.get("modelCatalog").is_none()
+    {
+        targets.retain(|target| *target != LogicalTarget::CodexModelCatalog);
+    }
+    Ok(targets)
+}
+
 pub(crate) fn plan_native(
     adapter_app: &AppType,
     request: &NativePlanRequest<'_>,
@@ -583,10 +612,16 @@ fn contents(
     documents: &LiveDocumentSet,
     target: LogicalTarget,
 ) -> Result<Option<&[u8]>, NativePlanError> {
-    documents
+    let document = documents
         .document(target)
-        .map(|document| document.contents())
-        .ok_or_else(|| invalid_document(target, "target was not supplied by the host"))
+        .ok_or_else(|| invalid_document(target, "target was not supplied by the host"))?;
+    if !document.is_observed() {
+        return Err(invalid_document(
+            target,
+            "target was not observed by the host",
+        ));
+    }
+    Ok(document.contents())
 }
 
 fn invalid_context(app: &AppType, message: impl Into<String>) -> NativePlanError {
@@ -1609,6 +1644,74 @@ mod tests {
             serde_json::from_str(write_contents(&plan, LogicalTarget::CodexModelCatalog))
                 .expect("Codex catalog JSON");
         assert_eq!(catalog["models"][0]["slug"], "qwen3-coder-plus");
+    }
+
+    #[test]
+    fn codex_requires_the_catalog_target_only_when_the_provider_manages_it() {
+        let adapter = builtin_app_adapter(&AppType::Codex);
+        let unmanaged = ProviderSnapshot::new(
+            "custom",
+            AppType::Codex,
+            "Custom",
+            json!({"auth": {}, "config": "model = \"gpt-5\"\n"}),
+        );
+        let managed = ProviderSnapshot::new(
+            "custom",
+            AppType::Codex,
+            "Custom",
+            json!({
+                "auth": {},
+                "config": "model = \"gpt-5\"\n",
+                "modelCatalog": {"models": []}
+            }),
+        );
+
+        let unmanaged_targets = adapter
+            .required_native_targets(NativeAction::Apply, &unmanaged)
+            .expect("unmanaged target set");
+        assert!(!unmanaged_targets.contains(&LogicalTarget::CodexModelCatalog));
+        let managed_targets = adapter
+            .required_native_targets(NativeAction::Apply, &managed)
+            .expect("managed target set");
+        assert!(managed_targets.contains(&LogicalTarget::CodexModelCatalog));
+
+        let documents = LiveDocumentSet::try_new(
+            AppType::Codex,
+            [
+                ObservedDocument::missing(LogicalTarget::CodexAuth),
+                ObservedDocument::missing(LogicalTarget::CodexConfig),
+                ObservedDocument::unobserved(LogicalTarget::CodexModelCatalog),
+            ],
+        )
+        .expect("complete Codex target inventory");
+        adapter
+            .plan_native(&NativePlanRequest {
+                action: NativeAction::Apply,
+                provider: &unmanaged,
+                documents: &documents,
+                mode: NativeProviderMode::Custom,
+                access: NativeProviderAccess::Writable,
+                context: NativePlanContext::Standard {
+                    common_config: None,
+                },
+            })
+            .expect("unmanaged catalog is not observed");
+        assert!(matches!(
+            adapter.plan_native(&NativePlanRequest {
+                action: NativeAction::Apply,
+                provider: &managed,
+                documents: &documents,
+                mode: NativeProviderMode::Custom,
+                access: NativeProviderAccess::Writable,
+                context: NativePlanContext::Standard {
+                    common_config: None,
+                },
+            }),
+            Err(NativePlanError::InvalidDocument {
+                target: LogicalTarget::CodexModelCatalog,
+                ..
+            })
+        ));
     }
 
     #[test]
