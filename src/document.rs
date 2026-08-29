@@ -12,12 +12,13 @@ use crate::{builtin_app_adapter, AppType, LogicalTarget, MAX_OPERATION_CONTENT_B
 
 /// One observed logical target.
 ///
-/// `None` means the target did not exist when the host observed it. The
-/// contents are deliberately omitted from `Debug` because live documents may
-/// contain credentials.
+/// The target is explicitly present, missing, or unobserved. Contents are
+/// deliberately omitted from `Debug` because live documents may contain
+/// credentials.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ObservedDocument {
     target: LogicalTarget,
+    observed: bool,
     contents: Option<Vec<u8>>,
 }
 
@@ -26,6 +27,7 @@ impl ObservedDocument {
     pub fn present(target: LogicalTarget, contents: impl Into<Vec<u8>>) -> Self {
         Self {
             target,
+            observed: true,
             contents: Some(contents.into()),
         }
     }
@@ -34,6 +36,19 @@ impl ObservedDocument {
     pub fn missing(target: LogicalTarget) -> Self {
         Self {
             target,
+            observed: true,
+            contents: None,
+        }
+    }
+
+    /// Records a declared target that the host did not need to read.
+    ///
+    /// Projection fails if it later attempts to use this target. This lets a
+    /// host avoid unrelated I/O while retaining a complete target inventory.
+    pub fn unobserved(target: LogicalTarget) -> Self {
+        Self {
+            target,
+            observed: false,
             contents: None,
         }
     }
@@ -43,9 +58,14 @@ impl ObservedDocument {
         self.target
     }
 
-    /// Returns the observed bytes, or `None` when the target was missing.
+    /// Returns observed bytes, or `None` when missing or unobserved.
     pub fn contents(&self) -> Option<&[u8]> {
         self.contents.as_deref()
+    }
+
+    /// Returns whether the host actually checked this target.
+    pub fn is_observed(&self) -> bool {
+        self.observed
     }
 }
 
@@ -53,13 +73,16 @@ impl fmt::Debug for ObservedDocument {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = formatter.debug_struct("ObservedDocument");
         debug.field("target", &self.target);
-        match &self.contents {
-            Some(contents) => {
+        match (self.observed, &self.contents) {
+            (false, _) => {
+                debug.field("contents", &"<unobserved>");
+            }
+            (true, Some(contents)) => {
                 debug
                     .field("contents", &"<redacted>")
                     .field("content_bytes", &contents.len());
             }
-            None => {
+            (true, None) => {
                 debug.field("contents", &"<missing>");
             }
         }
@@ -245,6 +268,22 @@ mod tests {
                 target: LogicalTarget::GeminiSettings
             }
         );
+    }
+
+    #[test]
+    fn keeps_unobserved_targets_distinct_from_missing_targets() {
+        let snapshot = LiveDocumentSet::try_new(
+            AppType::Claude,
+            [ObservedDocument::unobserved(LogicalTarget::ClaudeSettings)],
+        )
+        .expect("complete target inventory");
+        let document = snapshot
+            .document(LogicalTarget::ClaudeSettings)
+            .expect("declared target");
+
+        assert!(!document.is_observed());
+        assert!(document.contents().is_none());
+        assert!(format!("{document:?}").contains("<unobserved>"));
     }
 
     #[test]

@@ -3,7 +3,8 @@
 use std::fmt;
 
 use crate::{
-    builtin_app_registry, AppDescriptor, AppType, LogicalTarget, OperationPlan, OperationPlanError,
+    builtin_app_registry, projection, AppDescriptor, AppType, LogicalTarget, NativeAction,
+    NativePlanError, NativePlanRequest, OperationPlan, OperationPlanError, ProviderSnapshot,
 };
 
 mod sealed {
@@ -21,6 +22,22 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
     /// Returns every logical native document this adapter may manage.
     fn targets(&self) -> &'static [LogicalTarget];
 
+    /// Returns the targets a host must observe for this native action.
+    fn required_native_targets(
+        &self,
+        action: NativeAction,
+        provider: &ProviderSnapshot,
+        mode: crate::NativeProviderMode,
+    ) -> Result<Vec<LogicalTarget>, NativePlanError> {
+        projection::required_native_targets(
+            self.descriptor().app(),
+            self.targets(),
+            action,
+            provider,
+            mode,
+        )
+    }
+
     /// Validates that an operation plan belongs to this adapter.
     fn validate_plan(&self, plan: &OperationPlan) -> Result<(), OperationPlanError> {
         plan.validate_for(self.descriptor().app())?;
@@ -33,6 +50,16 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
             return Err(OperationPlanError::UndeclaredTarget { target });
         }
         Ok(())
+    }
+
+    /// Projects one native provider action into a compare-and-swap plan.
+    fn plan_native(
+        &self,
+        request: &NativePlanRequest<'_>,
+    ) -> Result<OperationPlan, NativePlanError> {
+        let plan = projection::plan_native(self.descriptor().app(), request)?;
+        self.validate_plan(&plan)?;
+        Ok(plan)
     }
 }
 

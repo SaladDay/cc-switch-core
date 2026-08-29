@@ -25,6 +25,7 @@ pub mod openclaw;
 pub mod opencode;
 mod operation;
 pub mod pi;
+mod projection;
 mod provider;
 mod registry;
 
@@ -35,6 +36,10 @@ pub use operation::{
     ConfigFormat, ContentExpectation, LogicalTarget, OperationPlan, OperationPlanDecodeError,
     OperationPlanError, PlannedWrite, MAX_OPERATION_CONTENT_BYTES, MAX_OPERATION_PLAN_WIRE_BYTES,
     MAX_OPERATION_WRITES, OPERATION_CONTRACT_MAJOR,
+};
+pub use projection::{
+    NativeAction, NativePlanContext, NativePlanError, NativePlanRequest, NativeProviderAccess,
+    NativeProviderMode, MAX_NATIVE_PLAN_INPUT_BYTES, MAX_NATIVE_PLAN_ROUTES,
 };
 pub use provider::{ProviderEntry, ProviderSnapshot};
 pub use registry::{
