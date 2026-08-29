@@ -3,7 +3,8 @@
 use std::fmt;
 
 use crate::{
-    builtin_app_registry, AppDescriptor, AppType, LogicalTarget, OperationPlan, OperationPlanError,
+    builtin_app_registry, projection, AppDescriptor, AppType, LogicalTarget, NativePlanError,
+    NativePlanRequest, OperationPlan, OperationPlanError,
 };
 
 mod sealed {
@@ -33,6 +34,16 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
             return Err(OperationPlanError::UndeclaredTarget { target });
         }
         Ok(())
+    }
+
+    /// Projects one native provider action into a compare-and-swap plan.
+    fn plan_native(
+        &self,
+        request: &NativePlanRequest<'_>,
+    ) -> Result<OperationPlan, NativePlanError> {
+        let plan = projection::plan_native(self.descriptor().app(), request)?;
+        self.validate_plan(&plan)?;
+        Ok(plan)
     }
 }
 
