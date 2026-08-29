@@ -12,9 +12,17 @@
 
 mod app_type;
 pub mod claude;
+pub mod claude_desktop;
 pub mod codex;
+pub mod common_config;
 pub mod fs;
+pub mod gemini;
+pub mod grokbuild;
+pub mod hermes;
+pub mod openclaw;
+pub mod opencode;
+pub mod pi;
 mod provider;
 
 pub use app_type::{AppType, ParseAppTypeError};
-pub use provider::ProviderSnapshot;
+pub use provider::{ProviderEntry, ProviderSnapshot};
