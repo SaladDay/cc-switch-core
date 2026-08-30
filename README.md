@@ -16,8 +16,11 @@ The `0.1` API contains:
 The live-operation layer does not own paths, raw-plan syntax validation,
 concrete file I/O, locks, business state, databases, UI, OAuth flows, proxy
 behavior, catalog generation, or the plugin system. Hosts supply stable
-resource identities and atomic single-target I/O; Core supplies structural plan
-validation, compare-and-swap sequencing, and guarded rollback. The crate's
+resource identities, bounded reads, and conditional single-target replacement
+relative to their documented synchronization primitive; Core supplies
+structural plan validation, compare-and-swap sequencing, and guarded rollback.
+Ordinary filesystems cannot exclude non-cooperating writers between comparison
+and replacement, so each host must document that platform limit. The crate's
 separate `fs` module remains the small shared file-writing primitive layer.
 
 The API may change before `1.0.0`.

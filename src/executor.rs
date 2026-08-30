@@ -1,8 +1,8 @@
 //! Host-neutral execution for native live-configuration plans.
 //!
 //! Core owns validation, compare-and-swap checks, write ordering, and guarded
-//! rollback. Hosts retain ownership of resource resolution, exact I/O,
-//! platform security, atomic replacement, and locking.
+//! rollback. Hosts retain ownership of resource resolution, bounded exact I/O,
+//! platform security, conditional replacement, and locking.
 
 use std::{error::Error, fmt};
 
@@ -14,12 +14,14 @@ use crate::{
 
 /// Product-owned resource access used by the shared operation executor.
 ///
-/// A host must resolve equal physical resources to equal `Resource` values,
+/// A host must resolve equal physical resources to equal `Resource` values and
 /// validate any plan contents that did not come from a built-in Core
-/// projection, return exact bytes from `read`, and make each `write` an atomic
-/// replacement or removal whenever the platform permits it. The host is also
-/// responsible for holding its application lock for the complete plan/receipt
-/// lifecycle.
+/// projection. Reads must stop after `maximum + 1` bytes. Conditional exchanges
+/// must compare and replace under the same host synchronization primitive.
+///
+/// Filesystems generally cannot exclude programs that ignore that primitive.
+/// The host must document that platform limit and hold its application lock for
+/// the complete plan/receipt lifecycle.
 pub trait OperationHost {
     type Resource: Eq;
     type Error;
@@ -27,15 +29,53 @@ pub trait OperationHost {
     /// Resolves a logical target to a stable, host-owned resource identity.
     fn resolve(&mut self, target: LogicalTarget) -> Result<Self::Resource, Self::Error>;
 
-    /// Reads exact bytes, returning `None` only when the resource is absent.
-    fn read(&mut self, resource: &Self::Resource) -> Result<Option<Vec<u8>>, Self::Error>;
-
-    /// Replaces a resource with exact bytes, or removes it for `None`.
-    fn write(
+    /// Reads exact bytes under an allocation and I/O bound.
+    fn read(
         &mut self,
         resource: &Self::Resource,
-        contents: Option<&[u8]>,
-    ) -> Result<(), Self::Error>;
+        maximum: usize,
+    ) -> Result<OperationRead, Self::Error>;
+
+    /// Replaces `expected` with `replacement` as one conditional host action.
+    ///
+    /// `Conflict` must leave the resource unchanged. Comparison should inspect
+    /// at most `expected.len() + 1` bytes. An error may have happened before or
+    /// after replacement, so the executor treats its outcome as uncertain and
+    /// runs guarded rollback.
+    fn compare_exchange(
+        &mut self,
+        resource: &Self::Resource,
+        expected: Option<&[u8]>,
+        replacement: Option<&[u8]>,
+    ) -> Result<CompareExchangeOutcome, Self::Error>;
+}
+
+/// Result of one host-bounded exact read.
+pub enum OperationRead {
+    Missing,
+    Contents(Vec<u8>),
+    TooLarge,
+}
+
+impl fmt::Debug for OperationRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("Missing"),
+            Self::Contents(contents) => formatter
+                .debug_struct("Contents")
+                .field("bytes", &contents.len())
+                .field("value", &"<redacted>")
+                .finish(),
+            Self::TooLarge => formatter.write_str("TooLarge"),
+        }
+    }
+}
+
+/// Result of a host-owned conditional replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareExchangeOutcome {
+    Applied,
+    Conflict,
 }
 
 /// The primary reason an operation could not complete.
@@ -215,10 +255,9 @@ impl<R> fmt::Debug for OperationReceipt<R> {
 /// Executes a validated plan through host-owned resources.
 ///
 /// All resources and preconditions are checked before the first write. Each
-/// target is checked again immediately before it is changed. A mid-operation
-/// failure rolls back already attempted writes in reverse order, but rollback
-/// never overwrites bytes that differ from both the original and intended
-/// contents.
+/// target is conditionally checked as it is changed. A mid-operation failure
+/// rolls back already attempted writes in reverse order, but every restoration
+/// is itself conditional on the intended bytes still being present.
 pub fn execute_operation_plan<H>(
     plan: &OperationPlan,
     host: &mut H,
@@ -268,18 +307,6 @@ where
     let mut applied = Vec::with_capacity(prepared.len());
     for prepared_write in prepared {
         let target = prepared_write.write.target;
-        let current = match read_for_execution(host, &prepared_write.resource, target) {
-            Ok(current) => current,
-            Err(failure) => return Err(failure_with_rollback(host, failure, &applied)),
-        };
-        if current != prepared_write.original {
-            return Err(failure_with_rollback(
-                host,
-                OperationFailure::Conflict { target },
-                &applied,
-            ));
-        }
-
         let written = prepared_write
             .write
             .contents
@@ -296,15 +323,28 @@ where
             original: prepared_write.original,
             written,
         };
-        if let Err(source) = host.write(&attempted.resource, attempted.written.as_deref()) {
-            applied.push(attempted);
-            return Err(failure_with_rollback(
-                host,
-                OperationFailure::Write { target, source },
-                &applied,
-            ));
+        match host.compare_exchange(
+            &attempted.resource,
+            attempted.original.as_deref(),
+            attempted.written.as_deref(),
+        ) {
+            Ok(CompareExchangeOutcome::Applied) => applied.push(attempted),
+            Ok(CompareExchangeOutcome::Conflict) => {
+                return Err(failure_with_rollback(
+                    host,
+                    OperationFailure::Conflict { target },
+                    &applied,
+                ));
+            }
+            Err(source) => {
+                applied.push(attempted);
+                return Err(failure_with_rollback(
+                    host,
+                    OperationFailure::Write { target, source },
+                    &applied,
+                ));
+            }
         }
-        applied.push(attempted);
     }
 
     Ok(OperationReceipt { applied })
@@ -318,19 +358,21 @@ fn read_for_execution<H>(
 where
     H: OperationHost,
 {
-    let contents = host
-        .read(resource)
-        .map_err(|source| OperationFailure::Read { target, source })?;
-    if contents
-        .as_ref()
-        .is_some_and(|contents| contents.len() > MAX_OPERATION_CONTENT_BYTES)
+    match host
+        .read(resource, MAX_OPERATION_CONTENT_BYTES)
+        .map_err(|source| OperationFailure::Read { target, source })?
     {
-        return Err(OperationFailure::ObservedContentTooLarge {
-            target,
-            limit: MAX_OPERATION_CONTENT_BYTES,
-        });
+        OperationRead::Missing => Ok(None),
+        OperationRead::Contents(contents) if contents.len() <= MAX_OPERATION_CONTENT_BYTES => {
+            Ok(Some(contents))
+        }
+        OperationRead::Contents(_) | OperationRead::TooLarge => {
+            Err(OperationFailure::ObservedContentTooLarge {
+                target,
+                limit: MAX_OPERATION_CONTENT_BYTES,
+            })
+        }
     }
-    Ok(contents)
 }
 
 fn execution_error<E>(failure: OperationFailure<E>) -> OperationExecutionError<E> {
@@ -363,43 +405,47 @@ where
 {
     let mut failures = Vec::new();
     for applied_write in applied.iter().rev() {
-        let current = match host.read(&applied_write.resource) {
-            Ok(contents)
-                if contents
-                    .as_ref()
-                    .is_some_and(|contents| contents.len() > MAX_OPERATION_CONTENT_BYTES) =>
-            {
-                failures.push(OperationRollbackFailure::ObservedContentTooLarge {
-                    target: applied_write.target,
-                    limit: MAX_OPERATION_CONTENT_BYTES,
-                });
-                continue;
+        match host.compare_exchange(
+            &applied_write.resource,
+            applied_write.written.as_deref(),
+            applied_write.original.as_deref(),
+        ) {
+            Ok(CompareExchangeOutcome::Applied) => {}
+            Ok(CompareExchangeOutcome::Conflict) => {
+                match host.read(&applied_write.resource, MAX_OPERATION_CONTENT_BYTES) {
+                    Ok(OperationRead::Missing) if applied_write.original.is_none() => {}
+                    Ok(OperationRead::Contents(contents))
+                        if contents.len() <= MAX_OPERATION_CONTENT_BYTES
+                            && applied_write.original.as_deref() == Some(contents.as_slice()) => {}
+                    Ok(OperationRead::Contents(contents))
+                        if contents.len() > MAX_OPERATION_CONTENT_BYTES =>
+                    {
+                        failures.push(OperationRollbackFailure::ObservedContentTooLarge {
+                            target: applied_write.target,
+                            limit: MAX_OPERATION_CONTENT_BYTES,
+                        });
+                    }
+                    Ok(OperationRead::TooLarge) => {
+                        failures.push(OperationRollbackFailure::ObservedContentTooLarge {
+                            target: applied_write.target,
+                            limit: MAX_OPERATION_CONTENT_BYTES,
+                        });
+                    }
+                    Ok(OperationRead::Missing | OperationRead::Contents(_)) => {
+                        failures.push(OperationRollbackFailure::Changed {
+                            target: applied_write.target,
+                        });
+                    }
+                    Err(source) => failures.push(OperationRollbackFailure::Read {
+                        target: applied_write.target,
+                        source,
+                    }),
+                }
             }
-            Ok(contents) => contents,
-            Err(source) => {
-                failures.push(OperationRollbackFailure::Read {
-                    target: applied_write.target,
-                    source,
-                });
-                continue;
-            }
-        };
-
-        if current == applied_write.original {
-            continue;
-        }
-        if current != applied_write.written {
-            failures.push(OperationRollbackFailure::Changed {
-                target: applied_write.target,
-            });
-            continue;
-        }
-        if let Err(source) = host.write(&applied_write.resource, applied_write.original.as_deref())
-        {
-            failures.push(OperationRollbackFailure::Write {
+            Err(source) => failures.push(OperationRollbackFailure::Write {
                 target: applied_write.target,
                 source,
-            });
+            }),
         }
     }
     failures
@@ -427,12 +473,12 @@ mod tests {
         documents: HashMap<u8, Vec<u8>>,
         resources: HashMap<LogicalTarget, u8>,
         reads: HashMap<u8, usize>,
-        writes: usize,
+        exchanges: usize,
         fail_resolve: Option<LogicalTarget>,
         fail_read: Option<(u8, usize)>,
-        fail_write: Option<usize>,
-        apply_failed_write: bool,
-        mutate_read: Option<(u8, usize, Option<Vec<u8>>)>,
+        fail_exchange: Option<usize>,
+        apply_failed_exchange: bool,
+        mutate_exchange: Option<(u8, Option<Vec<u8>>)>,
     }
 
     impl FakeHost {
@@ -467,18 +513,36 @@ mod tests {
                 .or_insert_with(|| resource_for(target)))
         }
 
-        fn read(&mut self, resource: &Self::Resource) -> Result<Option<Vec<u8>>, Self::Error> {
+        fn read(
+            &mut self,
+            resource: &Self::Resource,
+            maximum: usize,
+        ) -> Result<OperationRead, Self::Error> {
             let count = self.reads.entry(*resource).or_default();
             *count += 1;
             if self.fail_read == Some((*resource, *count)) {
                 return Err(FakeError::Read);
             }
+            match self.documents.get(resource) {
+                Some(contents) if contents.len() > maximum => Ok(OperationRead::TooLarge),
+                Some(contents) => Ok(OperationRead::Contents(contents.clone())),
+                None => Ok(OperationRead::Missing),
+            }
+        }
+
+        fn compare_exchange(
+            &mut self,
+            resource: &Self::Resource,
+            expected: Option<&[u8]>,
+            replacement: Option<&[u8]>,
+        ) -> Result<CompareExchangeOutcome, Self::Error> {
+            self.exchanges += 1;
             if self
-                .mutate_read
+                .mutate_exchange
                 .as_ref()
-                .is_some_and(|(target, read, _)| *target == *resource && *read == *count)
+                .is_some_and(|(target, _)| *target == *resource)
             {
-                let (_, _, contents) = self.mutate_read.take().expect("matched mutation");
+                let (_, contents) = self.mutate_exchange.take().expect("matched mutation");
                 match contents {
                     Some(contents) => {
                         self.documents.insert(*resource, contents);
@@ -488,18 +552,13 @@ mod tests {
                     }
                 }
             }
-            Ok(self.documents.get(resource).cloned())
-        }
+            if self.documents.get(resource).map(Vec::as_slice) != expected {
+                return Ok(CompareExchangeOutcome::Conflict);
+            }
 
-        fn write(
-            &mut self,
-            resource: &Self::Resource,
-            contents: Option<&[u8]>,
-        ) -> Result<(), Self::Error> {
-            self.writes += 1;
-            let should_fail = self.fail_write == Some(self.writes);
-            if !should_fail || self.apply_failed_write {
-                match contents {
+            let should_fail = self.fail_exchange == Some(self.exchanges);
+            if !should_fail || self.apply_failed_exchange {
+                match replacement {
                     Some(contents) => {
                         self.documents.insert(*resource, contents.to_vec());
                     }
@@ -511,7 +570,7 @@ mod tests {
             if should_fail {
                 Err(FakeError::Write)
             } else {
-                Ok(())
+                Ok(CompareExchangeOutcome::Applied)
             }
         }
     }
@@ -557,7 +616,7 @@ mod tests {
             OperationFailure::InvalidPlan(OperationPlanError::Empty)
         ));
         assert!(host.reads.is_empty());
-        assert_eq!(host.writes, 0);
+        assert_eq!(host.exchanges, 0);
     }
 
     #[test]
@@ -577,7 +636,7 @@ mod tests {
             OperationFailure::AliasedTargets { .. }
         ));
         assert!(host.reads.is_empty());
-        assert_eq!(host.writes, 0);
+        assert_eq!(host.exchanges, 0);
     }
 
     #[test]
@@ -598,11 +657,11 @@ mod tests {
             host.document(LogicalTarget::CodexAuth),
             Some(&b"external"[..])
         );
-        assert_eq!(host.writes, 0);
+        assert_eq!(host.exchanges, 0);
     }
 
     #[test]
-    fn recheck_conflict_rolls_back_earlier_writes_and_preserves_external_bytes() {
+    fn conditional_exchange_conflict_rolls_back_earlier_writes_and_preserves_external_bytes() {
         let plan = codex_plan(&[
             (LogicalTarget::CodexAuth, b"auth", "next-auth"),
             (LogicalTarget::CodexConfig, b"config", "next-config"),
@@ -611,9 +670,9 @@ mod tests {
         let mut host = FakeHost::default()
             .with_document(LogicalTarget::CodexAuth, b"auth")
             .with_document(LogicalTarget::CodexConfig, b"config");
-        host.mutate_read = Some((config_resource, 2, Some(b"external".to_vec())));
+        host.mutate_exchange = Some((config_resource, Some(b"external".to_vec())));
 
-        let error = execute_operation_plan(&plan, &mut host).expect_err("recheck conflict");
+        let error = execute_operation_plan(&plan, &mut host).expect_err("exchange conflict");
 
         assert!(matches!(
             error.failure(),
@@ -638,8 +697,8 @@ mod tests {
         let mut host = FakeHost::default()
             .with_document(LogicalTarget::CodexAuth, b"auth")
             .with_document(LogicalTarget::CodexConfig, b"config");
-        host.fail_write = Some(2);
-        host.apply_failed_write = true;
+        host.fail_exchange = Some(2);
+        host.apply_failed_exchange = true;
 
         let error = execute_operation_plan(&plan, &mut host).expect_err("second write fails");
 

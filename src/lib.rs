@@ -35,8 +35,9 @@ pub use adapter::{builtin_app_adapter, builtin_app_adapters, AppAdapter};
 pub use app_type::{AppType, ParseAppTypeError};
 pub use document::{LiveDocumentSet, LiveDocumentSetError, ObservedDocument};
 pub use executor::{
-    execute_operation_plan, OperationExecutionError, OperationFailure, OperationHost,
-    OperationReceipt, OperationRollbackError, OperationRollbackFailure,
+    execute_operation_plan, CompareExchangeOutcome, OperationExecutionError, OperationFailure,
+    OperationHost, OperationRead, OperationReceipt, OperationRollbackError,
+    OperationRollbackFailure,
 };
 pub use native_import::{
     HermesProviderSource, NativeImportCandidate, NativeImportContext, NativeImportError,
