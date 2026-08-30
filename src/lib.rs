@@ -17,6 +17,7 @@ pub mod claude_desktop;
 pub mod codex;
 pub mod common_config;
 mod document;
+mod executor;
 pub mod fs;
 pub mod gemini;
 pub mod grokbuild;
@@ -33,6 +34,10 @@ mod registry;
 pub use adapter::{builtin_app_adapter, builtin_app_adapters, AppAdapter};
 pub use app_type::{AppType, ParseAppTypeError};
 pub use document::{LiveDocumentSet, LiveDocumentSetError, ObservedDocument};
+pub use executor::{
+    execute_operation_plan, OperationExecutionError, OperationFailure, OperationHost,
+    OperationReceipt, OperationRollbackError, OperationRollbackFailure,
+};
 pub use native_import::{
     HermesProviderSource, NativeImportCandidate, NativeImportContext, NativeImportError,
     NativeImportStep,

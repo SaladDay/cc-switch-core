@@ -1,8 +1,9 @@
 //! Product-neutral live-configuration operation contracts.
 //!
-//! This module describes intended writes and their preconditions. Consumers
-//! remain responsible for resolving paths, validating document syntax,
-//! acquiring locks, applying writes, and rolling back failures.
+//! This module describes intended writes and their preconditions. The shared
+//! executor sequences those writes through host-owned resources; consumers
+//! retain ownership of paths, raw-plan syntax validation, exact I/O, platform
+//! security, and locking.
 
 use std::{collections::HashSet, fmt};
 

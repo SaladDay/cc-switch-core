@@ -10,11 +10,14 @@ The `0.1` API contains:
 - source-neutral, lossless provider snapshots;
 - redacted provider entries for additive application configs;
 - deterministic JSON and atomic file-writing primitives;
+- host-neutral compare-and-swap execution with guarded rollback;
 - pure live projections and validation for all nine supported applications.
 
-The live-projection layer does not own paths, operation execution, file I/O, locks, rollback,
-business state, databases, UI, OAuth flows, proxy behavior, catalog generation,
-or the plugin system. The crate's separate `fs` module remains the small shared
-file-writing primitive layer.
+The live-operation layer does not own paths, raw-plan syntax validation,
+concrete file I/O, locks, business state, databases, UI, OAuth flows, proxy
+behavior, catalog generation, or the plugin system. Hosts supply stable
+resource identities and atomic single-target I/O; Core supplies structural plan
+validation, compare-and-swap sequencing, and guarded rollback. The crate's
+separate `fs` module remains the small shared file-writing primitive layer.
 
 The API may change before `1.0.0`.
