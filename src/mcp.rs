@@ -1491,7 +1491,7 @@ fn copy_fields(source: &Map<String, Value>, target: &mut Map<String, Value>, key
     }
 }
 
-fn replace_yaml_section(
+pub(crate) fn replace_yaml_section(
     raw: &str,
     key: &str,
     value: &serde_yaml::Value,

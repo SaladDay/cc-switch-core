@@ -830,6 +830,11 @@ fn project_yaml_skill_enabled(
     enabled: bool,
 ) -> Result<Option<String>, SkillConfigError> {
     let mut root = parse_skill_yaml(target, contents)?;
+    let skills_key = serde_yaml::Value::String("skills".to_owned());
+    let section_existed = root
+        .as_mapping()
+        .expect("validated Skill YAML has a mapping root")
+        .contains_key(&skills_key);
     let platform_disabled = yaml_platform_disables_name(target, &root, name)?;
     if enabled && platform_disabled {
         return Err(SkillConfigError::ExternallyDisabled { target });
@@ -843,7 +848,6 @@ fn project_yaml_skill_enabled(
     let root_mapping = root
         .as_mapping_mut()
         .expect("validated Skill YAML has a mapping root");
-    let skills_key = serde_yaml::Value::String("skills".to_owned());
     if !root_mapping
         .get(&skills_key)
         .is_some_and(serde_yaml::Value::is_mapping)
@@ -868,8 +872,27 @@ fn project_yaml_skill_enabled(
         serde_yaml::Value::String("disabled".to_owned()),
         serde_yaml::Value::Sequence(next.into_iter().map(serde_yaml::Value::String).collect()),
     );
-    let output = serde_yaml::to_string(&root)
-        .map_err(|error| invalid_skill_config(target, &error.to_string()))?;
+    let original = contents
+        .filter(|contents| !contents.is_empty())
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|_| invalid_skill_config(target, "document is not UTF-8"))?
+        .unwrap_or_default();
+    let output = crate::mcp::replace_yaml_section(
+        original,
+        "skills",
+        root_mapping
+            .get(&skills_key)
+            .expect("projected YAML contains skills"),
+        section_existed,
+    )
+    .map_err(|message| invalid_skill_config(target, &message))?;
+    serde_yaml::from_str::<serde_yaml::Value>(&output).map_err(|_| {
+        invalid_skill_config(
+            target,
+            "projected skills section would invalidate the YAML document",
+        )
+    })?;
     validate_projected_size(target, output)
 }
 
@@ -2019,7 +2042,7 @@ mod tests {
 
     #[test]
     fn hermes_disabled_names_preserve_unrelated_yaml_and_platform_controls() {
-        let original = b"model:\n  default: local\nskills:\n  config:\n    token: keep\n  disabled: [old]\n  platform_disabled:\n    telegram: [mobile]\n";
+        let original = b"# keep this comment\nmodel:\n  default: local\nskills:\n  config:\n    token: keep\n  disabled: [old]\n  platform_disabled:\n    telegram: [mobile]\n";
         let disabled = project_skill_config_enabled(
             SkillConfigTarget::HermesConfig,
             Some(original),
@@ -2028,6 +2051,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert!(disabled.contains("# keep this comment"));
         let parsed = serde_yaml::from_str::<serde_yaml::Value>(&disabled).unwrap();
         assert_eq!(parsed["model"]["default"], "local");
         assert_eq!(parsed["skills"]["config"]["token"], "keep");
