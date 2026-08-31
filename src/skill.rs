@@ -1219,6 +1219,9 @@ fn recover_interrupted_deployment(
         let Some(marker) = read_operation_marker(&temporary_root)? else {
             continue;
         };
+        if marker.directory != directory {
+            continue;
+        }
         if marker.version != TEMP_MARKER_VERSION {
             return Err(SkillConfigError::Recovery {
                 message: format!(
@@ -1228,9 +1231,7 @@ fn recover_interrupted_deployment(
             });
         }
         validate_skill_directory(&marker.directory)?;
-        if marker.directory == directory {
-            interrupted.push((temporary_root, marker.operation));
-        }
+        interrupted.push((temporary_root, marker.operation));
     }
     interrupted.sort_by(|left, right| left.0.cmp(&right.0));
     for (temporary_root, operation) in interrupted {
@@ -1649,6 +1650,36 @@ mod tests {
             SkillDeploymentState::Copied
         );
         assert!(!temporary_root.exists());
+    }
+
+    #[test]
+    fn unrelated_future_marker_does_not_block_another_skill() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "other", InterruptedOperation::Enable)
+                .unwrap();
+        fs::write(
+            temporary_root.join(TEMP_MARKER_FILE),
+            serde_json::to_vec(&InterruptedOperationMarker {
+                version: TEMP_MARKER_VERSION + 1,
+                operation: InterruptedOperation::Enable,
+                directory: "other".to_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert!(temporary_root.exists());
+        assert_eq!(
+            inspect_skill_deployment(&source, &destination, "docs").unwrap(),
+            SkillDeploymentState::Copied
+        );
     }
 
     #[test]
