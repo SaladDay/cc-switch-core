@@ -459,6 +459,26 @@ mod tests {
             unified_discovery,
             ["codex", "gemini", "grokbuild", "opencode", "pi"]
         );
+        assert_eq!(
+            builtin_app_registry()
+                .for_app(&AppType::Gemini)
+                .skill_contract()
+                .unwrap()
+                .unified_control(),
+            Some(crate::UnifiedSkillControl::DisabledNameList(
+                crate::SkillConfigTarget::GeminiSettings
+            ))
+        );
+        assert_eq!(
+            builtin_app_registry()
+                .for_app(&AppType::GrokBuild)
+                .skill_contract()
+                .unwrap()
+                .unified_control(),
+            Some(crate::UnifiedSkillControl::DisabledNameList(
+                crate::SkillConfigTarget::GrokConfig
+            ))
+        );
     }
 
     #[test]

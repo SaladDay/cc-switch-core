@@ -67,15 +67,15 @@ pub struct SkillAppContract {
 
 impl SkillAppContract {
     /// Declares a catalog-backed application and its stable shared column.
-    pub const fn catalog_flag(column: &'static str) -> Self {
+    pub const fn with_catalog_column(column: &'static str) -> Self {
         Self {
             catalog_column: Some(column),
             unified_control: None,
         }
     }
 
-    /// Declares an application whose native directory is authoritative.
-    pub const fn native_presence() -> Self {
+    /// Declares an application that has no column in the shared catalog.
+    pub const fn without_catalog() -> Self {
         Self {
             catalog_column: None,
             unified_control: None,
@@ -99,22 +99,23 @@ impl SkillAppContract {
     }
 }
 
-pub const CLAUDE_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_claude");
-pub const CODEX_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_codex")
+pub const CLAUDE_SKILLS: SkillAppContract = SkillAppContract::with_catalog_column("enabled_claude");
+pub const CODEX_SKILLS: SkillAppContract = SkillAppContract::with_catalog_column("enabled_codex")
     .with_unified_store_discovery(UnifiedSkillControl::ReadOnly);
-pub const GEMINI_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_gemini")
+pub const GEMINI_SKILLS: SkillAppContract = SkillAppContract::with_catalog_column("enabled_gemini")
     .with_unified_store_discovery(UnifiedSkillControl::DisabledNameList(
         SkillConfigTarget::GeminiSettings,
     ));
-pub const GROKBUILD_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_grokbuild")
-    .with_unified_store_discovery(UnifiedSkillControl::DisabledNameList(
-        SkillConfigTarget::GrokConfig,
-    ));
-pub const OPENCODE_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_opencode")
-    .with_unified_store_discovery(UnifiedSkillControl::ReadOnly);
-pub const HERMES_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_hermes");
+pub const GROKBUILD_SKILLS: SkillAppContract =
+    SkillAppContract::with_catalog_column("enabled_grokbuild").with_unified_store_discovery(
+        UnifiedSkillControl::DisabledNameList(SkillConfigTarget::GrokConfig),
+    );
+pub const OPENCODE_SKILLS: SkillAppContract =
+    SkillAppContract::with_catalog_column("enabled_opencode")
+        .with_unified_store_discovery(UnifiedSkillControl::ReadOnly);
+pub const HERMES_SKILLS: SkillAppContract = SkillAppContract::with_catalog_column("enabled_hermes");
 pub const PI_SKILLS: SkillAppContract =
-    SkillAppContract::native_presence().with_unified_store_discovery(UnifiedSkillControl::ReadOnly);
+    SkillAppContract::without_catalog().with_unified_store_discovery(UnifiedSkillControl::ReadOnly);
 
 /// How an installed Skill is materialized in an application's native directory.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,12 +394,16 @@ pub fn inspect_skill_config_enabled(
 ) -> Result<bool, SkillConfigError> {
     validate_skill_name(name)?;
     Ok(match target {
-        SkillConfigTarget::GeminiSettings => !json_disabled_names(target, contents)?
-            .iter()
-            .any(|entry| entry == name),
-        SkillConfigTarget::GrokConfig => !toml_disabled_names(target, contents)?
-            .iter()
-            .any(|entry| entry == name),
+        SkillConfigTarget::GeminiSettings => {
+            !json_disabled_names(target, &parse_skill_json(target, contents)?)?
+                .iter()
+                .any(|entry| entry == name)
+        }
+        SkillConfigTarget::GrokConfig => {
+            !toml_disabled_names(target, &parse_skill_toml(target, contents)?)?
+                .iter()
+                .any(|entry| entry == name)
+        }
     })
 }
 
@@ -436,9 +441,8 @@ fn validate_skill_name(name: &str) -> Result<(), SkillConfigError> {
 
 fn json_disabled_names(
     target: SkillConfigTarget,
-    contents: Option<&[u8]>,
+    root: &Value,
 ) -> Result<Vec<String>, SkillConfigError> {
-    let root = parse_skill_json(target, contents)?;
     let Some(skills) = root.get("skills") else {
         return Ok(Vec::new());
     };
@@ -458,7 +462,7 @@ fn project_json_skill_enabled(
     enabled: bool,
 ) -> Result<Option<String>, SkillConfigError> {
     let mut root = parse_skill_json(target, contents)?;
-    let disabled = json_disabled_names(target, contents)?;
+    let disabled = json_disabled_names(target, &root)?;
     let currently_enabled = !disabled.iter().any(|entry| entry == name);
     if currently_enabled == enabled {
         return Ok(None);
@@ -539,9 +543,8 @@ fn string_array(
 
 fn toml_disabled_names(
     target: SkillConfigTarget,
-    contents: Option<&[u8]>,
+    document: &DocumentMut,
 ) -> Result<Vec<String>, SkillConfigError> {
-    let document = parse_skill_toml(target, contents)?;
     let Some(skills) = document.get("skills") else {
         return Ok(Vec::new());
     };
@@ -570,12 +573,12 @@ fn project_toml_skill_enabled(
     name: &str,
     enabled: bool,
 ) -> Result<Option<String>, SkillConfigError> {
-    let disabled = toml_disabled_names(target, contents)?;
+    let mut document = parse_skill_toml(target, contents)?;
+    let disabled = toml_disabled_names(target, &document)?;
     let currently_enabled = !disabled.iter().any(|entry| entry == name);
     if currently_enabled == enabled {
         return Ok(None);
     }
-    let mut document = parse_skill_toml(target, contents)?;
     if document.get("skills").is_none() {
         document["skills"] = Item::Table(Table::new());
     }
