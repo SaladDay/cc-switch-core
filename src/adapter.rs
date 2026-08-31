@@ -4,8 +4,9 @@ use std::fmt;
 
 use crate::{
     builtin_app_registry, native_import, projection, AppDescriptor, AppType, LiveDocumentSet,
-    LogicalTarget, NativeAction, NativeImportError, NativeImportStep, NativePlanError,
-    NativePlanRequest, OperationPlan, OperationPlanError, ProviderSnapshot, SimpleProviderError,
+    LogicalTarget, McpAppContract, McpConfigError, McpConfigTarget, McpImport, McpServerProjection,
+    NativeAction, NativeImportError, NativeImportStep, NativePlanError, NativePlanRequest,
+    OperationPlan, OperationPlanError, ProviderSnapshot, SimpleProviderError,
     SimpleProviderFormDescriptor, SimpleProviderValues,
 };
 
@@ -27,6 +28,34 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
     /// Returns the product-neutral simple provider form for this application.
     fn simple_provider_form(&self) -> &'static SimpleProviderFormDescriptor {
         crate::simple_provider_form(self.descriptor().app())
+    }
+
+    /// Returns this application's MCP document target, when supported.
+    fn mcp_config_target(&self) -> Option<McpConfigTarget> {
+        self.mcp_contract().map(|contract| contract.target())
+    }
+
+    /// Returns this application's MCP behavior, when supported.
+    fn mcp_contract(&self) -> Option<&'static McpAppContract> {
+        self.descriptor().mcp_contract()
+    }
+
+    /// Extracts valid unified MCP servers from an observed live document.
+    fn import_mcp_servers(
+        &self,
+        contents: Option<&[u8]>,
+    ) -> Result<Vec<McpImport>, McpConfigError> {
+        crate::import_mcp_servers(self.descriptor().app(), contents)
+    }
+
+    /// Projects one MCP state change into the complete live document.
+    fn project_mcp_server(
+        &self,
+        contents: Option<&[u8]>,
+        id: &str,
+        projection: McpServerProjection<'_>,
+    ) -> Result<Option<String>, McpConfigError> {
+        crate::project_mcp_server(self.descriptor().app(), contents, id, projection)
     }
 
     /// Extracts the small, shared provider field set from native settings.

@@ -2,7 +2,12 @@
 
 use serde::Serialize;
 
-use crate::AppType;
+use crate::{
+    mcp::{
+        McpAppContract, CLAUDE_MCP, CODEX_MCP, GEMINI_MCP, GROKBUILD_MCP, HERMES_MCP, OPENCODE_MCP,
+    },
+    AppType,
+};
 
 /// A product-facing capability declared by an application.
 ///
@@ -46,6 +51,8 @@ pub struct AppDescriptor {
     configuration_mode: ProviderConfigurationMode,
     capabilities: &'static [AppCapability],
     #[serde(skip_serializing)]
+    mcp_contract: Option<&'static McpAppContract>,
+    #[serde(skip_serializing)]
     aliases: &'static [&'static str],
 }
 
@@ -66,8 +73,14 @@ impl AppDescriptor {
             brand_key,
             configuration_mode,
             capabilities,
+            mcp_contract: None,
             aliases,
         }
+    }
+
+    const fn with_mcp(mut self, contract: &'static McpAppContract) -> Self {
+        self.mcp_contract = Some(contract);
+        self
     }
 
     /// Returns the built-in application type represented by this descriptor.
@@ -103,6 +116,11 @@ impl AppDescriptor {
     /// Returns whether the application declares a capability.
     pub fn supports(&self, capability: AppCapability) -> bool {
         self.capabilities.contains(&capability)
+    }
+
+    /// Returns the native MCP contract declared by this application.
+    pub fn mcp_contract(&self) -> Option<&'static McpAppContract> {
+        self.mcp_contract
     }
 
     fn matches_id(&self, normalized: &str) -> bool {
@@ -197,7 +215,8 @@ static CLAUDE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     ProviderConfigurationMode::Switch,
     PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
     &[],
-);
+)
+.with_mcp(&CLAUDE_MCP);
 
 static CLAUDE_DESKTOP_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::ClaudeDesktop,
@@ -217,7 +236,8 @@ static CODEX_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     ProviderConfigurationMode::Switch,
     PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
     &[],
-);
+)
+.with_mcp(&CODEX_MCP);
 
 static GEMINI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::Gemini,
@@ -227,7 +247,8 @@ static GEMINI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     ProviderConfigurationMode::Switch,
     PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
     &[],
-);
+)
+.with_mcp(&GEMINI_MCP);
 
 static GROKBUILD_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::GrokBuild,
@@ -237,7 +258,8 @@ static GROKBUILD_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     ProviderConfigurationMode::Switch,
     PROVIDER_LIVE_PROXY_MCP_PROMPTS_SKILLS,
     &["grok-build", "grok_build", "grok"],
-);
+)
+.with_mcp(&GROKBUILD_MCP);
 
 static OPENCODE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::OpenCode,
@@ -247,7 +269,8 @@ static OPENCODE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     ProviderConfigurationMode::Additive,
     PROVIDER_LIVE_MCP_PROMPTS_SKILLS,
     &[],
-);
+)
+.with_mcp(&OPENCODE_MCP);
 
 static OPENCLAW_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::OpenClaw,
@@ -267,7 +290,8 @@ static HERMES_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     ProviderConfigurationMode::Additive,
     PROVIDER_LIVE_MCP_PROMPTS_SKILLS,
     &[],
-);
+)
+.with_mcp(&HERMES_MCP);
 
 static PI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::Pi,

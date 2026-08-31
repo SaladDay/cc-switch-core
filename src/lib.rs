@@ -22,6 +22,7 @@ pub mod fs;
 pub mod gemini;
 pub mod grokbuild;
 pub mod hermes;
+mod mcp;
 mod native_import;
 pub mod openclaw;
 pub mod opencode;
@@ -39,6 +40,11 @@ pub use executor::{
     execute_operation_plan, CompareExchangeOutcome, OperationExecutionError, OperationFailure,
     OperationHost, OperationRead, OperationReceipt, OperationRollbackError,
     OperationRollbackFailure,
+};
+pub use mcp::{
+    import_mcp_servers, mcp_app_contract, mcp_config_target, mcp_servers_equivalent,
+    project_mcp_server, validate_mcp_server, validate_mcp_server_for_app, McpAppContract,
+    McpConfigError, McpConfigTarget, McpImport, McpNativeSnapshot, McpServerProjection,
 };
 pub use native_import::{
     HermesProviderSource, NativeImportCandidate, NativeImportContext, NativeImportError,
