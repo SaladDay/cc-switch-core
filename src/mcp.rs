@@ -50,6 +50,27 @@ pub struct McpImport {
     pub enabled: bool,
 }
 
+/// Desired state for one server in an application-owned MCP document.
+#[derive(Clone, Copy)]
+pub enum McpServerProjection<'a> {
+    /// Write the shared connection fields and enable the native entry.
+    Enable(&'a Value),
+    /// Update an existing native entry but keep it disabled.
+    Disable(&'a Value),
+    /// Remove the native entry completely.
+    Remove,
+}
+
+impl fmt::Debug for McpServerProjection<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Enable(_) => formatter.write_str("Enable(<redacted>)"),
+            Self::Disable(_) => formatter.write_str("Disable(<redacted>)"),
+            Self::Remove => formatter.write_str("Remove"),
+        }
+    }
+}
+
 impl fmt::Debug for McpImport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -131,9 +152,9 @@ pub fn validate_mcp_server(id: &str, server: &Value) -> Result<(), McpConfigErro
 ///
 /// Application-only extension fields are intentionally ignored so importing
 /// the same connection from two applications does not create a false conflict.
-pub fn mcp_servers_equivalent(left: &Value, right: &Value) -> bool {
-    managed_server_fields(left)
-        .is_some_and(|left| managed_server_fields(right).is_some_and(|right| left == right))
+pub fn mcp_servers_equivalent(app: &AppType, left: &Value, right: &Value) -> bool {
+    comparable_server_fields(app, left)
+        .is_some_and(|left| comparable_server_fields(app, right).is_some_and(|right| left == right))
 }
 
 /// Reads every valid MCP server from one application live document.
@@ -157,43 +178,55 @@ pub fn import_mcp_servers(
         McpConfigTarget::GrokBuild => import_toml_section(app, contents, true)?,
         McpConfigTarget::Hermes => import_hermes(app, contents)?,
     };
-    imports.retain(|entry| validate_mcp_server(&entry.id, &entry.server).is_ok());
+    imports.retain_mut(|entry| {
+        let Some(server) = managed_server_fields(&entry.server) else {
+            return false;
+        };
+        entry.server = server;
+        validate_mcp_server(&entry.id, &entry.server).is_ok()
+    });
     imports.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(imports)
 }
 
-/// Projects one enabled application link or removal into a complete document.
-///
-/// Native `enabled = false` entries are represented by [`McpImport::enabled`]
-/// during import. Hosts keep that state in their catalog and pass `None` here
-/// when an application link is disabled.
+/// Projects one application link state into a complete document.
 ///
 /// `Ok(None)` means the live document does not need to be written.
 pub fn project_mcp_server(
     app: &AppType,
     contents: Option<&[u8]>,
     id: &str,
-    server: Option<&Value>,
+    projection: McpServerProjection<'_>,
 ) -> Result<Option<String>, McpConfigError> {
     validate_id(id)?;
-    if let Some(server) = server {
+    if let McpServerProjection::Enable(server) | McpServerProjection::Disable(server) = projection {
         validate_mcp_server(id, server)?;
     }
     let target = require_target(app)?;
     validate_document_size(app, contents)?;
     let projected = match target {
-        McpConfigTarget::Claude => {
-            project_json_section(app, contents, "mcpServers", id, server, JsonFlavor::Claude)
-        }
-        McpConfigTarget::Gemini => {
-            project_json_section(app, contents, "mcpServers", id, server, JsonFlavor::Gemini)
-        }
+        McpConfigTarget::Claude => project_json_section(
+            app,
+            contents,
+            "mcpServers",
+            id,
+            projection,
+            JsonFlavor::Claude,
+        ),
+        McpConfigTarget::Gemini => project_json_section(
+            app,
+            contents,
+            "mcpServers",
+            id,
+            projection,
+            JsonFlavor::Gemini,
+        ),
         McpConfigTarget::OpenCode => {
-            project_json_section(app, contents, "mcp", id, server, JsonFlavor::OpenCode)
+            project_json_section(app, contents, "mcp", id, projection, JsonFlavor::OpenCode)
         }
-        McpConfigTarget::Codex => project_toml_section(app, contents, id, server, false),
-        McpConfigTarget::GrokBuild => project_toml_section(app, contents, id, server, true),
-        McpConfigTarget::Hermes => project_hermes(app, contents, id, server),
+        McpConfigTarget::Codex => project_toml_section(app, contents, id, projection, false),
+        McpConfigTarget::GrokBuild => project_toml_section(app, contents, id, projection, true),
+        McpConfigTarget::Hermes => project_hermes(app, contents, id, projection),
     }?;
     if projected
         .as_ref()
@@ -320,6 +353,26 @@ fn managed_server_fields(server: &Value) -> Option<Value> {
     Some(Value::Object(managed))
 }
 
+fn comparable_server_fields(app: &AppType, server: &Value) -> Option<Value> {
+    let mut managed = managed_server_fields(server)?;
+    if matches!(
+        app,
+        AppType::GrokBuild | AppType::OpenCode | AppType::Hermes
+    ) {
+        let object = managed
+            .as_object_mut()
+            .expect("managed server is an object");
+        if object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|transport| matches!(transport, "http" | "sse"))
+        {
+            object.insert("type".to_owned(), Value::String("remote".to_owned()));
+        }
+    }
+    Some(managed)
+}
+
 #[derive(Clone, Copy)]
 enum JsonFlavor {
     Claude,
@@ -373,7 +426,7 @@ fn project_json_section(
     contents: Option<&[u8]>,
     section: &str,
     id: &str,
-    server: Option<&Value>,
+    projection: McpServerProjection<'_>,
     flavor: JsonFlavor,
 ) -> Result<Option<String>, McpConfigError> {
     let mut root = parse_json_root(app, contents)?;
@@ -384,7 +437,28 @@ fn project_json_section(
         .and_then(|entries| entries.get(id))
         .cloned();
 
-    if let Some(server) = server {
+    let projected = match projection {
+        McpServerProjection::Enable(server) => {
+            Some(to_json_flavor(flavor, server, existing_entry.as_ref())?)
+        }
+        McpServerProjection::Disable(server) if matches!(flavor, JsonFlavor::OpenCode) => {
+            let Some(existing) = existing_entry.as_ref() else {
+                return Ok(None);
+            };
+            let mut projected = to_json_flavor(flavor, server, Some(existing))?;
+            projected
+                .as_object_mut()
+                .expect("OpenCode projection is an object")
+                .insert("enabled".to_owned(), Value::Bool(false));
+            if &projected == existing {
+                return Ok(None);
+            }
+            Some(projected)
+        }
+        McpServerProjection::Disable(_) | McpServerProjection::Remove => None,
+    };
+
+    if let Some(projected) = projected {
         match root_object.get(section) {
             Some(value) if !value.is_object() => {
                 return Err(invalid_document(
@@ -397,7 +471,6 @@ fn project_json_section(
             }
             Some(_) => {}
         }
-        let projected = to_json_flavor(flavor, server, existing_entry.as_ref())?;
         root_object
             .get_mut(section)
             .and_then(Value::as_object_mut)
@@ -498,7 +571,6 @@ fn to_json_flavor(
                 .cloned()
                 .unwrap_or_default();
             clear_fields(&mut output, MANAGED_SERVER_FIELDS);
-            merge_server_extensions(&mut output, unified, &[]);
             copy_fields(unified, &mut output, MANAGED_SERVER_FIELDS);
             Ok(Value::Object(output))
         }
@@ -513,7 +585,6 @@ fn to_json_flavor(
                     "type", "command", "args", "env", "cwd", "url", "httpUrl", "headers",
                 ],
             );
-            merge_server_extensions(&mut output, unified, &["httpUrl"]);
             match unified
                 .get("type")
                 .and_then(Value::as_str)
@@ -547,14 +618,6 @@ fn to_json_flavor(
                 "headers",
             ] {
                 output.remove(key);
-            }
-            for (key, value) in unified {
-                if !matches!(
-                    key.as_str(),
-                    "type" | "command" | "args" | "env" | "cwd" | "url" | "headers"
-                ) {
-                    output.entry(key.clone()).or_insert_with(|| value.clone());
-                }
             }
             match unified
                 .get("type")
@@ -702,64 +765,115 @@ fn project_toml_section(
     app: &AppType,
     contents: Option<&[u8]>,
     id: &str,
-    server: Option<&Value>,
+    projection: McpServerProjection<'_>,
     grok: bool,
 ) -> Result<Option<String>, McpConfigError> {
     let mut document = parse_toml(app, contents)?;
     let mut changed = false;
 
-    if let Some(server) = server {
-        let existing = document
-            .get("mcp_servers")
-            .and_then(Item::as_table_like)
-            .and_then(|entries| entries.get(id))
-            .cloned()
-            .or_else(|| {
+    match projection {
+        McpServerProjection::Enable(server) => {
+            let existing = official_toml_entry(&document, id).cloned().or_else(|| {
                 (!grok)
-                    .then(|| {
-                        document
-                            .get("mcp")
-                            .and_then(Item::as_table_like)
-                            .and_then(|table| table.get("servers"))
-                            .and_then(Item::as_table_like)
-                            .and_then(|entries| entries.get(id))
-                            .cloned()
-                    })
+                    .then(|| legacy_toml_entry(&document, id).cloned())
                     .flatten()
             });
-        match document.get("mcp_servers") {
-            Some(value) if value.as_table_like().is_none() => {
-                return Err(invalid_document(app, "'mcp_servers' must be a table"));
+            let projected = unified_to_toml_server(server, grok, existing)?;
+            let entries = ensure_official_toml_entries(app, &mut document)?;
+            entries.insert(id, projected);
+            changed = true;
+            if !grok {
+                changed |= remove_legacy_toml_entry(&mut document, id);
             }
-            None => document["mcp_servers"] = Item::Table(Table::new()),
-            Some(_) => {}
         }
-        document
-            .get_mut("mcp_servers")
-            .and_then(Item::as_table_like_mut)
-            .expect("MCP table initialized")
-            .insert(id, unified_to_toml_server(server, grok, existing)?);
-        changed = true;
-    } else if let Some(entries) = document.get_mut("mcp_servers") {
-        changed |= entries
-            .as_table_like_mut()
-            .ok_or_else(|| invalid_document(app, "'mcp_servers' must be a table"))?
-            .remove(id)
-            .is_some();
-    }
-
-    if !grok {
-        if let Some(legacy) = document
-            .get_mut("mcp")
-            .and_then(Item::as_table_like_mut)
-            .and_then(|table| table.get_mut("servers"))
-            .and_then(Item::as_table_like_mut)
-        {
-            changed |= legacy.remove(id).is_some();
+        McpServerProjection::Disable(server) => {
+            if let Some(existing) = official_toml_entry(&document, id).cloned() {
+                let mut projected = unified_to_toml_server(server, grok, Some(existing))?;
+                set_toml_enabled(&mut projected, false)?;
+                ensure_official_toml_entries(app, &mut document)?.insert(id, projected);
+                changed = true;
+            } else if !grok {
+                if let Some(existing) = legacy_toml_entry(&document, id).cloned() {
+                    let mut projected = unified_to_toml_server(server, grok, Some(existing))?;
+                    set_toml_enabled(&mut projected, false)?;
+                    document
+                        .get_mut("mcp")
+                        .and_then(Item::as_table_like_mut)
+                        .and_then(|table| table.get_mut("servers"))
+                        .and_then(Item::as_table_like_mut)
+                        .expect("legacy MCP entry was observed")
+                        .insert(id, projected);
+                    changed = true;
+                }
+            }
+        }
+        McpServerProjection::Remove => {
+            if let Some(entries) = document.get_mut("mcp_servers") {
+                changed |= entries
+                    .as_table_like_mut()
+                    .ok_or_else(|| invalid_document(app, "'mcp_servers' must be a table"))?
+                    .remove(id)
+                    .is_some();
+            }
+            if !grok {
+                changed |= remove_legacy_toml_entry(&mut document, id);
+            }
         }
     }
 
     Ok(changed.then(|| document.to_string()))
+}
+
+fn official_toml_entry<'a>(document: &'a DocumentMut, id: &str) -> Option<&'a Item> {
+    document
+        .get("mcp_servers")
+        .and_then(Item::as_table_like)
+        .and_then(|entries| entries.get(id))
+}
+
+fn legacy_toml_entry<'a>(document: &'a DocumentMut, id: &str) -> Option<&'a Item> {
+    document
+        .get("mcp")
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("servers"))
+        .and_then(Item::as_table_like)
+        .and_then(|entries| entries.get(id))
+}
+
+fn ensure_official_toml_entries<'a>(
+    app: &AppType,
+    document: &'a mut DocumentMut,
+) -> Result<&'a mut dyn TableLike, McpConfigError> {
+    match document.get("mcp_servers") {
+        Some(value) if value.as_table_like().is_none() => {
+            return Err(invalid_document(app, "'mcp_servers' must be a table"));
+        }
+        None => document["mcp_servers"] = Item::Table(Table::new()),
+        Some(_) => {}
+    }
+    Ok(document
+        .get_mut("mcp_servers")
+        .and_then(Item::as_table_like_mut)
+        .expect("MCP table initialized"))
+}
+
+fn remove_legacy_toml_entry(document: &mut DocumentMut, id: &str) -> bool {
+    document
+        .get_mut("mcp")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|table| table.get_mut("servers"))
+        .and_then(Item::as_table_like_mut)
+        .and_then(|entries| entries.remove(id))
+        .is_some()
+}
+
+fn set_toml_enabled(item: &mut Item, enabled: bool) -> Result<(), McpConfigError> {
+    item.as_table_like_mut()
+        .ok_or_else(|| {
+            McpConfigError::InvalidServer("existing TOML MCP entry must be a table".to_owned())
+        })?
+        .insert("enabled", toml_edit::value(enabled));
+    Ok(())
 }
 
 fn unified_to_toml_server(
@@ -784,15 +898,6 @@ fn unified_to_toml_server(
         "enabled",
     ] {
         table.remove(key);
-    }
-    for (key, value) in source {
-        if !MANAGED_SERVER_FIELDS.contains(&key.as_str())
-            && key != "http_headers"
-            && key != "enabled"
-            && table.get(key).is_none()
-        {
-            table.insert(key, json_to_toml_item(value)?);
-        }
     }
     for (key, value) in source {
         if !MANAGED_SERVER_FIELDS.contains(&key.as_str()) || grok && key == "type" {
@@ -946,7 +1051,7 @@ fn project_hermes(
     app: &AppType,
     contents: Option<&[u8]>,
     id: &str,
-    server: Option<&Value>,
+    projection: McpServerProjection<'_>,
 ) -> Result<Option<String>, McpConfigError> {
     let original = contents
         .map(|value| std::str::from_utf8(value).map(str::to_owned))
@@ -963,39 +1068,49 @@ fn project_hermes(
         .and_then(|entries| entries.get(&id_key))
         .cloned();
 
-    let changed = if let Some(server) = server {
-        match root.get(&section_key) {
-            Some(value) if !value.is_mapping() => {
-                return Err(invalid_document(app, "'mcp_servers' must be a mapping"));
+    let changed = match projection {
+        McpServerProjection::Enable(server) => {
+            match root.get(&section_key) {
+                Some(value) if !value.is_mapping() => {
+                    return Err(invalid_document(app, "'mcp_servers' must be a mapping"));
+                }
+                None => {
+                    root.insert(
+                        section_key.clone(),
+                        serde_yaml::Value::Mapping(Default::default()),
+                    );
+                }
+                Some(_) => {}
             }
-            None => {
-                root.insert(
-                    section_key.clone(),
-                    serde_yaml::Value::Mapping(Default::default()),
-                );
-            }
-            Some(_) => {}
+            let projected = hermes_projection(app, server, existing.as_ref(), true)?;
+            root.get_mut(&section_key)
+                .and_then(serde_yaml::Value::as_mapping_mut)
+                .expect("MCP mapping initialized")
+                .insert(id_key, projected);
+            true
         }
-        let existing = existing
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|_| invalid_document(app, "existing MCP entry is invalid"))?;
-        let projected = serde_yaml::to_value(to_hermes(server, existing.as_ref())?)
-            .map_err(|_| invalid_document(app, "MCP entry cannot be written as YAML"))?;
-        root.get_mut(&section_key)
-            .and_then(serde_yaml::Value::as_mapping_mut)
-            .expect("MCP mapping initialized")
-            .insert(id_key, projected);
-        true
-    } else if let Some(entries) = root.get_mut(&section_key) {
-        entries
-            .as_mapping_mut()
-            .ok_or_else(|| invalid_document(app, "'mcp_servers' must be a mapping"))?
-            .remove(&id_key)
-            .is_some()
-    } else {
-        false
+        McpServerProjection::Disable(server) => {
+            let Some(existing) = existing.as_ref() else {
+                return Ok(None);
+            };
+            let projected = hermes_projection(app, server, Some(existing), false)?;
+            root.get_mut(&section_key)
+                .and_then(serde_yaml::Value::as_mapping_mut)
+                .ok_or_else(|| invalid_document(app, "'mcp_servers' must be a mapping"))?
+                .insert(id_key, projected);
+            true
+        }
+        McpServerProjection::Remove => {
+            if let Some(entries) = root.get_mut(&section_key) {
+                entries
+                    .as_mapping_mut()
+                    .ok_or_else(|| invalid_document(app, "'mcp_servers' must be a mapping"))?
+                    .remove(&id_key)
+                    .is_some()
+            } else {
+                false
+            }
+        }
     };
 
     if !changed {
@@ -1010,6 +1125,20 @@ fn project_hermes(
     )
     .map(Some)
     .map_err(|message| invalid_document(app, &message))
+}
+
+fn hermes_projection(
+    app: &AppType,
+    server: &Value,
+    existing: Option<&serde_yaml::Value>,
+    enabled: bool,
+) -> Result<serde_yaml::Value, McpConfigError> {
+    let existing = existing
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|_| invalid_document(app, "existing MCP entry is invalid"))?;
+    serde_yaml::to_value(to_hermes(server, existing.as_ref(), enabled)?)
+        .map_err(|_| invalid_document(app, "MCP entry cannot be written as YAML"))
 }
 
 fn from_hermes(id: &str, value: &Value) -> Result<Value, McpConfigError> {
@@ -1037,7 +1166,11 @@ fn from_hermes(id: &str, value: &Value) -> Result<Value, McpConfigError> {
     Ok(Value::Object(output))
 }
 
-fn to_hermes(server: &Value, existing: Option<&Value>) -> Result<Value, McpConfigError> {
+fn to_hermes(
+    server: &Value,
+    existing: Option<&Value>,
+    enabled: bool,
+) -> Result<Value, McpConfigError> {
     let unified = server.as_object().expect("validated server object");
     let mut output = existing
         .and_then(Value::as_object)
@@ -1049,7 +1182,6 @@ fn to_hermes(server: &Value, existing: Option<&Value>) -> Result<Value, McpConfi
             "type", "command", "args", "env", "cwd", "url", "headers", "enabled",
         ],
     );
-    merge_server_extensions(&mut output, unified, &["enabled"]);
     match unified
         .get("type")
         .and_then(Value::as_str)
@@ -1059,25 +1191,13 @@ fn to_hermes(server: &Value, existing: Option<&Value>) -> Result<Value, McpConfi
         "http" | "sse" => copy_fields(unified, &mut output, &["url", "headers"]),
         _ => unreachable!("validated transport"),
     }
-    output.insert("enabled".to_owned(), Value::Bool(true));
+    output.insert("enabled".to_owned(), Value::Bool(enabled));
     Ok(Value::Object(output))
 }
 
 fn clear_fields(target: &mut Map<String, Value>, keys: &[&str]) {
     for key in keys {
         target.remove(*key);
-    }
-}
-
-fn merge_server_extensions(
-    target: &mut Map<String, Value>,
-    source: &Map<String, Value>,
-    excluded: &[&str],
-) {
-    for (key, value) in source {
-        if !MANAGED_SERVER_FIELDS.contains(&key.as_str()) && !excluded.contains(&key.as_str()) {
-            target.entry(key.clone()).or_insert_with(|| value.clone());
-        }
     }
 }
 
@@ -1212,17 +1332,31 @@ mod tests {
         assert!(validate_mcp_server("server", &json!({"type": "grpc"})).is_err());
         assert!(validate_mcp_server(" ", &json!({"command": "npx"})).is_err());
         assert!(validate_mcp_server(" server ", &json!({"command": "npx"})).is_err());
+        assert_eq!(
+            format!(
+                "{:?}",
+                McpServerProjection::Enable(&json!({"env":{"TOKEN":"secret"}}))
+            ),
+            "Enable(<redacted>)"
+        );
     }
 
     #[test]
     fn connection_equivalence_ignores_application_extensions() {
         assert!(mcp_servers_equivalent(
+            &AppType::Claude,
             &json!({"command":"npx","args":[],"timeout":30}),
             &json!({"type":"stdio","command":"npx","future":true})
         ));
         assert!(!mcp_servers_equivalent(
+            &AppType::Claude,
             &json!({"type":"stdio","command":"npx"}),
             &json!({"type":"stdio","command":"uvx"})
+        ));
+        assert!(mcp_servers_equivalent(
+            &AppType::Hermes,
+            &json!({"type":"http","url":"https://example.com"}),
+            &json!({"type":"sse","url":"https://example.com"})
         ));
     }
 
@@ -1234,7 +1368,9 @@ mod tests {
                 br#"{"theme":"dark","mcpServers":{"old":{"command":"old"},"new":{"command":"before","future":"keep"}}}"#,
             ),
             "new",
-            Some(&json!({"type":"stdio","command":"npx","args":["server"]})),
+            McpServerProjection::Enable(
+                &json!({"type":"stdio","command":"npx","args":["server"],"auth":"do-not-copy"}),
+            ),
         )
         .expect("project Claude")
         .expect("changed");
@@ -1243,6 +1379,15 @@ mod tests {
         assert_eq!(root["mcpServers"]["old"]["command"], "old");
         assert_eq!(root["mcpServers"]["new"]["command"], "npx");
         assert_eq!(root["mcpServers"]["new"]["future"], "keep");
+        assert!(root["mcpServers"]["new"].get("auth").is_none());
+        let imports = import_mcp_servers(&AppType::Claude, Some(projected.as_bytes())).unwrap();
+        assert!(imports
+            .iter()
+            .find(|entry| entry.id == "new")
+            .unwrap()
+            .server
+            .get("future")
+            .is_none());
     }
 
     #[test]
@@ -1253,7 +1398,7 @@ mod tests {
                 br#"{"theme":"dark","mcpServers":{"remote":{"httpUrl":"https://old.example","future":"keep"}}}"#,
             ),
             "remote",
-            Some(&json!({"type":"http","url":"https://example.com","headers":{"Authorization":"secret"}})),
+            McpServerProjection::Enable(&json!({"type":"http","url":"https://example.com","headers":{"Authorization":"secret"}})),
         )
         .unwrap()
         .unwrap();
@@ -1269,7 +1414,7 @@ mod tests {
             &AppType::OpenCode,
             Some(br#"{"mcp":{"local":{"type":"local","command":["old"],"timeout":30,"enabled":false}}}"#),
             "local",
-            Some(&json!({"type":"stdio","command":"npx","args":["-y"],"env":{"TOKEN":"secret"}})),
+            McpServerProjection::Enable(&json!({"type":"stdio","command":"npx","args":["-y"],"env":{"TOKEN":"secret"}})),
         )
         .unwrap()
         .unwrap();
@@ -1278,6 +1423,19 @@ mod tests {
         assert_eq!(root["mcp"]["local"]["environment"]["TOKEN"], "secret");
         assert_eq!(root["mcp"]["local"]["timeout"], 30);
         assert_eq!(root["mcp"]["local"]["enabled"], true);
+        let disabled = project_mcp_server(
+            &AppType::OpenCode,
+            Some(opencode.as_bytes()),
+            "local",
+            McpServerProjection::Disable(
+                &json!({"type":"stdio","command":"npx","args":["-y"],"env":{"TOKEN":"secret"}}),
+            ),
+        )
+        .unwrap()
+        .unwrap();
+        let disabled: Value = serde_json::from_str(&disabled).unwrap();
+        assert_eq!(disabled["mcp"]["local"]["timeout"], 30);
+        assert_eq!(disabled["mcp"]["local"]["enabled"], false);
         let imports = import_mcp_servers(
             &AppType::OpenCode,
             Some(br#"{"mcp":{"local":{"type":"local","command":["old"],"enabled":false}}}"#),
@@ -1297,9 +1455,14 @@ mod tests {
             "type":"http", "url":"https://example.com/mcp",
             "headers":{"Authorization":"secret"}, "timeout":30
         });
-        let codex = project_mcp_server(&AppType::Codex, Some(original), "remote", Some(&server))
-            .unwrap()
-            .unwrap();
+        let codex = project_mcp_server(
+            &AppType::Codex,
+            Some(original),
+            "remote",
+            McpServerProjection::Enable(&server),
+        )
+        .unwrap()
+        .unwrap();
         assert!(codex.contains("model = \"keep\""));
         assert!(codex.contains("[mcp_servers.old]"));
         assert!(codex.contains("http_headers"));
@@ -1308,9 +1471,26 @@ mod tests {
         assert!(!codex.contains("future_date = \"1979-05-27T07:32:00Z\""));
         assert!(!codex.contains("enabled = false"));
 
-        let grok = project_mcp_server(&AppType::GrokBuild, Some(original), "remote", Some(&server))
-            .unwrap()
-            .unwrap();
+        let disabled = project_mcp_server(
+            &AppType::Codex,
+            Some(codex.as_bytes()),
+            "remote",
+            McpServerProjection::Disable(&server),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(disabled.contains("enabled = false"));
+        assert!(disabled.contains("future_date = 1979-05-27T07:32:00Z"));
+        assert!(!disabled.contains("future_date = \"1979-05-27T07:32:00Z\""));
+
+        let grok = project_mcp_server(
+            &AppType::GrokBuild,
+            Some(original),
+            "remote",
+            McpServerProjection::Enable(&server),
+        )
+        .unwrap()
+        .unwrap();
         assert!(grok.contains("headers"));
         assert!(!grok.contains("http_headers"));
         assert!(grok.contains("future = \"keep\""));
@@ -1332,7 +1512,7 @@ mod tests {
             &AppType::Hermes,
             Some(original),
             "remote",
-            Some(&json!({"type":"sse","url":"https://new.example"})),
+            McpServerProjection::Enable(&json!({"type":"sse","url":"https://new.example"})),
         )
         .unwrap()
         .unwrap();
@@ -1345,26 +1525,24 @@ mod tests {
         assert_eq!(root["mcp_servers"]["remote"]["enabled"], true);
         let imports = import_mcp_servers(&AppType::Hermes, Some(original)).unwrap();
         assert!(!imports[0].enabled);
-        assert_eq!(imports[0].server["auth"], "oauth");
-        assert_eq!(imports[0].server["timeout"], 30);
-        assert_eq!(imports[0].server["future"], "keep");
+        assert!(imports[0].server.get("auth").is_none());
+        assert!(imports[0].server.get("timeout").is_none());
+        assert!(imports[0].server.get("future").is_none());
         assert!(imports[0].server.get("enabled").is_none());
 
-        let removed = project_mcp_server(&AppType::Hermes, Some(original), "remote", None)
-            .unwrap()
-            .unwrap();
-        let restored = project_mcp_server(
+        let disabled = project_mcp_server(
             &AppType::Hermes,
-            Some(removed.as_bytes()),
+            Some(original),
             "remote",
-            Some(&imports[0].server),
+            McpServerProjection::Disable(&imports[0].server),
         )
         .unwrap()
         .unwrap();
-        let restored: Value = serde_yaml::from_str(&restored).unwrap();
-        assert_eq!(restored["mcp_servers"]["remote"]["auth"], "oauth");
-        assert_eq!(restored["mcp_servers"]["remote"]["timeout"], 30);
-        assert_eq!(restored["mcp_servers"]["remote"]["future"], "keep");
+        let disabled: Value = serde_yaml::from_str(&disabled).unwrap();
+        assert_eq!(disabled["mcp_servers"]["remote"]["auth"], "oauth");
+        assert_eq!(disabled["mcp_servers"]["remote"]["timeout"], 30);
+        assert_eq!(disabled["mcp_servers"]["remote"]["future"], "keep");
+        assert_eq!(disabled["mcp_servers"]["remote"]["enabled"], false);
     }
 
     #[test]
@@ -1383,7 +1561,7 @@ mod tests {
                 &AppType::Hermes,
                 Some(original),
                 "new",
-                Some(&json!({"command":"npx"})),
+                McpServerProjection::Enable(&json!({"command":"npx"})),
             )
             .expect_err("unsupported YAML form must not be rewritten");
             assert!(matches!(error, McpConfigError::InvalidDocument { .. }));
@@ -1393,14 +1571,14 @@ mod tests {
     #[test]
     fn projection_rejects_a_document_over_the_shared_limit() {
         let original = serde_json::to_vec(&json!({
-            "keep": "x".repeat(MAX_OPERATION_CONTENT_BYTES - 256)
+            "keep": "x".repeat(MAX_OPERATION_CONTENT_BYTES - 32)
         }))
         .unwrap();
         let error = project_mcp_server(
             &AppType::Claude,
             Some(&original),
             "server",
-            Some(&json!({"command":"npx", "future":"x".repeat(512)})),
+            McpServerProjection::Enable(&json!({"command":"npx", "future":"x".repeat(512)})),
         )
         .expect_err("oversized projected document");
         assert!(matches!(error, McpConfigError::InvalidDocument { .. }));
@@ -1415,7 +1593,7 @@ mod tests {
                 &AppType::Claude,
                 Some(&oversized),
                 "server",
-                Some(&json!({"command":"npx"})),
+                McpServerProjection::Enable(&json!({"command":"npx"})),
             )
             .map(|_| ()),
         ] {
@@ -1433,7 +1611,7 @@ mod tests {
                 &AppType::Claude,
                 Some(br#"{"mcpServers":{}}"#),
                 "missing",
-                None,
+                McpServerProjection::Remove,
             )
             .unwrap(),
             None

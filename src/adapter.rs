@@ -4,9 +4,10 @@ use std::fmt;
 
 use crate::{
     builtin_app_registry, native_import, projection, AppDescriptor, AppType, LiveDocumentSet,
-    LogicalTarget, McpConfigError, McpConfigTarget, McpImport, NativeAction, NativeImportError,
-    NativeImportStep, NativePlanError, NativePlanRequest, OperationPlan, OperationPlanError,
-    ProviderSnapshot, SimpleProviderError, SimpleProviderFormDescriptor, SimpleProviderValues,
+    LogicalTarget, McpConfigError, McpConfigTarget, McpImport, McpServerProjection, NativeAction,
+    NativeImportError, NativeImportStep, NativePlanError, NativePlanRequest, OperationPlan,
+    OperationPlanError, ProviderSnapshot, SimpleProviderError, SimpleProviderFormDescriptor,
+    SimpleProviderValues,
 };
 
 mod sealed {
@@ -42,14 +43,14 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
         crate::import_mcp_servers(self.descriptor().app(), contents)
     }
 
-    /// Projects one MCP upsert or removal into the complete live document.
+    /// Projects one MCP state change into the complete live document.
     fn project_mcp_server(
         &self,
         contents: Option<&[u8]>,
         id: &str,
-        server: Option<&serde_json::Value>,
+        projection: McpServerProjection<'_>,
     ) -> Result<Option<String>, McpConfigError> {
-        crate::project_mcp_server(self.descriptor().app(), contents, id, server)
+        crate::project_mcp_server(self.descriptor().app(), contents, id, projection)
     }
 
     /// Extracts the small, shared provider field set from native settings.

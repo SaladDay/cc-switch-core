@@ -43,7 +43,7 @@ pub use executor::{
 };
 pub use mcp::{
     import_mcp_servers, mcp_config_target, mcp_servers_equivalent, project_mcp_server,
-    validate_mcp_server, McpConfigError, McpConfigTarget, McpImport,
+    validate_mcp_server, McpConfigError, McpConfigTarget, McpImport, McpServerProjection,
 };
 pub use native_import::{
     HermesProviderSource, NativeImportCandidate, NativeImportContext, NativeImportError,
