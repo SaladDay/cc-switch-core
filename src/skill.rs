@@ -2,17 +2,21 @@
 
 use std::{
     fs::{self, DirEntry, File},
-    io::Read,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use toml_edit::{Array, DocumentMut, Item, Table};
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
+
+use crate::operation::{LogicalTarget, MAX_OPERATION_CONTENT_BYTES};
 
 /// Maximum number of entries accepted in one installed Skill tree.
 pub const MAX_SKILL_TREE_ENTRIES: usize = 10_000;
@@ -20,54 +24,68 @@ pub const MAX_SKILL_TREE_ENTRIES: usize = 10_000;
 pub const MAX_SKILL_TREE_BYTES: u64 = 512 * 1024 * 1024;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const TEMP_DIRECTORY_PREFIX: &str = ".cc-switch-skill.";
+const TEMP_MARKER_FILE: &str = ".operation.json";
+const TEMP_MARKER_VERSION: u8 = 1;
+const MAX_TEMP_MARKER_BYTES: u64 = 1024;
 
-/// Where the application-specific enabled state is stored when the shared
-/// source is not itself one of the application's discovery roots.
+/// How a host may control a Skill that an application discovers directly from
+/// `~/.agents/skills`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum SkillActivationSource {
-    /// The shared catalog contains an `enabled_*` flag.
-    CatalogFlag,
-    /// Presence in the native Skill directory is authoritative.
-    NativePresence,
+pub enum UnifiedSkillControl {
+    /// Core cannot safely determine or change the application's effective state.
+    ReadOnly,
+    /// The application uses a name-based disabled list in its native settings.
+    DisabledNameList(SkillConfigTarget),
+}
+
+/// Native document containing a supported per-Skill disabled list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillConfigTarget {
+    GeminiSettings,
+    GrokConfig,
+}
+
+impl SkillConfigTarget {
+    /// Returns the shared logical document edited by this control.
+    pub const fn logical_target(self) -> LogicalTarget {
+        match self {
+            Self::GeminiSettings => LogicalTarget::GeminiSettings,
+            Self::GrokConfig => LogicalTarget::GrokConfig,
+        }
+    }
 }
 
 /// Product-neutral Skill behavior declared by an application descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkillAppContract {
-    activation_source: SkillActivationSource,
     catalog_column: Option<&'static str>,
-    discovers_unified_store: bool,
+    unified_control: Option<UnifiedSkillControl>,
 }
 
 impl SkillAppContract {
     /// Declares a catalog-backed application and its stable shared column.
     pub const fn catalog_flag(column: &'static str) -> Self {
         Self {
-            activation_source: SkillActivationSource::CatalogFlag,
             catalog_column: Some(column),
-            discovers_unified_store: false,
+            unified_control: None,
         }
     }
 
     /// Declares an application whose native directory is authoritative.
     pub const fn native_presence() -> Self {
         Self {
-            activation_source: SkillActivationSource::NativePresence,
             catalog_column: None,
-            discovers_unified_store: false,
+            unified_control: None,
         }
     }
 
     /// Declares that the application discovers `~/.agents/skills` directly.
-    pub const fn with_unified_store_discovery(mut self) -> Self {
-        self.discovers_unified_store = true;
+    pub const fn with_unified_store_discovery(mut self, control: UnifiedSkillControl) -> Self {
+        self.unified_control = Some(control);
         self
-    }
-
-    /// Returns the authoritative source for this application's enabled state.
-    pub const fn activation_source(self) -> SkillActivationSource {
-        self.activation_source
     }
 
     /// Returns the shared catalog column when activation is catalog-backed.
@@ -75,24 +93,28 @@ impl SkillAppContract {
         self.catalog_column
     }
 
-    /// Returns whether the application discovers the unified Skill store directly.
-    pub const fn discovers_unified_store(self) -> bool {
-        self.discovers_unified_store
+    /// Returns direct unified-store discovery and its supported control method.
+    pub const fn unified_control(self) -> Option<UnifiedSkillControl> {
+        self.unified_control
     }
 }
 
 pub const CLAUDE_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_claude");
-pub const CODEX_SKILLS: SkillAppContract =
-    SkillAppContract::catalog_flag("enabled_codex").with_unified_store_discovery();
-pub const GEMINI_SKILLS: SkillAppContract =
-    SkillAppContract::catalog_flag("enabled_gemini").with_unified_store_discovery();
-pub const GROKBUILD_SKILLS: SkillAppContract =
-    SkillAppContract::catalog_flag("enabled_grokbuild").with_unified_store_discovery();
-pub const OPENCODE_SKILLS: SkillAppContract =
-    SkillAppContract::catalog_flag("enabled_opencode").with_unified_store_discovery();
+pub const CODEX_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_codex")
+    .with_unified_store_discovery(UnifiedSkillControl::ReadOnly);
+pub const GEMINI_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_gemini")
+    .with_unified_store_discovery(UnifiedSkillControl::DisabledNameList(
+        SkillConfigTarget::GeminiSettings,
+    ));
+pub const GROKBUILD_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_grokbuild")
+    .with_unified_store_discovery(UnifiedSkillControl::DisabledNameList(
+        SkillConfigTarget::GrokConfig,
+    ));
+pub const OPENCODE_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_opencode")
+    .with_unified_store_discovery(UnifiedSkillControl::ReadOnly);
 pub const HERMES_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_hermes");
 pub const PI_SKILLS: SkillAppContract =
-    SkillAppContract::native_presence().with_unified_store_discovery();
+    SkillAppContract::native_presence().with_unified_store_discovery(UnifiedSkillControl::ReadOnly);
 
 /// How an installed Skill is materialized in an application's native directory.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +148,13 @@ pub enum SkillConfigError {
     MissingSource { path: PathBuf },
     #[error("Skill source is missing SKILL.md: {path:?}")]
     MissingManifest { path: PathBuf },
+    #[error("invalid Skill name: {name:?}")]
+    InvalidName { name: String },
+    #[error("invalid {target:?} Skill configuration: {message}")]
+    InvalidConfig {
+        target: SkillConfigTarget,
+        message: String,
+    },
     #[error("Skill source and destination roots overlap: {source_root:?}, {destination_root:?}")]
     OverlappingRoots {
         source_root: PathBuf,
@@ -181,6 +210,20 @@ enum DeploymentChange {
         backup: PathBuf,
         expectation: DeploymentExpectation,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum InterruptedOperation {
+    Enable,
+    Disable,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InterruptedOperationMarker {
+    version: u8,
+    operation: InterruptedOperation,
+    directory: String,
 }
 
 /// A reversible native Skill change.
@@ -244,8 +287,7 @@ impl SkillDeploymentReceipt {
                 require_expectation(&backup, &expectation)?;
                 fs::rename(&backup, &destination)
                     .map_err(|source| SkillConfigError::io(&destination, source))?;
-                fs::remove_dir(&temporary_root)
-                    .map_err(|source| SkillConfigError::io(&temporary_root, source))
+                remove_directory(&temporary_root)
             }
         }
     }
@@ -343,6 +385,258 @@ pub fn inspect_skill_presence(
     }
 }
 
+/// Reads the effective name-based enabled state from a supported native config.
+pub fn inspect_skill_config_enabled(
+    target: SkillConfigTarget,
+    contents: Option<&[u8]>,
+    name: &str,
+) -> Result<bool, SkillConfigError> {
+    validate_skill_name(name)?;
+    Ok(match target {
+        SkillConfigTarget::GeminiSettings => !json_disabled_names(target, contents)?
+            .iter()
+            .any(|entry| entry == name),
+        SkillConfigTarget::GrokConfig => !toml_disabled_names(target, contents)?
+            .iter()
+            .any(|entry| entry == name),
+    })
+}
+
+/// Changes only the supported native disabled list and preserves unrelated data.
+/// `None` means the requested state already matches the document.
+pub fn project_skill_config_enabled(
+    target: SkillConfigTarget,
+    contents: Option<&[u8]>,
+    name: &str,
+    enabled: bool,
+) -> Result<Option<String>, SkillConfigError> {
+    validate_skill_name(name)?;
+    match target {
+        SkillConfigTarget::GeminiSettings => {
+            project_json_skill_enabled(target, contents, name, enabled)
+        }
+        SkillConfigTarget::GrokConfig => {
+            project_toml_skill_enabled(target, contents, name, enabled)
+        }
+    }
+}
+
+fn validate_skill_name(name: &str) -> Result<(), SkillConfigError> {
+    if name.is_empty()
+        || name.trim() != name
+        || name.len() > 256
+        || name.chars().any(char::is_control)
+    {
+        return Err(SkillConfigError::InvalidName {
+            name: name.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn json_disabled_names(
+    target: SkillConfigTarget,
+    contents: Option<&[u8]>,
+) -> Result<Vec<String>, SkillConfigError> {
+    let root = parse_skill_json(target, contents)?;
+    let Some(skills) = root.get("skills") else {
+        return Ok(Vec::new());
+    };
+    let skills = skills
+        .as_object()
+        .ok_or_else(|| invalid_skill_config(target, "'skills' must be an object"))?;
+    let Some(disabled) = skills.get("disabled") else {
+        return Ok(Vec::new());
+    };
+    string_array(target, disabled, "'skills.disabled'")
+}
+
+fn project_json_skill_enabled(
+    target: SkillConfigTarget,
+    contents: Option<&[u8]>,
+    name: &str,
+    enabled: bool,
+) -> Result<Option<String>, SkillConfigError> {
+    let mut root = parse_skill_json(target, contents)?;
+    let disabled = json_disabled_names(target, contents)?;
+    let currently_enabled = !disabled.iter().any(|entry| entry == name);
+    if currently_enabled == enabled {
+        return Ok(None);
+    }
+
+    let root_object = root
+        .as_object_mut()
+        .expect("validated Skill JSON has an object root");
+    let skills = root_object
+        .entry("skills")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .expect("validated skills entry is an object");
+    let mut next = disabled
+        .into_iter()
+        .filter(|entry| !enabled || entry != name)
+        .collect::<Vec<_>>();
+    if !enabled {
+        next.push(name.to_owned());
+    }
+    skills.insert(
+        "disabled".to_owned(),
+        Value::Array(next.into_iter().map(Value::String).collect()),
+    );
+
+    let output = if let Some(contents) = contents.filter(|contents| !contents.is_empty()) {
+        let original = std::str::from_utf8(contents)
+            .map_err(|_| invalid_skill_config(target, "document is not UTF-8"))?;
+        crate::json_patch::replace_top_level_value(
+            original,
+            "skills",
+            root.get("skills").expect("projected JSON contains skills"),
+        )
+        .map_err(|message| invalid_skill_config(target, &message))?
+    } else {
+        let mut rendered = serde_json::to_string_pretty(&root)
+            .map_err(|error| invalid_skill_config(target, &error.to_string()))?;
+        rendered.push('\n');
+        rendered
+    };
+    validate_projected_size(target, output)
+}
+
+fn parse_skill_json(
+    target: SkillConfigTarget,
+    contents: Option<&[u8]>,
+) -> Result<Value, SkillConfigError> {
+    let Some(contents) = contents.filter(|contents| !contents.is_empty()) else {
+        return Ok(Value::Object(Map::new()));
+    };
+    if contents.len() > MAX_OPERATION_CONTENT_BYTES {
+        return Err(invalid_skill_config(target, "document is too large"));
+    }
+    let root = serde_json::from_slice::<Value>(contents)
+        .map_err(|_| invalid_skill_config(target, "document is not strict JSON"))?;
+    if !root.is_object() {
+        return Err(invalid_skill_config(target, "root must be an object"));
+    }
+    Ok(root)
+}
+
+fn string_array(
+    target: SkillConfigTarget,
+    value: &Value,
+    label: &str,
+) -> Result<Vec<String>, SkillConfigError> {
+    value
+        .as_array()
+        .ok_or_else(|| invalid_skill_config(target, &format!("{label} must be an array")))?
+        .iter()
+        .map(|entry| {
+            entry.as_str().map(str::to_owned).ok_or_else(|| {
+                invalid_skill_config(target, &format!("{label} must contain strings"))
+            })
+        })
+        .collect()
+}
+
+fn toml_disabled_names(
+    target: SkillConfigTarget,
+    contents: Option<&[u8]>,
+) -> Result<Vec<String>, SkillConfigError> {
+    let document = parse_skill_toml(target, contents)?;
+    let Some(skills) = document.get("skills") else {
+        return Ok(Vec::new());
+    };
+    let skills = skills
+        .as_table_like()
+        .ok_or_else(|| invalid_skill_config(target, "'skills' must be a table"))?;
+    let Some(disabled) = skills.get("disabled") else {
+        return Ok(Vec::new());
+    };
+    let disabled = disabled
+        .as_array()
+        .ok_or_else(|| invalid_skill_config(target, "'skills.disabled' must be an array"))?;
+    disabled
+        .iter()
+        .map(|entry| {
+            entry.as_str().map(str::to_owned).ok_or_else(|| {
+                invalid_skill_config(target, "'skills.disabled' must contain strings")
+            })
+        })
+        .collect()
+}
+
+fn project_toml_skill_enabled(
+    target: SkillConfigTarget,
+    contents: Option<&[u8]>,
+    name: &str,
+    enabled: bool,
+) -> Result<Option<String>, SkillConfigError> {
+    let disabled = toml_disabled_names(target, contents)?;
+    let currently_enabled = !disabled.iter().any(|entry| entry == name);
+    if currently_enabled == enabled {
+        return Ok(None);
+    }
+    let mut document = parse_skill_toml(target, contents)?;
+    if document.get("skills").is_none() {
+        document["skills"] = Item::Table(Table::new());
+    }
+    let skills = document["skills"]
+        .as_table_like_mut()
+        .expect("validated skills entry is a table");
+    if skills.get("disabled").is_none() {
+        skills.insert("disabled", Item::Value(Array::new().into()));
+    }
+    let array = skills
+        .get_mut("disabled")
+        .and_then(Item::as_array_mut)
+        .expect("validated disabled entry is an array");
+    if enabled {
+        for index in (0..array.len()).rev() {
+            if array.get(index).and_then(toml_edit::Value::as_str) == Some(name) {
+                array.remove(index);
+            }
+        }
+    } else {
+        array.push(name);
+    }
+    validate_projected_size(target, document.to_string())
+}
+
+fn parse_skill_toml(
+    target: SkillConfigTarget,
+    contents: Option<&[u8]>,
+) -> Result<DocumentMut, SkillConfigError> {
+    let Some(contents) = contents.filter(|contents| !contents.is_empty()) else {
+        return Ok(DocumentMut::new());
+    };
+    if contents.len() > MAX_OPERATION_CONTENT_BYTES {
+        return Err(invalid_skill_config(target, "document is too large"));
+    }
+    let text = std::str::from_utf8(contents)
+        .map_err(|_| invalid_skill_config(target, "document is not UTF-8"))?;
+    text.parse::<DocumentMut>()
+        .map_err(|_| invalid_skill_config(target, "document is not valid TOML"))
+}
+
+fn validate_projected_size(
+    target: SkillConfigTarget,
+    output: String,
+) -> Result<Option<String>, SkillConfigError> {
+    if output.len() > MAX_OPERATION_CONTENT_BYTES {
+        return Err(invalid_skill_config(
+            target,
+            "projected document is too large",
+        ));
+    }
+    Ok(Some(output))
+}
+
+fn invalid_skill_config(target: SkillConfigTarget, message: &str) -> SkillConfigError {
+    SkillConfigError::InvalidConfig {
+        target,
+        message: message.to_owned(),
+    }
+}
+
 /// Applies an enable or disable operation and returns a reversible receipt.
 pub fn apply_skill_deployment(
     source_root: &Path,
@@ -352,20 +646,21 @@ pub fn apply_skill_deployment(
     sync_method: SkillSyncMethod,
 ) -> Result<SkillDeploymentReceipt, SkillConfigError> {
     let paths = deployment_paths(source_root, destination_root, directory)?;
+    recover_interrupted_deployment(&paths, directory)?;
     let (state, expectation) = inspect_paths(&paths.source, &paths.destination)?;
     if enabled {
         return match state {
             SkillDeploymentState::Linked | SkillDeploymentState::Copied => {
                 Ok(observed_receipt(paths.destination, expectation))
             }
-            SkillDeploymentState::Missing => enable_deployment(paths, sync_method),
+            SkillDeploymentState::Missing => enable_deployment(paths, directory, sync_method),
         };
     }
 
     match state {
         SkillDeploymentState::Missing => Ok(observed_receipt(paths.destination, expectation)),
         SkillDeploymentState::Linked | SkillDeploymentState::Copied => {
-            disable_deployment(paths.destination, expectation)
+            disable_deployment(paths.destination, directory, expectation)
         }
     }
 }
@@ -524,6 +819,7 @@ fn inspect_paths(
 
 fn enable_deployment(
     paths: DeploymentPaths,
+    directory: &str,
     sync_method: SkillSyncMethod,
 ) -> Result<SkillDeploymentReceipt, SkillConfigError> {
     let parent = paths
@@ -558,15 +854,19 @@ fn enable_deployment(
         }
     }
 
-    create_copy(paths)
+    create_copy(paths, directory)
 }
 
-fn create_copy(paths: DeploymentPaths) -> Result<SkillDeploymentReceipt, SkillConfigError> {
+fn create_copy(
+    paths: DeploymentPaths,
+    directory: &str,
+) -> Result<SkillDeploymentReceipt, SkillConfigError> {
     let parent = paths
         .destination
         .parent()
         .expect("a deployment has a destination root");
-    let temporary_root = create_temporary_directory(parent)?;
+    let temporary_root =
+        create_temporary_directory(parent, directory, InterruptedOperation::Enable)?;
     let staged = temporary_root.join("deployment");
     let staged_digest = (|| {
         let mut budget = TreeBudget::default();
@@ -597,9 +897,8 @@ fn create_copy(paths: DeploymentPaths) -> Result<SkillDeploymentReceipt, SkillCo
             },
         },
     };
-    if let Err(source) = fs::remove_dir(&temporary_root) {
-        let error = recover_created(receipt, SkillConfigError::io(&temporary_root, source));
-        return Err(cleanup_temporary(&temporary_root, error));
+    if let Err(error) = remove_directory(&temporary_root) {
+        return Err(recover_created(receipt, error));
     }
     if let Err(error) = receipt.verify() {
         return Err(recover_created(receipt, error));
@@ -618,12 +917,14 @@ fn recover_created(receipt: SkillDeploymentReceipt, error: SkillConfigError) -> 
 
 fn disable_deployment(
     destination: PathBuf,
+    directory: &str,
     expectation: DeploymentExpectation,
 ) -> Result<SkillDeploymentReceipt, SkillConfigError> {
     let parent = destination
         .parent()
         .expect("a deployment has a destination root");
-    let temporary_root = create_temporary_directory(parent)?;
+    let temporary_root =
+        create_temporary_directory(parent, directory, InterruptedOperation::Disable)?;
     let backup = temporary_root.join("deployment");
     if let Err(source) = fs::rename(&destination, &backup) {
         return Err(cleanup_temporary(
@@ -883,7 +1184,135 @@ fn read_directory_entries(
     Ok(entries)
 }
 
-fn create_temporary_directory(parent: &Path) -> Result<PathBuf, SkillConfigError> {
+fn recover_interrupted_deployment(
+    paths: &DeploymentPaths,
+    directory: &str,
+) -> Result<(), SkillConfigError> {
+    let parent = paths
+        .destination
+        .parent()
+        .expect("a deployment has a destination root");
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(SkillConfigError::io(parent, source)),
+    };
+    let mut interrupted = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| SkillConfigError::io(parent, source))?;
+        let name = entry.file_name();
+        if !name
+            .to_str()
+            .is_some_and(|name| name.starts_with(TEMP_DIRECTORY_PREFIX))
+        {
+            continue;
+        }
+        let temporary_root = entry.path();
+        let metadata = fs::symlink_metadata(&temporary_root)
+            .map_err(|source| SkillConfigError::io(&temporary_root, source))?;
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        let Some(marker) = read_operation_marker(&temporary_root)? else {
+            continue;
+        };
+        if marker.version != TEMP_MARKER_VERSION {
+            return Err(SkillConfigError::Recovery {
+                message: format!(
+                    "unsupported Skill operation marker version {} at {:?}",
+                    marker.version, temporary_root
+                ),
+            });
+        }
+        validate_skill_directory(&marker.directory)?;
+        if marker.directory == directory {
+            interrupted.push((temporary_root, marker.operation));
+        }
+    }
+    interrupted.sort_by(|left, right| left.0.cmp(&right.0));
+    for (temporary_root, operation) in interrupted {
+        match operation {
+            InterruptedOperation::Enable => recover_interrupted_enable(paths, &temporary_root)?,
+            InterruptedOperation::Disable => recover_interrupted_disable(paths, &temporary_root)?,
+        }
+    }
+    Ok(())
+}
+
+fn read_operation_marker(
+    temporary_root: &Path,
+) -> Result<Option<InterruptedOperationMarker>, SkillConfigError> {
+    let path = temporary_root.join(TEMP_MARKER_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => return Err(SkillConfigError::UnsupportedEntry { path }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(SkillConfigError::io(path, source)),
+    };
+    if metadata.len() > MAX_TEMP_MARKER_BYTES {
+        return Err(SkillConfigError::Recovery {
+            message: format!("Skill operation marker is too large at {path:?}"),
+        });
+    }
+    let contents = fs::read(&path).map_err(|source| SkillConfigError::io(&path, source))?;
+    serde_json::from_slice(&contents)
+        .map(Some)
+        .map_err(|error| SkillConfigError::Recovery {
+            message: format!("invalid Skill operation marker at {path:?}: {error}"),
+        })
+}
+
+fn recover_interrupted_enable(
+    paths: &DeploymentPaths,
+    temporary_root: &Path,
+) -> Result<(), SkillConfigError> {
+    let (destination_state, _) = inspect_paths(&paths.source, &paths.destination)?;
+    if destination_state == SkillDeploymentState::Missing {
+        let staged = temporary_root.join("deployment");
+        match inspect_paths(&paths.source, &staged) {
+            Ok((SkillDeploymentState::Linked | SkillDeploymentState::Copied, _)) => {
+                fs::rename(&staged, &paths.destination)
+                    .map_err(|source| SkillConfigError::io(&paths.destination, source))?;
+            }
+            Ok((SkillDeploymentState::Missing, _)) | Err(SkillConfigError::Conflict { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    remove_directory(temporary_root)
+}
+
+fn recover_interrupted_disable(
+    paths: &DeploymentPaths,
+    temporary_root: &Path,
+) -> Result<(), SkillConfigError> {
+    let backup = temporary_root.join("deployment");
+    let (destination_state, _) = inspect_paths(&paths.source, &paths.destination)?;
+    let (backup_state, _) = inspect_paths(&paths.source, &backup)?;
+    match (destination_state, backup_state) {
+        (SkillDeploymentState::Missing, _)
+        | (
+            SkillDeploymentState::Linked | SkillDeploymentState::Copied,
+            SkillDeploymentState::Missing,
+        ) => {
+            if destination_state != SkillDeploymentState::Missing {
+                remove_deployment(&paths.destination)?;
+            }
+            remove_directory(temporary_root)
+        }
+        _ => Err(SkillConfigError::Recovery {
+            message: format!(
+                "interrupted Skill disable has both destination and backup at {:?}",
+                paths.destination
+            ),
+        }),
+    }
+}
+
+fn create_temporary_directory(
+    parent: &Path,
+    directory: &str,
+    operation: InterruptedOperation,
+) -> Result<PathBuf, SkillConfigError> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -892,11 +1321,22 @@ fn create_temporary_directory(parent: &Path) -> Result<PathBuf, SkillConfigError
     for _ in 0..16 {
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(
-            ".cc-switch-skill.{}.{timestamp}.{counter}",
+            "{TEMP_DIRECTORY_PREFIX}{}.{timestamp}.{counter}",
             std::process::id()
         ));
         match fs::create_dir(&path) {
-            Ok(()) => return Ok(path),
+            Ok(()) => {
+                let marker = InterruptedOperationMarker {
+                    version: TEMP_MARKER_VERSION,
+                    operation,
+                    directory: directory.to_owned(),
+                };
+                let result = write_operation_marker(&path, &marker);
+                return match result {
+                    Ok(()) => Ok(path),
+                    Err(error) => Err(cleanup_temporary(&path, error)),
+                };
+            }
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
                 last_error = Some((path, source));
             }
@@ -905,6 +1345,30 @@ fn create_temporary_directory(parent: &Path) -> Result<PathBuf, SkillConfigError
     }
     let (path, source) = last_error.expect("temporary directory loop must run");
     Err(SkillConfigError::io(path, source))
+}
+
+fn write_operation_marker(
+    temporary_root: &Path,
+    marker: &InterruptedOperationMarker,
+) -> Result<(), SkillConfigError> {
+    let path = temporary_root.join(TEMP_MARKER_FILE);
+    let contents = serde_json::to_vec(marker).map_err(|error| SkillConfigError::Recovery {
+        message: format!("failed to encode Skill operation marker: {error}"),
+    })?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|source| SkillConfigError::io(&path, source))?;
+    file.write_all(&contents)
+        .map_err(|source| SkillConfigError::io(&path, source))?;
+    file.sync_all()
+        .map_err(|source| SkillConfigError::io(&path, source))
 }
 
 #[cfg(unix)]
@@ -1003,6 +1467,88 @@ mod tests {
     }
 
     #[test]
+    fn gemini_disabled_names_are_projected_without_rewriting_other_settings() {
+        let original = b"{\n  \"theme\" : \"dark\",\n  \"skills\": {\"enabled\":true,\"disabled\":[\"old\"]}\n}\n";
+        let disabled = project_skill_config_enabled(
+            SkillConfigTarget::GeminiSettings,
+            Some(original),
+            "docs",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(disabled.contains("\"theme\" : \"dark\""));
+        assert!(!inspect_skill_config_enabled(
+            SkillConfigTarget::GeminiSettings,
+            Some(disabled.as_bytes()),
+            "docs"
+        )
+        .unwrap());
+
+        let enabled = project_skill_config_enabled(
+            SkillConfigTarget::GeminiSettings,
+            Some(disabled.as_bytes()),
+            "docs",
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(inspect_skill_config_enabled(
+            SkillConfigTarget::GeminiSettings,
+            Some(enabled.as_bytes()),
+            "docs"
+        )
+        .unwrap());
+        assert!(enabled.contains("\"old\""));
+    }
+
+    #[test]
+    fn grok_disabled_names_preserve_unrelated_toml() {
+        let original =
+            b"model = \"grok-code\"\n\n[skills]\npaths = [\"~/team\"]\ndisabled = [\"old\"]\n";
+        let disabled = project_skill_config_enabled(
+            SkillConfigTarget::GrokConfig,
+            Some(original),
+            "docs",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(disabled.contains("model = \"grok-code\""));
+        assert!(disabled.contains("paths = [\"~/team\"]"));
+        assert!(!inspect_skill_config_enabled(
+            SkillConfigTarget::GrokConfig,
+            Some(disabled.as_bytes()),
+            "docs"
+        )
+        .unwrap());
+        assert!(project_skill_config_enabled(
+            SkillConfigTarget::GrokConfig,
+            Some(disabled.as_bytes()),
+            "docs",
+            false
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn malformed_skill_control_sections_are_never_rewritten() {
+        for (target, contents) in [
+            (
+                SkillConfigTarget::GeminiSettings,
+                b"{\"skills\":[]}".as_slice(),
+            ),
+            (SkillConfigTarget::GrokConfig, b"skills = []".as_slice()),
+        ] {
+            assert!(matches!(
+                project_skill_config_enabled(target, Some(contents), "docs", false),
+                Err(SkillConfigError::InvalidConfig { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn directory_budget_is_enforced_while_entries_are_collected() {
         let temporary = tempdir().unwrap();
         fs::write(temporary.path().join("a"), "a").unwrap();
@@ -1075,6 +1621,72 @@ mod tests {
             .unwrap();
         assert!(source.join("docs/SKILL.md").exists());
         assert!(!destination.join("docs").exists());
+    }
+
+    #[test]
+    fn interrupted_copy_is_completed_before_retry() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Enable).unwrap();
+        copy_tree(
+            &source.join("docs"),
+            &temporary_root.join("deployment"),
+            &mut TreeBudget::default(),
+        )
+        .unwrap();
+
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert_eq!(
+            inspect_skill_deployment(&source, &destination, "docs").unwrap(),
+            SkillDeploymentState::Copied
+        );
+        assert!(!temporary_root.exists());
+    }
+
+    #[test]
+    fn interrupted_disable_is_completed_before_retry() {
+        let (_temporary, source, destination) = roots();
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Disable)
+                .unwrap();
+        fs::rename(destination.join("docs"), temporary_root.join("deployment")).unwrap();
+
+        apply_skill_deployment(&source, &destination, "docs", false, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert!(!destination.join("docs").exists());
+        assert!(!temporary_root.exists());
+    }
+
+    #[test]
+    fn marker_only_disable_is_finished_before_retry() {
+        let (_temporary, source, destination) = roots();
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Disable)
+                .unwrap();
+
+        apply_skill_deployment(&source, &destination, "docs", false, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert!(!destination.join("docs").exists());
+        assert!(!temporary_root.exists());
     }
 
     #[test]

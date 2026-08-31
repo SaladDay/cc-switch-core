@@ -22,6 +22,8 @@ pub mod fs;
 pub mod gemini;
 pub mod grokbuild;
 pub mod hermes;
+#[path = "mcp/json_patch.rs"]
+mod json_patch;
 mod mcp;
 mod native_import;
 pub mod openclaw;
@@ -72,8 +74,9 @@ pub use simple_provider::{
     SimpleProviderPreset, SimpleProviderProtocol, SimpleProviderValues,
 };
 pub use skill::{
-    apply_skill_deployment, inspect_skill_deployment, inspect_skill_presence, skill_directory_key,
-    skill_tree_digest, validate_skill_directory, validate_skill_source, SkillActivationSource,
-    SkillAppContract, SkillConfigError, SkillDeploymentReceipt, SkillDeploymentState,
-    SkillSyncMethod, MAX_SKILL_TREE_BYTES, MAX_SKILL_TREE_ENTRIES,
+    apply_skill_deployment, inspect_skill_config_enabled, inspect_skill_deployment,
+    inspect_skill_presence, project_skill_config_enabled, skill_directory_key, skill_tree_digest,
+    validate_skill_directory, validate_skill_source, SkillAppContract, SkillConfigError,
+    SkillConfigTarget, SkillDeploymentReceipt, SkillDeploymentState, SkillSyncMethod,
+    UnifiedSkillControl, MAX_SKILL_TREE_BYTES, MAX_SKILL_TREE_ENTRIES,
 };

@@ -440,29 +440,21 @@ mod tests {
                 descriptor.id()
             );
             if let Some(contract) = descriptor.skill_contract() {
-                assert_eq!(
-                    contract.catalog_column().is_some(),
-                    contract.activation_source() == crate::SkillActivationSource::CatalogFlag,
-                    "{}",
-                    descriptor.id()
-                );
                 if let Some(column) = contract.catalog_column() {
                     assert!(column.starts_with("enabled_"));
                     assert!(columns.insert(column), "duplicate Skill column: {column}");
                 }
-                if contract.discovers_unified_store() {
+                if contract.unified_control().is_some() {
                     unified_discovery.push(descriptor.id());
                 }
             }
         }
-        assert_eq!(
-            builtin_app_registry()
-                .for_app(&AppType::Pi)
-                .skill_contract()
-                .unwrap()
-                .activation_source(),
-            crate::SkillActivationSource::NativePresence
-        );
+        assert!(builtin_app_registry()
+            .for_app(&AppType::Pi)
+            .skill_contract()
+            .unwrap()
+            .catalog_column()
+            .is_none());
         assert_eq!(
             unified_discovery,
             ["codex", "gemini", "grokbuild", "opencode", "pi"]
