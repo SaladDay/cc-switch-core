@@ -139,7 +139,7 @@ impl SkillConfigError {
 #[derive(Debug)]
 enum DeploymentExpectation {
     Missing,
-    Linked { source: PathBuf },
+    Linked { target: PathBuf },
     Copied { digest: String },
 }
 
@@ -163,6 +163,7 @@ enum DeploymentChange {
 
 /// A reversible native Skill change.
 #[derive(Debug)]
+#[must_use = "a Skill deployment receipt must be committed or rolled back"]
 pub struct SkillDeploymentReceipt {
     change: DeploymentChange,
 }
@@ -411,17 +412,17 @@ fn inspect_paths(
         let target = fs::read_link(destination)
             .map_err(|source_error| SkillConfigError::io(destination, source_error))?;
         let resolved = if target.is_absolute() {
-            target
+            target.clone()
         } else {
             destination
                 .parent()
                 .expect("a deployment has a destination root")
-                .join(target)
+                .join(&target)
         };
         if canonicalize_optional(&resolved)?.as_ref() == Some(&expected) {
             return Ok((
                 SkillDeploymentState::Linked,
-                DeploymentExpectation::Linked { source: expected },
+                DeploymentExpectation::Linked { target },
             ));
         }
         return Err(SkillConfigError::Conflict {
@@ -460,13 +461,11 @@ fn enable_deployment(
     if !matches!(sync_method, SkillSyncMethod::Copy) {
         match create_symlink(&paths.source, &paths.destination) {
             Ok(()) => {
-                let expected_source = fs::canonicalize(&paths.source)
-                    .map_err(|source| SkillConfigError::io(&paths.source, source))?;
                 let receipt = SkillDeploymentReceipt {
                     change: DeploymentChange::Created {
                         destination: paths.destination,
                         expectation: DeploymentExpectation::Linked {
-                            source: expected_source,
+                            target: paths.source,
                         },
                     },
                 };
@@ -495,12 +494,11 @@ fn create_copy(paths: DeploymentPaths) -> Result<SkillDeploymentReceipt, SkillCo
         .expect("a deployment has a destination root");
     let temporary_root = create_temporary_directory(parent)?;
     let staged = temporary_root.join("deployment");
-    let source_digest = tree_digest(&paths.source);
-    let staged_digest = source_digest.and_then(|digest| {
+    let staged_digest = (|| {
         let mut budget = TreeBudget::default();
         copy_tree(&paths.source, &staged, &mut budget)?;
-        Ok((digest, tree_digest(&staged)?))
-    });
+        Ok((tree_digest(&paths.source)?, tree_digest(&staged)?))
+    })();
     let (source_digest, staged_digest) = match staged_digest {
         Ok(digests) => digests,
         Err(error) => return Err(cleanup_temporary(&temporary_root, error)),
@@ -613,22 +611,15 @@ fn require_expectation(
             Ok(_) => false,
             Err(source) => return Err(SkillConfigError::io(path, source)),
         },
-        DeploymentExpectation::Linked { source } => {
+        DeploymentExpectation::Linked { target } => {
             let metadata = fs::symlink_metadata(path)
                 .map_err(|source_error| SkillConfigError::io(path, source_error))?;
             if !metadata.file_type().is_symlink() {
                 false
             } else {
-                let target = fs::read_link(path)
-                    .map_err(|source_error| SkillConfigError::io(path, source_error))?;
-                let resolved = if target.is_absolute() {
-                    target
-                } else {
-                    path.parent()
-                        .expect("a deployment has a parent")
-                        .join(target)
-                };
-                canonicalize_optional(&resolved)?.as_ref() == Some(source)
+                fs::read_link(path)
+                    .map_err(|source_error| SkillConfigError::io(path, source_error))?
+                    == *target
             }
         }
         DeploymentExpectation::Copied { digest } => match fs::symlink_metadata(path) {
@@ -984,5 +975,29 @@ mod tests {
         );
         receipt.rollback().unwrap();
         assert!(!destination.join("docs").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_link_can_be_disabled_and_rolled_back() {
+        use std::os::unix::fs::symlink;
+
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        symlink("../source/docs", destination.join("docs")).unwrap();
+        let receipt = apply_skill_deployment(
+            &source,
+            &destination,
+            "docs",
+            false,
+            SkillSyncMethod::Symlink,
+        )
+        .unwrap();
+        assert!(!destination.join("docs").exists());
+        receipt.rollback().unwrap();
+        assert_eq!(
+            fs::read_link(destination.join("docs")).unwrap(),
+            PathBuf::from("../source/docs")
+        );
     }
 }
