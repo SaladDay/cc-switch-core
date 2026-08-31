@@ -26,6 +26,7 @@ pub const MAX_SKILL_TREE_BYTES: u64 = 512 * 1024 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TEMP_DIRECTORY_PREFIX: &str = ".cc-switch-skill.";
 const TEMP_MARKER_FILE: &str = ".operation.json";
+const TEMP_MARKER_STAGING_FILE: &str = ".operation.json.pending";
 const TEMP_MARKER_VERSION: u8 = 1;
 const MAX_TEMP_MARKER_BYTES: u64 = 1024;
 
@@ -46,6 +47,14 @@ pub enum UnifiedSkillControl {
 pub enum SkillConfigTarget {
     GeminiSettings,
     GrokConfig,
+}
+
+/// Effective state reported by a supported native per-Skill control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillConfigState {
+    Enabled,
+    Disabled,
+    GloballyDisabled,
 }
 
 impl SkillConfigTarget {
@@ -164,6 +173,8 @@ pub enum SkillConfigError {
         target: SkillConfigTarget,
         message: String,
     },
+    #[error("{target:?} cannot enable a Skill while Skills are disabled globally")]
+    GloballyDisabled { target: SkillConfigTarget },
     #[error("Skill source and destination roots overlap: {source_root:?}, {destination_root:?}")]
     OverlappingRoots {
         source_root: PathBuf,
@@ -425,24 +436,29 @@ pub fn inspect_skill_discovery(
     }
 }
 
-/// Reads the effective name-based enabled state from a supported native config.
-pub fn inspect_skill_config_enabled(
+/// Reads the effective state from a supported native per-Skill control.
+pub fn inspect_skill_config_state(
     target: SkillConfigTarget,
     contents: Option<&[u8]>,
     name: &str,
-) -> Result<bool, SkillConfigError> {
+) -> Result<SkillConfigState, SkillConfigError> {
     validate_skill_name(name)?;
-    Ok(match target {
+    let disabled = match target {
         SkillConfigTarget::GeminiSettings => {
-            !json_disabled_names(target, &parse_skill_json(target, contents)?)?
-                .iter()
-                .any(|entry| entry == name)
+            let root = parse_skill_json(target, contents)?;
+            if !json_skills_enabled(target, &root)? {
+                return Ok(SkillConfigState::GloballyDisabled);
+            }
+            json_disabled_names(target, &root)?
         }
         SkillConfigTarget::GrokConfig => {
-            !toml_disabled_names(target, &parse_skill_toml(target, contents)?)?
-                .iter()
-                .any(|entry| entry == name)
+            toml_disabled_names(target, &parse_skill_toml(target, contents)?)?
         }
+    };
+    Ok(if disabled.iter().any(|entry| entry == name) {
+        SkillConfigState::Disabled
+    } else {
+        SkillConfigState::Enabled
     })
 }
 
@@ -478,16 +494,38 @@ fn validate_skill_name(name: &str) -> Result<(), SkillConfigError> {
     Ok(())
 }
 
-fn json_disabled_names(
+fn json_skills_object(
     target: SkillConfigTarget,
     root: &Value,
-) -> Result<Vec<String>, SkillConfigError> {
+) -> Result<Option<&Map<String, Value>>, SkillConfigError> {
     let Some(skills) = root.get("skills") else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let skills = skills
         .as_object()
         .ok_or_else(|| invalid_skill_config(target, "'skills' must be an object"))?;
+    Ok(Some(skills))
+}
+
+fn json_skills_enabled(target: SkillConfigTarget, root: &Value) -> Result<bool, SkillConfigError> {
+    let Some(skills) = json_skills_object(target, root)? else {
+        return Ok(true);
+    };
+    match skills.get("enabled") {
+        None => Ok(true),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| invalid_skill_config(target, "'skills.enabled' must be a boolean")),
+    }
+}
+
+fn json_disabled_names(
+    target: SkillConfigTarget,
+    root: &Value,
+) -> Result<Vec<String>, SkillConfigError> {
+    let Some(skills) = json_skills_object(target, root)? else {
+        return Ok(Vec::new());
+    };
     let Some(disabled) = skills.get("disabled") else {
         return Ok(Vec::new());
     };
@@ -501,8 +539,12 @@ fn project_json_skill_enabled(
     enabled: bool,
 ) -> Result<Option<String>, SkillConfigError> {
     let mut root = parse_skill_json(target, contents)?;
+    let skills_enabled = json_skills_enabled(target, &root)?;
+    if enabled && !skills_enabled {
+        return Err(SkillConfigError::GloballyDisabled { target });
+    }
     let disabled = json_disabled_names(target, &root)?;
-    let currently_enabled = !disabled.iter().any(|entry| entry == name);
+    let currently_enabled = skills_enabled && !disabled.iter().any(|entry| entry == name);
     if currently_enabled == enabled {
         return Ok(None);
     }
@@ -1288,21 +1330,15 @@ fn read_operation_marker(
     let path = temporary_root.join(TEMP_MARKER_FILE);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => metadata,
-        Ok(_) => return Err(SkillConfigError::UnsupportedEntry { path }),
+        Ok(_) => return Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(SkillConfigError::io(path, source)),
     };
     if metadata.len() > MAX_TEMP_MARKER_BYTES {
-        return Err(SkillConfigError::Recovery {
-            message: format!("Skill operation marker is too large at {path:?}"),
-        });
+        return Ok(None);
     }
     let contents = fs::read(&path).map_err(|source| SkillConfigError::io(&path, source))?;
-    serde_json::from_slice(&contents)
-        .map(Some)
-        .map_err(|error| SkillConfigError::Recovery {
-            message: format!("invalid Skill operation marker at {path:?}: {error}"),
-        })
+    Ok(serde_json::from_slice(&contents).ok())
 }
 
 fn recover_interrupted_enable(
@@ -1376,7 +1412,10 @@ fn create_temporary_directory(
                 };
                 let result = write_operation_marker(&path, &marker);
                 return match result {
-                    Ok(()) => Ok(path),
+                    Ok(()) => match sync_directory(parent) {
+                        Ok(()) => Ok(path),
+                        Err(error) => Err(cleanup_temporary(&path, error)),
+                    },
                     Err(error) => Err(cleanup_temporary(&path, error)),
                 };
             }
@@ -1395,6 +1434,7 @@ fn write_operation_marker(
     marker: &InterruptedOperationMarker,
 ) -> Result<(), SkillConfigError> {
     let path = temporary_root.join(TEMP_MARKER_FILE);
+    let staging = temporary_root.join(TEMP_MARKER_STAGING_FILE);
     let contents = serde_json::to_vec(marker).map_err(|error| SkillConfigError::Recovery {
         message: format!("failed to encode Skill operation marker: {error}"),
     })?;
@@ -1406,12 +1446,31 @@ fn write_operation_marker(
         options.mode(0o600);
     }
     let mut file = options
-        .open(&path)
-        .map_err(|source| SkillConfigError::io(&path, source))?;
-    file.write_all(&contents)
-        .map_err(|source| SkillConfigError::io(&path, source))?;
-    file.sync_all()
-        .map_err(|source| SkillConfigError::io(&path, source))
+        .open(&staging)
+        .map_err(|source| SkillConfigError::io(&staging, source))?;
+    if let Err(source) = file.write_all(&contents).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&staging);
+        return Err(SkillConfigError::io(&staging, source));
+    }
+    drop(file);
+    if let Err(source) = fs::rename(&staging, &path) {
+        let _ = fs::remove_file(&staging);
+        return Err(SkillConfigError::io(&path, source));
+    }
+    sync_directory(temporary_root)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), SkillConfigError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| SkillConfigError::io(path, source))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), SkillConfigError> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1554,12 +1613,15 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(disabled.contains("\"theme\" : \"dark\""));
-        assert!(!inspect_skill_config_enabled(
-            SkillConfigTarget::GeminiSettings,
-            Some(disabled.as_bytes()),
-            "docs"
-        )
-        .unwrap());
+        assert_eq!(
+            inspect_skill_config_state(
+                SkillConfigTarget::GeminiSettings,
+                Some(disabled.as_bytes()),
+                "docs"
+            )
+            .unwrap(),
+            SkillConfigState::Disabled
+        );
 
         let enabled = project_skill_config_enabled(
             SkillConfigTarget::GeminiSettings,
@@ -1569,13 +1631,45 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(inspect_skill_config_enabled(
-            SkillConfigTarget::GeminiSettings,
-            Some(enabled.as_bytes()),
-            "docs"
-        )
-        .unwrap());
+        assert_eq!(
+            inspect_skill_config_state(
+                SkillConfigTarget::GeminiSettings,
+                Some(enabled.as_bytes()),
+                "docs"
+            )
+            .unwrap(),
+            SkillConfigState::Enabled
+        );
         assert!(enabled.contains("\"old\""));
+    }
+
+    #[test]
+    fn gemini_global_disable_is_effective_and_cannot_be_overridden() {
+        let original = br#"{"skills":{"enabled":false,"disabled":[]}}"#;
+        assert_eq!(
+            inspect_skill_config_state(SkillConfigTarget::GeminiSettings, Some(original), "docs")
+                .unwrap(),
+            SkillConfigState::GloballyDisabled
+        );
+        assert!(matches!(
+            project_skill_config_enabled(
+                SkillConfigTarget::GeminiSettings,
+                Some(original),
+                "docs",
+                true
+            ),
+            Err(SkillConfigError::GloballyDisabled {
+                target: SkillConfigTarget::GeminiSettings
+            })
+        ));
+        assert!(project_skill_config_enabled(
+            SkillConfigTarget::GeminiSettings,
+            Some(original),
+            "docs",
+            false
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -1592,12 +1686,15 @@ mod tests {
         .unwrap();
         assert!(disabled.contains("model = \"grok-code\""));
         assert!(disabled.contains("paths = [\"~/team\"]"));
-        assert!(!inspect_skill_config_enabled(
-            SkillConfigTarget::GrokConfig,
-            Some(disabled.as_bytes()),
-            "docs"
-        )
-        .unwrap());
+        assert_eq!(
+            inspect_skill_config_state(
+                SkillConfigTarget::GrokConfig,
+                Some(disabled.as_bytes()),
+                "docs"
+            )
+            .unwrap(),
+            SkillConfigState::Disabled
+        );
         assert!(project_skill_config_enabled(
             SkillConfigTarget::GrokConfig,
             Some(disabled.as_bytes()),
@@ -1614,6 +1711,10 @@ mod tests {
             (
                 SkillConfigTarget::GeminiSettings,
                 b"{\"skills\":[]}".as_slice(),
+            ),
+            (
+                SkillConfigTarget::GeminiSettings,
+                b"{\"skills\":{\"enabled\":\"yes\"}}".as_slice(),
             ),
             (SkillConfigTarget::GrokConfig, b"skills = []".as_slice()),
         ] {
@@ -1700,11 +1801,37 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_markers_do_not_block_other_skill_operations() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        let malformed = destination.join(format!("{TEMP_DIRECTORY_PREFIX}malformed"));
+        fs::create_dir(&malformed).unwrap();
+        fs::write(malformed.join(TEMP_MARKER_FILE), b"{").unwrap();
+        let pending = destination.join(format!("{TEMP_DIRECTORY_PREFIX}pending"));
+        fs::create_dir(&pending).unwrap();
+        fs::write(pending.join(TEMP_MARKER_STAGING_FILE), b"{").unwrap();
+
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert!(malformed.exists());
+        assert!(pending.exists());
+        assert_eq!(
+            inspect_skill_deployment(&source, &destination, "docs").unwrap(),
+            SkillDeploymentState::Copied
+        );
+    }
+
+    #[test]
     fn interrupted_copy_is_completed_before_retry() {
         let (_temporary, source, destination) = roots();
         fs::create_dir_all(&destination).unwrap();
         let temporary_root =
             create_temporary_directory(&destination, "docs", InterruptedOperation::Enable).unwrap();
+        assert!(temporary_root.join(TEMP_MARKER_FILE).is_file());
+        assert!(!temporary_root.join(TEMP_MARKER_STAGING_FILE).exists());
         copy_tree(
             &source.join("docs"),
             &temporary_root.join("deployment"),
