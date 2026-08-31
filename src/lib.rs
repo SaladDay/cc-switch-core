@@ -32,6 +32,7 @@ mod projection;
 mod provider;
 mod registry;
 mod simple_provider;
+mod skill;
 
 pub use adapter::{builtin_app_adapter, builtin_app_adapters, AppAdapter};
 pub use app_type::{AppType, ParseAppTypeError};
@@ -69,4 +70,9 @@ pub use simple_provider::{
     project_simple_provider_settings, simple_provider_form, SimpleProviderError,
     SimpleProviderField, SimpleProviderFieldDescriptor, SimpleProviderFormDescriptor,
     SimpleProviderPreset, SimpleProviderProtocol, SimpleProviderValues,
+};
+pub use skill::{
+    apply_skill_deployment, inspect_skill_deployment, skill_tree_digest, validate_skill_directory,
+    SkillActivationSource, SkillAppContract, SkillConfigError, SkillDeploymentReceipt,
+    SkillDeploymentState, SkillSyncMethod, MAX_SKILL_TREE_BYTES, MAX_SKILL_TREE_ENTRIES,
 };

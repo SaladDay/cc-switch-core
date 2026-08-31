@@ -6,6 +6,7 @@ use crate::{
     mcp::{
         McpAppContract, CLAUDE_MCP, CODEX_MCP, GEMINI_MCP, GROKBUILD_MCP, HERMES_MCP, OPENCODE_MCP,
     },
+    skill::{SkillAppContract, CATALOG_SKILLS, NATIVE_PRESENCE_SKILLS},
     AppType,
 };
 
@@ -53,6 +54,8 @@ pub struct AppDescriptor {
     #[serde(skip_serializing)]
     mcp_contract: Option<&'static McpAppContract>,
     #[serde(skip_serializing)]
+    skill_contract: Option<&'static SkillAppContract>,
+    #[serde(skip_serializing)]
     aliases: &'static [&'static str],
 }
 
@@ -74,12 +77,18 @@ impl AppDescriptor {
             configuration_mode,
             capabilities,
             mcp_contract: None,
+            skill_contract: None,
             aliases,
         }
     }
 
     const fn with_mcp(mut self, contract: &'static McpAppContract) -> Self {
         self.mcp_contract = Some(contract);
+        self
+    }
+
+    const fn with_skills(mut self, contract: &'static SkillAppContract) -> Self {
+        self.skill_contract = Some(contract);
         self
     }
 
@@ -121,6 +130,11 @@ impl AppDescriptor {
     /// Returns the native MCP contract declared by this application.
     pub fn mcp_contract(&self) -> Option<&'static McpAppContract> {
         self.mcp_contract
+    }
+
+    /// Returns the native Skill behavior declared by this application.
+    pub fn skill_contract(&self) -> Option<&'static SkillAppContract> {
+        self.skill_contract
     }
 
     fn matches_id(&self, normalized: &str) -> bool {
@@ -216,7 +230,8 @@ static CLAUDE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
     &[],
 )
-.with_mcp(&CLAUDE_MCP);
+.with_mcp(&CLAUDE_MCP)
+.with_skills(&CATALOG_SKILLS);
 
 static CLAUDE_DESKTOP_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::ClaudeDesktop,
@@ -237,7 +252,8 @@ static CODEX_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
     &[],
 )
-.with_mcp(&CODEX_MCP);
+.with_mcp(&CODEX_MCP)
+.with_skills(&CATALOG_SKILLS);
 
 static GEMINI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::Gemini,
@@ -248,7 +264,8 @@ static GEMINI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
     &[],
 )
-.with_mcp(&GEMINI_MCP);
+.with_mcp(&GEMINI_MCP)
+.with_skills(&CATALOG_SKILLS);
 
 static GROKBUILD_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::GrokBuild,
@@ -259,7 +276,8 @@ static GROKBUILD_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_PROXY_MCP_PROMPTS_SKILLS,
     &["grok-build", "grok_build", "grok"],
 )
-.with_mcp(&GROKBUILD_MCP);
+.with_mcp(&GROKBUILD_MCP)
+.with_skills(&CATALOG_SKILLS);
 
 static OPENCODE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::OpenCode,
@@ -270,7 +288,8 @@ static OPENCODE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_MCP_PROMPTS_SKILLS,
     &[],
 )
-.with_mcp(&OPENCODE_MCP);
+.with_mcp(&OPENCODE_MCP)
+.with_skills(&CATALOG_SKILLS);
 
 static OPENCLAW_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::OpenClaw,
@@ -291,7 +310,8 @@ static HERMES_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_MCP_PROMPTS_SKILLS,
     &[],
 )
-.with_mcp(&HERMES_MCP);
+.with_mcp(&HERMES_MCP)
+.with_skills(&CATALOG_SKILLS);
 
 static PI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::Pi,
@@ -301,7 +321,8 @@ static PI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     ProviderConfigurationMode::Additive,
     PROVIDER_LIVE_PROMPTS_SKILLS,
     &[],
-);
+)
+.with_skills(&NATIVE_PRESENCE_SKILLS);
 
 static BUILTIN_APP_DESCRIPTORS: [&AppDescriptor; 9] = [
     &CLAUDE_DESCRIPTOR,
@@ -402,6 +423,26 @@ mod tests {
                 descriptor.app().supports_local_proxy()
             );
         }
+    }
+
+    #[test]
+    fn skill_capabilities_have_one_registry_owned_contract() {
+        for descriptor in builtin_app_registry().descriptors() {
+            assert_eq!(
+                descriptor.supports(AppCapability::Skills),
+                descriptor.skill_contract().is_some(),
+                "{}",
+                descriptor.id()
+            );
+        }
+        assert_eq!(
+            builtin_app_registry()
+                .for_app(&AppType::Pi)
+                .skill_contract()
+                .unwrap()
+                .activation_source(),
+            crate::SkillActivationSource::NativePresence
+        );
     }
 
     #[test]
