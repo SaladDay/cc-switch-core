@@ -55,7 +55,8 @@ pub struct McpImport {
 pub enum McpServerProjection<'a> {
     /// Write the shared connection fields and enable the native entry.
     Enable(&'a Value),
-    /// Update an existing native entry but keep it disabled.
+    /// Update an existing native entry and preserve native disabled state when supported.
+    /// Applications without a native disabled state remove the live entry.
     Disable(&'a Value),
     /// Remove the native entry completely.
     Remove,
@@ -152,6 +153,7 @@ pub fn validate_mcp_server(id: &str, server: &Value) -> Result<(), McpConfigErro
 ///
 /// Application-only extension fields are intentionally ignored so importing
 /// the same connection from two applications does not create a false conflict.
+/// Transport names are compared using the target application's native fidelity.
 pub fn mcp_servers_equivalent(app: &AppType, left: &Value, right: &Value) -> bool {
     comparable_server_fields(app, left)
         .is_some_and(|left| comparable_server_fields(app, right).is_some_and(|right| left == right))
