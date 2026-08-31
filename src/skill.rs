@@ -11,6 +11,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
 /// Maximum number of entries accepted in one installed Skill tree.
@@ -20,7 +21,8 @@ pub const MAX_SKILL_TREE_BYTES: u64 = 512 * 1024 * 1024;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Where the authoritative enabled state for an application is stored.
+/// Where the application-specific enabled state is stored when the shared
+/// source is not itself one of the application's discovery roots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkillActivationSource {
@@ -80,10 +82,14 @@ impl SkillAppContract {
 }
 
 pub const CLAUDE_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_claude");
-pub const CODEX_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_codex");
-pub const GEMINI_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_gemini");
-pub const GROKBUILD_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_grokbuild");
-pub const OPENCODE_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_opencode");
+pub const CODEX_SKILLS: SkillAppContract =
+    SkillAppContract::catalog_flag("enabled_codex").with_unified_store_discovery();
+pub const GEMINI_SKILLS: SkillAppContract =
+    SkillAppContract::catalog_flag("enabled_gemini").with_unified_store_discovery();
+pub const GROKBUILD_SKILLS: SkillAppContract =
+    SkillAppContract::catalog_flag("enabled_grokbuild").with_unified_store_discovery();
+pub const OPENCODE_SKILLS: SkillAppContract =
+    SkillAppContract::catalog_flag("enabled_opencode").with_unified_store_discovery();
 pub const HERMES_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_hermes");
 pub const PI_SKILLS: SkillAppContract =
     SkillAppContract::native_presence().with_unified_store_discovery();
@@ -277,7 +283,7 @@ pub fn validate_skill_directory(directory: &str) -> Result<(), SkillConfigError>
 /// Returns a stable, conservative key for detecting cross-platform directory aliases.
 pub fn skill_directory_key(directory: &str) -> Result<String, SkillConfigError> {
     validate_skill_directory(directory)?;
-    Ok(directory.nfc().flat_map(char::to_lowercase).nfc().collect())
+    Ok(directory.nfc().case_fold().nfc().collect())
 }
 
 fn is_windows_reserved_name(directory: &str) -> bool {
@@ -287,7 +293,12 @@ fn is_windows_reserved_name(directory: &str) -> bool {
         || upper
             .strip_prefix("COM")
             .or_else(|| upper.strip_prefix("LPT"))
-            .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
+            .is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
 }
 
 /// Computes a deterministic digest of every regular file and directory in a Skill.
@@ -969,6 +980,13 @@ mod tests {
             skill_directory_key("É").unwrap(),
             skill_directory_key("e\u{301}").unwrap()
         );
+        assert_eq!(
+            skill_directory_key("σ").unwrap(),
+            skill_directory_key("ς").unwrap()
+        );
+        for invalid in ["COM¹", "com².txt", "LPT³"] {
+            assert!(validate_skill_directory(invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]

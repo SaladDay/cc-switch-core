@@ -431,6 +431,7 @@ mod tests {
     #[test]
     fn skill_capabilities_have_one_registry_owned_contract() {
         let mut columns = HashSet::new();
+        let mut unified_discovery = Vec::new();
         for descriptor in builtin_app_registry().descriptors() {
             assert_eq!(
                 descriptor.supports(AppCapability::Skills),
@@ -449,6 +450,9 @@ mod tests {
                     assert!(column.starts_with("enabled_"));
                     assert!(columns.insert(column), "duplicate Skill column: {column}");
                 }
+                if contract.discovers_unified_store() {
+                    unified_discovery.push(descriptor.id());
+                }
             }
         }
         assert_eq!(
@@ -459,11 +463,10 @@ mod tests {
                 .activation_source(),
             crate::SkillActivationSource::NativePresence
         );
-        assert!(builtin_app_registry()
-            .for_app(&AppType::Pi)
-            .skill_contract()
-            .unwrap()
-            .discovers_unified_store());
+        assert_eq!(
+            unified_discovery,
+            ["codex", "gemini", "grokbuild", "opencode", "pi"]
+        );
     }
 
     #[test]
