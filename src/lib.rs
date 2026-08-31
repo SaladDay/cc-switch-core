@@ -35,6 +35,7 @@ mod provider;
 mod registry;
 mod simple_provider;
 mod skill;
+mod yaml_patch;
 
 pub use adapter::{builtin_app_adapter, builtin_app_adapters, AppAdapter};
 pub use app_type::{AppType, ParseAppTypeError};

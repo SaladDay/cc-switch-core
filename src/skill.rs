@@ -131,12 +131,12 @@ impl SkillAppContract {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillSyncMethod {
-    /// Prefer a symbolic link and fall back to a verified copy.
+    /// Prefer a symbolic link and fall back to a Core-marked, verified copy.
     #[default]
     Auto,
     /// Require a symbolic link.
     Symlink,
-    /// Materialize a verified copy.
+    /// Materialize a Core-marked, verified copy.
     Copy,
 }
 
@@ -878,7 +878,7 @@ fn project_yaml_skill_enabled(
         .transpose()
         .map_err(|_| invalid_skill_config(target, "document is not UTF-8"))?
         .unwrap_or_default();
-    let output = crate::mcp::replace_yaml_section(
+    let output = crate::yaml_patch::replace_top_level_section(
         original,
         "skills",
         root_mapping
