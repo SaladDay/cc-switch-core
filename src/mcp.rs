@@ -288,11 +288,14 @@ pub fn import_mcp_servers(
         McpConfigTarget::Hermes => import_hermes(app, contents)?,
     };
     imports.retain_mut(|entry| {
+        if validate_mcp_server(&entry.id, &entry.server).is_err() {
+            return false;
+        }
         let Some(server) = managed_server_fields(&entry.server) else {
             return false;
         };
         entry.server = server;
-        validate_mcp_server(&entry.id, &entry.server).is_ok()
+        true
     });
     imports.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(imports)
@@ -1058,17 +1061,22 @@ fn set_grok_disabled(
             "'disabled_mcp_servers' must contain only strings",
         ));
     }
-    let position = array.iter().position(|value| value.as_str() == Some(id));
-    match (disabled, position) {
-        (true, None) => {
+    if disabled {
+        if array.iter().any(|value| value.as_str() == Some(id)) {
+            Ok(false)
+        } else {
             array.push(id);
             Ok(true)
         }
-        (false, Some(position)) => {
+    } else {
+        let mut changed = false;
+        loop {
+            let position = array.iter().position(|value| value.as_str() == Some(id));
+            let Some(position) = position else { break };
             array.remove(position);
-            Ok(true)
+            changed = true;
         }
-        _ => Ok(false),
+        Ok(changed)
     }
 }
 
@@ -1601,6 +1609,12 @@ mod tests {
             &json!({"command":"npx","cwd":"/repo"}),
         )
         .expect("Codex supports cwd");
+        assert!(import_mcp_servers(
+            &AppType::Claude,
+            Some(br#"{"mcpServers":{"bad":{"type":0,"command":"npx"}}}"#),
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]

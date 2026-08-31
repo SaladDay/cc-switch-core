@@ -9,6 +9,7 @@ The `0.1` API contains:
 - sealed built-in adapter and live-operation plan contracts;
 - source-neutral, lossless provider snapshots;
 - redacted provider entries for additive application configs;
+- MCP application contracts, validation, import, and loss-aware projection;
 - deterministic JSON and atomic file-writing primitives;
 - host-neutral compare-and-swap execution with guarded rollback;
 - pure live projections and validation for all nine supported applications.
