@@ -11,6 +11,11 @@ use thiserror::Error;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Returns the common advisory-lock path for live configuration writes.
+pub fn shared_live_config_lock_path(home: &Path) -> PathBuf {
+    home.join(".cc-switch/live-config.lock")
+}
+
 /// An error produced while reading or replacing a file.
 #[derive(Debug, Error)]
 pub enum FileError {
@@ -259,6 +264,14 @@ mod tests {
             })
             .map(|entry| entry.path())
             .collect()
+    }
+
+    #[test]
+    fn live_config_lock_path_is_shared_across_products() {
+        assert_eq!(
+            shared_live_config_lock_path(Path::new("profile")),
+            Path::new("profile/.cc-switch/live-config.lock")
+        );
     }
 
     #[test]

@@ -162,7 +162,11 @@ pub fn import_mcp_servers(
     Ok(imports)
 }
 
-/// Projects one upsert or removal into a complete application document.
+/// Projects one enabled application link or removal into a complete document.
+///
+/// Native `enabled = false` entries are represented by [`McpImport::enabled`]
+/// during import. Hosts keep that state in their catalog and pass `None` here
+/// when an application link is disabled.
 ///
 /// `Ok(None)` means the live document does not need to be written.
 pub fn project_mcp_server(
@@ -672,14 +676,23 @@ fn append_toml_imports(
     output: &mut Vec<McpImport>,
 ) -> Result<(), McpConfigError> {
     for (id, item) in entries.iter() {
-        let server = item_to_json(item)
+        let mut server = item_to_json(item)
             .and_then(|value| value.as_object().cloned().ok_or(()))
-            .map(Value::Object)
             .map_err(|_| invalid_document(app, "MCP server entries must be tables"))?;
+        let enabled = match server.remove("enabled") {
+            Some(Value::Bool(enabled)) => enabled,
+            Some(_) => {
+                return Err(invalid_document(
+                    app,
+                    "MCP server 'enabled' fields must be booleans",
+                ));
+            }
+            None => true,
+        };
         output.push(McpImport {
             id: id.to_owned(),
-            server,
-            enabled: true,
+            server: Value::Object(server),
+            enabled,
         });
     }
     Ok(())
@@ -768,12 +781,14 @@ fn unified_to_toml_server(
         "url",
         "headers",
         "http_headers",
+        "enabled",
     ] {
         table.remove(key);
     }
     for (key, value) in source {
         if !MANAGED_SERVER_FIELDS.contains(&key.as_str())
             && key != "http_headers"
+            && key != "enabled"
             && table.get(key).is_none()
         {
             table.insert(key, json_to_toml_item(value)?);
@@ -1001,7 +1016,13 @@ fn from_hermes(id: &str, value: &Value) -> Result<Value, McpConfigError> {
     let object = value.as_object().ok_or_else(|| {
         McpConfigError::InvalidServer(format!("Hermes entry '{id}' must be an object"))
     })?;
-    let mut output = Map::new();
+    let mut output = object.clone();
+    clear_fields(
+        &mut output,
+        &[
+            "type", "command", "args", "env", "cwd", "url", "headers", "enabled",
+        ],
+    );
     if object.contains_key("command") {
         output.insert("type".to_owned(), Value::String("stdio".to_owned()));
         copy_fields(object, &mut output, &["command", "args", "env"]);
@@ -1024,8 +1045,11 @@ fn to_hermes(server: &Value, existing: Option<&Value>) -> Result<Value, McpConfi
         .unwrap_or_default();
     clear_fields(
         &mut output,
-        &["type", "command", "args", "env", "cwd", "url", "headers"],
+        &[
+            "type", "command", "args", "env", "cwd", "url", "headers", "enabled",
+        ],
     );
+    merge_server_extensions(&mut output, unified, &["enabled"]);
     match unified
         .get("type")
         .and_then(Value::as_str)
@@ -1264,7 +1288,11 @@ mod tests {
 
     #[test]
     fn codex_and_grok_preserve_unrelated_toml() {
-        let original = b"model = \"keep\"\n[mcp_servers.old]\ncommand = \"old\"\n[mcp_servers.remote]\nurl = \"https://old.example\"\nfuture = \"keep\"\nfuture_date = 1979-05-27T07:32:00Z\n";
+        let original = b"model = \"keep\"\n[mcp_servers.old]\ncommand = \"old\"\n[mcp_servers.remote]\nurl = \"https://old.example\"\nenabled = false\nfuture = \"keep\"\nfuture_date = 1979-05-27T07:32:00Z\n";
+        let imported = import_mcp_servers(&AppType::Codex, Some(original)).unwrap();
+        let imported = imported.iter().find(|item| item.id == "remote").unwrap();
+        assert!(!imported.enabled);
+        assert!(imported.server.get("enabled").is_none());
         let server = json!({
             "type":"http", "url":"https://example.com/mcp",
             "headers":{"Authorization":"secret"}, "timeout":30
@@ -1278,6 +1306,7 @@ mod tests {
         assert!(codex.contains("future = \"keep\""));
         assert!(codex.contains("future_date = 1979-05-27T07:32:00Z"));
         assert!(!codex.contains("future_date = \"1979-05-27T07:32:00Z\""));
+        assert!(!codex.contains("enabled = false"));
 
         let grok = project_mcp_server(&AppType::GrokBuild, Some(original), "remote", Some(&server))
             .unwrap()
@@ -1316,6 +1345,26 @@ mod tests {
         assert_eq!(root["mcp_servers"]["remote"]["enabled"], true);
         let imports = import_mcp_servers(&AppType::Hermes, Some(original)).unwrap();
         assert!(!imports[0].enabled);
+        assert_eq!(imports[0].server["auth"], "oauth");
+        assert_eq!(imports[0].server["timeout"], 30);
+        assert_eq!(imports[0].server["future"], "keep");
+        assert!(imports[0].server.get("enabled").is_none());
+
+        let removed = project_mcp_server(&AppType::Hermes, Some(original), "remote", None)
+            .unwrap()
+            .unwrap();
+        let restored = project_mcp_server(
+            &AppType::Hermes,
+            Some(removed.as_bytes()),
+            "remote",
+            Some(&imports[0].server),
+        )
+        .unwrap()
+        .unwrap();
+        let restored: Value = serde_yaml::from_str(&restored).unwrap();
+        assert_eq!(restored["mcp_servers"]["remote"]["auth"], "oauth");
+        assert_eq!(restored["mcp_servers"]["remote"]["timeout"], 30);
+        assert_eq!(restored["mcp_servers"]["remote"]["future"], "keep");
     }
 
     #[test]
