@@ -6,10 +6,7 @@ use crate::{
     mcp::{
         McpAppContract, CLAUDE_MCP, CODEX_MCP, GEMINI_MCP, GROKBUILD_MCP, HERMES_MCP, OPENCODE_MCP,
     },
-    skill::{
-        SkillAppContract, CLAUDE_SKILLS, CODEX_SKILLS, GEMINI_SKILLS, GROKBUILD_SKILLS,
-        HERMES_SKILLS, OPENCODE_SKILLS, PI_SKILLS,
-    },
+    skill::{SkillAppContract, SkillConfigTarget},
     AppType,
 };
 
@@ -223,6 +220,23 @@ const PROVIDER_LIVE: &[AppCapability] = &[
 ];
 
 static BUILTIN_APP_REGISTRY: BuiltinAppRegistry = BuiltinAppRegistry { _private: () };
+
+static CLAUDE_SKILLS: SkillAppContract = SkillAppContract::with_catalog_column("enabled_claude");
+static CODEX_SKILLS: SkillAppContract =
+    SkillAppContract::with_catalog_column("enabled_codex").with_unified_store_discovery();
+static GEMINI_SKILLS: SkillAppContract = SkillAppContract::with_catalog_column("enabled_gemini")
+    .with_unified_store_discovery()
+    .with_config_target(SkillConfigTarget::GeminiSettings);
+static GROKBUILD_SKILLS: SkillAppContract =
+    SkillAppContract::with_catalog_column("enabled_grokbuild")
+        .with_unified_store_discovery()
+        .with_config_target(SkillConfigTarget::GrokConfig);
+static OPENCODE_SKILLS: SkillAppContract =
+    SkillAppContract::with_catalog_column("enabled_opencode").with_unified_store_discovery();
+static HERMES_SKILLS: SkillAppContract = SkillAppContract::with_catalog_column("enabled_hermes")
+    .with_config_target(SkillConfigTarget::HermesConfig);
+static PI_SKILLS: SkillAppContract =
+    SkillAppContract::without_catalog().with_unified_store_discovery();
 
 static CLAUDE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::Claude,
@@ -444,7 +458,7 @@ mod tests {
                     assert!(column.starts_with("enabled_"));
                     assert!(columns.insert(column), "duplicate Skill column: {column}");
                 }
-                if contract.unified_control().is_some() {
+                if contract.discovery() == crate::SkillDiscoveryMode::Unified {
                     unified_discovery.push(descriptor.id());
                 }
             }
@@ -464,20 +478,24 @@ mod tests {
                 .for_app(&AppType::Gemini)
                 .skill_contract()
                 .unwrap()
-                .unified_control(),
-            Some(crate::UnifiedSkillControl::DisabledNameList(
-                crate::SkillConfigTarget::GeminiSettings
-            ))
+                .config_target(),
+            Some(crate::SkillConfigTarget::GeminiSettings)
         );
         assert_eq!(
             builtin_app_registry()
                 .for_app(&AppType::GrokBuild)
                 .skill_contract()
                 .unwrap()
-                .unified_control(),
-            Some(crate::UnifiedSkillControl::DisabledNameList(
-                crate::SkillConfigTarget::GrokConfig
-            ))
+                .config_target(),
+            Some(crate::SkillConfigTarget::GrokConfig)
+        );
+        assert_eq!(
+            builtin_app_registry()
+                .for_app(&AppType::Hermes)
+                .skill_contract()
+                .unwrap()
+                .config_target(),
+            Some(crate::SkillConfigTarget::HermesConfig)
         );
     }
 
