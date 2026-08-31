@@ -202,10 +202,12 @@ pub fn validate_mcp_server(id: &str, server: &Value) -> Result<(), McpConfigErro
             string_array(object, "args")?;
             string_map(object, "env")?;
             optional_string(object, "cwd")?;
+            reject_fields(object, &["url", "headers"], "stdio")?;
         }
         "http" | "sse" => {
             required_string(object, "url", "remote definitions require url")?;
             string_map(object, "headers")?;
+            reject_fields(object, &["command", "args", "env", "cwd"], transport)?;
         }
         other => {
             return Err(McpConfigError::InvalidServer(format!(
@@ -458,6 +460,20 @@ fn string_map(object: &Map<String, Value>, key: &str) -> Result<(), McpConfigErr
         Err(McpConfigError::InvalidServer(format!(
             "'{key}' must map strings to strings"
         )))
+    }
+}
+
+fn reject_fields(
+    object: &Map<String, Value>,
+    fields: &[&str],
+    transport: &str,
+) -> Result<(), McpConfigError> {
+    if let Some(field) = fields.iter().find(|field| object.contains_key(**field)) {
+        Err(McpConfigError::InvalidServer(format!(
+            "'{field}' is not valid for '{transport}' definitions"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -1378,15 +1394,21 @@ fn project_hermes(
     if !changed {
         return Ok(None);
     }
-    replace_yaml_section(
+    let projected = replace_yaml_section(
         &original,
         "mcp_servers",
         root.get(&section_key)
             .expect("changed YAML contains MCP section"),
         section_existed,
     )
-    .map(Some)
-    .map_err(|message| invalid_document(app, &message))
+    .map_err(|message| invalid_document(app, &message))?;
+    serde_yaml::from_str::<serde_yaml::Value>(&projected).map_err(|_| {
+        invalid_document(
+            app,
+            "projected MCP section would invalidate references elsewhere in the YAML document",
+        )
+    })?;
+    Ok(Some(projected))
 }
 
 fn hermes_projection(
@@ -1593,6 +1615,16 @@ mod tests {
         assert!(validate_mcp_server("server", &json!({"type": "stdio"})).is_err());
         assert!(validate_mcp_server("server", &json!({"type": "grpc"})).is_err());
         assert!(validate_mcp_server("server", &json!({"type": 0, "command": "npx"})).is_err());
+        assert!(validate_mcp_server(
+            "server",
+            &json!({"type":"stdio","command":"npx","url":"https://example.com"})
+        )
+        .is_err());
+        assert!(validate_mcp_server(
+            "server",
+            &json!({"type":"http","url":"https://example.com","command":"npx"})
+        )
+        .is_err());
         assert!(validate_mcp_server(" ", &json!({"command": "npx"})).is_err());
         assert!(validate_mcp_server(" server ", &json!({"command": "npx"})).is_err());
         assert_eq!(
@@ -1916,6 +1948,26 @@ mod tests {
             .expect_err("unsupported YAML form must not be rewritten");
             assert!(matches!(error, McpConfigError::InvalidDocument { .. }));
         }
+    }
+
+    #[test]
+    fn hermes_rejects_projection_that_would_break_cross_section_aliases() {
+        let original = br#"mcp_servers:
+  server: &shared
+    command: npx
+runtime:
+  fallback: *shared
+"#;
+
+        let error = project_mcp_server(
+            &AppType::Hermes,
+            Some(original),
+            "server",
+            McpServerProjection::Enable(&json!({"command":"uvx"})),
+        )
+        .expect_err("projection must not leave an alias without its anchor");
+
+        assert!(matches!(error, McpConfigError::InvalidDocument { .. }));
     }
 
     #[test]
