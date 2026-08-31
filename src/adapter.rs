@@ -4,10 +4,10 @@ use std::fmt;
 
 use crate::{
     builtin_app_registry, native_import, projection, AppDescriptor, AppType, LiveDocumentSet,
-    LogicalTarget, McpConfigError, McpConfigTarget, McpImport, McpServerProjection, NativeAction,
-    NativeImportError, NativeImportStep, NativePlanError, NativePlanRequest, OperationPlan,
-    OperationPlanError, ProviderSnapshot, SimpleProviderError, SimpleProviderFormDescriptor,
-    SimpleProviderValues,
+    LogicalTarget, McpAppContract, McpConfigError, McpConfigTarget, McpImport, McpServerProjection,
+    NativeAction, NativeImportError, NativeImportStep, NativePlanError, NativePlanRequest,
+    OperationPlan, OperationPlanError, ProviderSnapshot, SimpleProviderError,
+    SimpleProviderFormDescriptor, SimpleProviderValues,
 };
 
 mod sealed {
@@ -32,7 +32,12 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
 
     /// Returns this application's MCP document target, when supported.
     fn mcp_config_target(&self) -> Option<McpConfigTarget> {
-        crate::mcp_config_target(self.descriptor().app())
+        self.mcp_contract().map(|contract| contract.target())
+    }
+
+    /// Returns this application's MCP behavior, when supported.
+    fn mcp_contract(&self) -> Option<&'static McpAppContract> {
+        crate::mcp_app_contract(self.descriptor().app())
     }
 
     /// Extracts valid unified MCP servers from an observed live document.

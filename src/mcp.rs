@@ -3,7 +3,7 @@
 //! Hosts own paths, locking, persistence, and rollback. This module validates
 //! the unified server shape and changes only the MCP section of live config.
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -27,17 +27,77 @@ pub enum McpConfigTarget {
     Hermes,
 }
 
-impl McpConfigTarget {
-    /// Returns the application that owns this document.
-    pub fn app(self) -> AppType {
-        match self {
-            Self::Claude => AppType::Claude,
-            Self::Codex => AppType::Codex,
-            Self::Gemini => AppType::Gemini,
-            Self::GrokBuild => AppType::GrokBuild,
-            Self::OpenCode => AppType::OpenCode,
-            Self::Hermes => AppType::Hermes,
-        }
+/// MCP behavior that a host must honor for one application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpAppContract {
+    target: McpConfigTarget,
+    preserves_disabled_entry: bool,
+    supports_cwd: bool,
+}
+
+impl McpAppContract {
+    /// Returns the application-owned MCP document target.
+    pub const fn target(self) -> McpConfigTarget {
+        self.target
+    }
+
+    /// Returns whether disabling keeps a native entry that can later be restored in place.
+    pub const fn preserves_disabled_entry(self) -> bool {
+        self.preserves_disabled_entry
+    }
+
+    /// Returns whether this application's native MCP format can express `cwd`.
+    pub const fn supports_cwd(self) -> bool {
+        self.supports_cwd
+    }
+}
+
+const CLAUDE_MCP: McpAppContract = McpAppContract {
+    target: McpConfigTarget::Claude,
+    preserves_disabled_entry: false,
+    supports_cwd: true,
+};
+const CODEX_MCP: McpAppContract = McpAppContract {
+    target: McpConfigTarget::Codex,
+    preserves_disabled_entry: true,
+    supports_cwd: true,
+};
+const GEMINI_MCP: McpAppContract = McpAppContract {
+    target: McpConfigTarget::Gemini,
+    preserves_disabled_entry: false,
+    supports_cwd: true,
+};
+const GROKBUILD_MCP: McpAppContract = McpAppContract {
+    target: McpConfigTarget::GrokBuild,
+    preserves_disabled_entry: true,
+    supports_cwd: true,
+};
+const OPENCODE_MCP: McpAppContract = McpAppContract {
+    target: McpConfigTarget::OpenCode,
+    preserves_disabled_entry: true,
+    supports_cwd: false,
+};
+const HERMES_MCP: McpAppContract = McpAppContract {
+    target: McpConfigTarget::Hermes,
+    preserves_disabled_entry: true,
+    supports_cwd: false,
+};
+
+/// Opaque, application-owned state used to restore an entry that has no native disabled form.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpNativeSnapshot {
+    target: McpConfigTarget,
+    entry: Value,
+}
+
+impl fmt::Debug for McpNativeSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpNativeSnapshot")
+            .field("target", &self.target)
+            .field("entry", &"<redacted>")
+            .finish()
     }
 }
 
@@ -48,6 +108,8 @@ pub struct McpImport {
     pub id: String,
     pub server: Value,
     pub enabled: bool,
+    #[serde(skip_serializing)]
+    pub native_snapshot: Option<McpNativeSnapshot>,
 }
 
 /// Desired state for one server in an application-owned MCP document.
@@ -55,6 +117,11 @@ pub struct McpImport {
 pub enum McpServerProjection<'a> {
     /// Write the shared connection fields and enable the native entry.
     Enable(&'a Value),
+    /// Enable an entry, restoring target-owned fields when the live entry was removed on disable.
+    Restore {
+        server: &'a Value,
+        snapshot: &'a McpNativeSnapshot,
+    },
     /// Update an existing native entry and preserve native disabled state when supported.
     /// Applications without a native disabled state remove the live entry.
     Disable(&'a Value),
@@ -66,6 +133,7 @@ impl fmt::Debug for McpServerProjection<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Enable(_) => formatter.write_str("Enable(<redacted>)"),
+            Self::Restore { .. } => formatter.write_str("Restore(<redacted>)"),
             Self::Disable(_) => formatter.write_str("Disable(<redacted>)"),
             Self::Remove => formatter.write_str("Remove"),
         }
@@ -79,6 +147,10 @@ impl fmt::Debug for McpImport {
             .field("id", &self.id)
             .field("server", &"<redacted>")
             .field("enabled", &self.enabled)
+            .field(
+                "native_snapshot",
+                &self.native_snapshot.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -97,17 +169,22 @@ pub enum McpConfigError {
     InvalidDocument { app_id: String, message: String },
 }
 
-/// Returns the live MCP target declared for an application.
-pub fn mcp_config_target(app: &AppType) -> Option<McpConfigTarget> {
+/// Returns the MCP behavior declared for an application.
+pub fn mcp_app_contract(app: &AppType) -> Option<&'static McpAppContract> {
     match app {
-        AppType::Claude => Some(McpConfigTarget::Claude),
-        AppType::Codex => Some(McpConfigTarget::Codex),
-        AppType::Gemini => Some(McpConfigTarget::Gemini),
-        AppType::GrokBuild => Some(McpConfigTarget::GrokBuild),
-        AppType::OpenCode => Some(McpConfigTarget::OpenCode),
-        AppType::Hermes => Some(McpConfigTarget::Hermes),
+        AppType::Claude => Some(&CLAUDE_MCP),
+        AppType::Codex => Some(&CODEX_MCP),
+        AppType::Gemini => Some(&GEMINI_MCP),
+        AppType::GrokBuild => Some(&GROKBUILD_MCP),
+        AppType::OpenCode => Some(&OPENCODE_MCP),
+        AppType::Hermes => Some(&HERMES_MCP),
         AppType::ClaudeDesktop | AppType::OpenClaw | AppType::Pi => None,
     }
+}
+
+/// Returns the live MCP target declared for an application.
+pub fn mcp_config_target(app: &AppType) -> Option<McpConfigTarget> {
+    mcp_app_contract(app).map(|contract| contract.target())
 }
 
 /// Validates the small, cross-product MCP server contract.
@@ -116,10 +193,15 @@ pub fn validate_mcp_server(id: &str, server: &Value) -> Result<(), McpConfigErro
     let object = server.as_object().ok_or_else(|| {
         McpConfigError::InvalidServer("the definition must be an object".to_owned())
     })?;
-    let transport = object
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("stdio");
+    let transport = match object.get("type") {
+        Some(Value::String(transport)) => transport.as_str(),
+        Some(_) => {
+            return Err(McpConfigError::InvalidServer(
+                "'type' must be a string".to_owned(),
+            ));
+        }
+        None => "stdio",
+    };
     match transport {
         "stdio" => {
             required_string(object, "command", "stdio definitions require command")?;
@@ -144,6 +226,31 @@ pub fn validate_mcp_server(id: &str, server: &Value) -> Result<(), McpConfigErro
     {
         return Err(McpConfigError::InvalidServer(format!(
             "definition exceeds {MAX_OPERATION_CONTENT_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates that a shared server can be represented by one application's native format.
+pub fn validate_mcp_server_for_app(
+    app: &AppType,
+    id: &str,
+    server: &Value,
+) -> Result<(), McpConfigError> {
+    validate_mcp_server(id, server)?;
+    let contract = mcp_app_contract(app).ok_or_else(|| McpConfigError::UnsupportedApp {
+        app_id: app.as_str().to_owned(),
+    })?;
+    let object = server.as_object().expect("validated server object");
+    if !contract.supports_cwd()
+        && object
+            .get("cwd")
+            .and_then(Value::as_str)
+            .is_some_and(|cwd| !cwd.is_empty())
+    {
+        return Err(McpConfigError::InvalidServer(format!(
+            "application '{}' cannot represent 'cwd'",
+            app.as_str()
         )));
     }
     Ok(())
@@ -201,10 +308,17 @@ pub fn project_mcp_server(
     projection: McpServerProjection<'_>,
 ) -> Result<Option<String>, McpConfigError> {
     validate_id(id)?;
-    if let McpServerProjection::Enable(server) | McpServerProjection::Disable(server) = projection {
-        validate_mcp_server(id, server)?;
+    match projection {
+        McpServerProjection::Enable(server) | McpServerProjection::Restore { server, .. } => {
+            validate_mcp_server_for_app(app, id, server)?;
+        }
+        McpServerProjection::Disable(server) => validate_mcp_server(id, server)?,
+        McpServerProjection::Remove => {}
     }
     let target = require_target(app)?;
+    if let McpServerProjection::Restore { snapshot, .. } = projection {
+        validate_snapshot(target, snapshot)?;
+    }
     validate_document_size(app, contents)?;
     let projected = match target {
         McpConfigTarget::Claude => project_json_section(
@@ -246,6 +360,28 @@ fn require_target(app: &AppType) -> Result<McpConfigTarget, McpConfigError> {
     mcp_config_target(app).ok_or_else(|| McpConfigError::UnsupportedApp {
         app_id: app.as_str().to_owned(),
     })
+}
+
+fn validate_snapshot(
+    target: McpConfigTarget,
+    snapshot: &McpNativeSnapshot,
+) -> Result<(), McpConfigError> {
+    if snapshot.target != target {
+        return Err(McpConfigError::InvalidServer(
+            "native MCP snapshot belongs to another application".to_owned(),
+        ));
+    }
+    if !matches!(target, McpConfigTarget::Claude | McpConfigTarget::Gemini) {
+        return Err(McpConfigError::InvalidServer(
+            "this application does not use removable native snapshots".to_owned(),
+        ));
+    }
+    if !snapshot.entry.is_object() {
+        return Err(McpConfigError::InvalidServer(
+            "native MCP snapshot must contain an object".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_document_size(app: &AppType, contents: Option<&[u8]>) -> Result<(), McpConfigError> {
@@ -357,20 +493,22 @@ fn managed_server_fields(server: &Value) -> Option<Value> {
 
 fn comparable_server_fields(app: &AppType, server: &Value) -> Option<Value> {
     let mut managed = managed_server_fields(server)?;
+    let contract = mcp_app_contract(app)?;
+    let object = managed
+        .as_object_mut()
+        .expect("managed server is an object");
+    if !contract.supports_cwd() {
+        object.remove("cwd");
+    }
     if matches!(
         app,
         AppType::GrokBuild | AppType::OpenCode | AppType::Hermes
-    ) {
-        let object = managed
-            .as_object_mut()
-            .expect("managed server is an object");
-        if object
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|transport| matches!(transport, "http" | "sse"))
-        {
-            object.insert("type".to_owned(), Value::String("remote".to_owned()));
-        }
+    ) && object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|transport| matches!(transport, "http" | "sse"))
+    {
+        object.insert("type".to_owned(), Value::String("remote".to_owned()));
     }
     Some(managed)
 }
@@ -418,6 +556,17 @@ fn import_json_section(
                     id: id.clone(),
                     server,
                     enabled,
+                    native_snapshot: match flavor {
+                        JsonFlavor::Claude => Some(McpNativeSnapshot {
+                            target: McpConfigTarget::Claude,
+                            entry: value.clone(),
+                        }),
+                        JsonFlavor::Gemini => Some(McpNativeSnapshot {
+                            target: McpConfigTarget::Gemini,
+                            entry: value.clone(),
+                        }),
+                        JsonFlavor::OpenCode => None,
+                    },
                 })
         })
         .collect())
@@ -431,6 +580,7 @@ fn project_json_section(
     projection: McpServerProjection<'_>,
     flavor: JsonFlavor,
 ) -> Result<Option<String>, McpConfigError> {
+    ensure_lossless_json_projection(app, contents)?;
     let mut root = parse_json_root(app, contents)?;
     let root_object = root.as_object_mut().expect("validated JSON root");
     let existing_entry = root_object
@@ -443,6 +593,11 @@ fn project_json_section(
         McpServerProjection::Enable(server) => {
             Some(to_json_flavor(flavor, server, existing_entry.as_ref())?)
         }
+        McpServerProjection::Restore { server, snapshot } => Some(to_json_flavor(
+            flavor,
+            server,
+            existing_entry.as_ref().or(Some(&snapshot.entry)),
+        )?),
         McpServerProjection::Disable(server) if matches!(flavor, JsonFlavor::OpenCode) => {
             let Some(existing) = existing_entry.as_ref() else {
                 return Ok(None);
@@ -493,6 +648,22 @@ fn project_json_section(
     pretty_json(root)
         .map(Some)
         .map_err(|message| invalid_document(app, &message))
+}
+
+fn ensure_lossless_json_projection(
+    app: &AppType,
+    contents: Option<&[u8]>,
+) -> Result<(), McpConfigError> {
+    let Some(contents) = contents else {
+        return Ok(());
+    };
+    serde_json::from_slice::<Value>(contents).map_err(|_| {
+        invalid_document(
+            app,
+            "JSON5 syntax cannot be edited without losing comments or formatting",
+        )
+    })?;
+    Ok(())
 }
 
 fn from_json_flavor(flavor: JsonFlavor, value: &Value) -> Result<(Value, bool), McpConfigError> {
@@ -694,6 +865,11 @@ fn import_toml_section(
     grok: bool,
 ) -> Result<Vec<McpImport>, McpConfigError> {
     let document = parse_toml(app, contents)?;
+    let grok_disabled = if grok {
+        grok_disabled_ids(app, &document)?
+    } else {
+        HashSet::new()
+    };
     let mut imports = Vec::new();
     if let Some(entries) = document.get("mcp_servers") {
         let entries = entries
@@ -722,6 +898,9 @@ fn import_toml_section(
     }
 
     for entry in &mut imports {
+        if grok_disabled.contains(&entry.id) {
+            entry.enabled = false;
+        }
         let object = entry.server.as_object_mut().expect("TOML entry object");
         if let Some(headers) = object.remove("http_headers") {
             object.insert("headers".to_owned(), headers);
@@ -758,6 +937,7 @@ fn append_toml_imports(
             id: id.to_owned(),
             server: Value::Object(server),
             enabled,
+            native_snapshot: None,
         });
     }
     Ok(())
@@ -774,7 +954,7 @@ fn project_toml_section(
     let mut changed = false;
 
     match projection {
-        McpServerProjection::Enable(server) => {
+        McpServerProjection::Enable(server) | McpServerProjection::Restore { server, .. } => {
             let existing = official_toml_entry(&document, id).cloned().or_else(|| {
                 (!grok)
                     .then(|| legacy_toml_entry(&document, id).cloned())
@@ -784,6 +964,9 @@ fn project_toml_section(
             let entries = ensure_official_toml_entries(app, &mut document)?;
             entries.insert(id, projected);
             changed = true;
+            if grok {
+                changed |= set_grok_disabled(app, &mut document, id, false)?;
+            }
             if !grok {
                 changed |= remove_legacy_toml_entry(&mut document, id);
             }
@@ -794,6 +977,9 @@ fn project_toml_section(
                 set_toml_enabled(&mut projected, false)?;
                 ensure_official_toml_entries(app, &mut document)?.insert(id, projected);
                 changed = true;
+                if grok {
+                    changed |= set_grok_disabled(app, &mut document, id, true)?;
+                }
             } else if !grok {
                 if let Some(existing) = legacy_toml_entry(&document, id).cloned() {
                     let mut projected = unified_to_toml_server(server, grok, Some(existing))?;
@@ -819,11 +1005,71 @@ fn project_toml_section(
             }
             if !grok {
                 changed |= remove_legacy_toml_entry(&mut document, id);
+            } else {
+                changed |= set_grok_disabled(app, &mut document, id, false)?;
             }
         }
     }
 
     Ok(changed.then(|| document.to_string()))
+}
+
+fn grok_disabled_ids(
+    app: &AppType,
+    document: &DocumentMut,
+) -> Result<HashSet<String>, McpConfigError> {
+    let Some(item) = document.get("disabled_mcp_servers") else {
+        return Ok(HashSet::new());
+    };
+    let array = item.as_array().ok_or_else(|| {
+        invalid_document(app, "'disabled_mcp_servers' must be an array of strings")
+    })?;
+    array
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                invalid_document(app, "'disabled_mcp_servers' must contain only strings")
+            })
+        })
+        .collect()
+}
+
+fn set_grok_disabled(
+    app: &AppType,
+    document: &mut DocumentMut,
+    id: &str,
+    disabled: bool,
+) -> Result<bool, McpConfigError> {
+    if document.get("disabled_mcp_servers").is_none() {
+        if !disabled {
+            return Ok(false);
+        }
+        document["disabled_mcp_servers"] = Item::Value(toml_edit::Value::Array(Array::new()));
+    }
+    let array = document
+        .get_mut("disabled_mcp_servers")
+        .and_then(Item::as_array_mut)
+        .ok_or_else(|| {
+            invalid_document(app, "'disabled_mcp_servers' must be an array of strings")
+        })?;
+    if array.iter().any(|value| value.as_str().is_none()) {
+        return Err(invalid_document(
+            app,
+            "'disabled_mcp_servers' must contain only strings",
+        ));
+    }
+    let position = array.iter().position(|value| value.as_str() == Some(id));
+    match (disabled, position) {
+        (true, None) => {
+            array.push(id);
+            Ok(true)
+        }
+        (false, Some(position)) => {
+            array.remove(position);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn official_toml_entry<'a>(document: &'a DocumentMut, id: &str) -> Option<&'a Item> {
@@ -1043,6 +1289,7 @@ fn import_hermes(app: &AppType, contents: Option<&[u8]>) -> Result<Vec<McpImport
                 id: id.to_owned(),
                 server,
                 enabled: json.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                native_snapshot: None,
             });
         }
     }
@@ -1071,7 +1318,7 @@ fn project_hermes(
         .cloned();
 
     let changed = match projection {
-        McpServerProjection::Enable(server) => {
+        McpServerProjection::Enable(server) | McpServerProjection::Restore { server, .. } => {
             match root.get(&section_key) {
                 Some(value) if !value.is_mapping() => {
                     return Err(invalid_document(app, "'mcp_servers' must be a mapping"));
@@ -1332,6 +1579,7 @@ mod tests {
         }
         assert!(validate_mcp_server("server", &json!({"type": "stdio"})).is_err());
         assert!(validate_mcp_server("server", &json!({"type": "grpc"})).is_err());
+        assert!(validate_mcp_server("server", &json!({"type": 0, "command": "npx"})).is_err());
         assert!(validate_mcp_server(" ", &json!({"command": "npx"})).is_err());
         assert!(validate_mcp_server(" server ", &json!({"command": "npx"})).is_err());
         assert_eq!(
@@ -1341,6 +1589,18 @@ mod tests {
             ),
             "Enable(<redacted>)"
         );
+        assert!(validate_mcp_server_for_app(
+            &AppType::OpenCode,
+            "server",
+            &json!({"command":"npx","cwd":"/repo"})
+        )
+        .is_err());
+        validate_mcp_server_for_app(
+            &AppType::Codex,
+            "server",
+            &json!({"command":"npx","cwd":"/repo"}),
+        )
+        .expect("Codex supports cwd");
     }
 
     #[test]
@@ -1447,6 +1707,47 @@ mod tests {
     }
 
     #[test]
+    fn removable_json_entries_restore_only_their_native_fields() {
+        let original = br#"{"mcpServers":{"server":{"command":"npx","timeout":30,"trust":true}}}"#;
+        let imported = import_mcp_servers(&AppType::Gemini, Some(original)).unwrap();
+        let snapshot = imported[0]
+            .native_snapshot
+            .as_ref()
+            .expect("Gemini requires a native snapshot");
+        assert!(!format!("{snapshot:?}").contains("timeout"));
+
+        let disabled = project_mcp_server(
+            &AppType::Gemini,
+            Some(original),
+            "server",
+            McpServerProjection::Disable(&imported[0].server),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            serde_json::from_str::<Value>(&disabled).unwrap()["mcpServers"]
+                .get("server")
+                .is_none()
+        );
+
+        let restored = project_mcp_server(
+            &AppType::Gemini,
+            Some(disabled.as_bytes()),
+            "server",
+            McpServerProjection::Restore {
+                server: &json!({"command":"uvx"}),
+                snapshot,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let restored: Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(restored["mcpServers"]["server"]["command"], "uvx");
+        assert_eq!(restored["mcpServers"]["server"]["timeout"], 30);
+        assert_eq!(restored["mcpServers"]["server"]["trust"], true);
+    }
+
+    #[test]
     fn codex_and_grok_preserve_unrelated_toml() {
         let original = b"model = \"keep\"\n[mcp_servers.old]\ncommand = \"old\"\n[mcp_servers.remote]\nurl = \"https://old.example\"\nenabled = false\nfuture = \"keep\"\nfuture_date = 1979-05-27T07:32:00Z\n";
         let imported = import_mcp_servers(&AppType::Codex, Some(original)).unwrap();
@@ -1505,6 +1806,34 @@ mod tests {
                 .server["type"],
             "http"
         );
+
+        let grok_disabled = project_mcp_server(
+            &AppType::GrokBuild,
+            Some(grok.as_bytes()),
+            "remote",
+            McpServerProjection::Disable(&server),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(grok_disabled.contains("disabled_mcp_servers = [\"remote\"]"));
+        let imports = import_mcp_servers(&AppType::GrokBuild, Some(grok_disabled.as_bytes()))
+            .expect("import disabled Grok server");
+        assert!(
+            !imports
+                .iter()
+                .find(|item| item.id == "remote")
+                .unwrap()
+                .enabled
+        );
+        let grok_enabled = project_mcp_server(
+            &AppType::GrokBuild,
+            Some(grok_disabled.as_bytes()),
+            "remote",
+            McpServerProjection::Enable(&server),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!grok_enabled.contains("\"remote\"]"));
     }
 
     #[test]
@@ -1568,6 +1897,28 @@ mod tests {
             .expect_err("unsupported YAML form must not be rewritten");
             assert!(matches!(error, McpConfigError::InvalidDocument { .. }));
         }
+    }
+
+    #[test]
+    fn json5_is_importable_but_rejected_for_lossy_projection() {
+        let original = br#"{
+          // keep this user note
+          mcp: { server: { type: 'local', command: ['npx'], }, },
+        }"#;
+        assert_eq!(
+            import_mcp_servers(&AppType::OpenCode, Some(original))
+                .unwrap()
+                .len(),
+            1
+        );
+        let error = project_mcp_server(
+            &AppType::OpenCode,
+            Some(original),
+            "server",
+            McpServerProjection::Enable(&json!({"command":"uvx"})),
+        )
+        .expect_err("lossy JSON5 rewrite must be rejected");
+        assert!(matches!(error, McpConfigError::InvalidDocument { .. }));
     }
 
     #[test]
