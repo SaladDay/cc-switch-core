@@ -33,23 +33,44 @@ pub enum SkillActivationSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkillAppContract {
     activation_source: SkillActivationSource,
+    catalog_column: Option<&'static str>,
 }
 
 impl SkillAppContract {
-    pub const fn new(activation_source: SkillActivationSource) -> Self {
-        Self { activation_source }
+    /// Declares a catalog-backed application and its stable shared column.
+    pub const fn catalog_flag(column: &'static str) -> Self {
+        Self {
+            activation_source: SkillActivationSource::CatalogFlag,
+            catalog_column: Some(column),
+        }
+    }
+
+    /// Declares an application whose native directory is authoritative.
+    pub const fn native_presence() -> Self {
+        Self {
+            activation_source: SkillActivationSource::NativePresence,
+            catalog_column: None,
+        }
     }
 
     /// Returns the authoritative source for this application's enabled state.
     pub const fn activation_source(self) -> SkillActivationSource {
         self.activation_source
     }
+
+    /// Returns the shared catalog column when activation is catalog-backed.
+    pub const fn catalog_column(self) -> Option<&'static str> {
+        self.catalog_column
+    }
 }
 
-pub const CATALOG_SKILLS: SkillAppContract =
-    SkillAppContract::new(SkillActivationSource::CatalogFlag);
-pub const NATIVE_PRESENCE_SKILLS: SkillAppContract =
-    SkillAppContract::new(SkillActivationSource::NativePresence);
+pub const CLAUDE_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_claude");
+pub const CODEX_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_codex");
+pub const GEMINI_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_gemini");
+pub const GROKBUILD_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_grokbuild");
+pub const OPENCODE_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_opencode");
+pub const HERMES_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_hermes");
+pub const PI_SKILLS: SkillAppContract = SkillAppContract::native_presence();
 
 /// How an installed Skill is materialized in an application's native directory.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,7 +322,8 @@ fn deployment_paths(
     })
 }
 
-fn validate_skill_source(source: &Path) -> Result<(), SkillConfigError> {
+/// Validates that an installed Skill is a real directory with a regular `SKILL.md`.
+pub fn validate_skill_source(source: &Path) -> Result<(), SkillConfigError> {
     match fs::symlink_metadata(source) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
         Ok(_) => {

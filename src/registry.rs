@@ -6,7 +6,10 @@ use crate::{
     mcp::{
         McpAppContract, CLAUDE_MCP, CODEX_MCP, GEMINI_MCP, GROKBUILD_MCP, HERMES_MCP, OPENCODE_MCP,
     },
-    skill::{SkillAppContract, CATALOG_SKILLS, NATIVE_PRESENCE_SKILLS},
+    skill::{
+        SkillAppContract, CLAUDE_SKILLS, CODEX_SKILLS, GEMINI_SKILLS, GROKBUILD_SKILLS,
+        HERMES_SKILLS, OPENCODE_SKILLS, PI_SKILLS,
+    },
     AppType,
 };
 
@@ -231,7 +234,7 @@ static CLAUDE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     &[],
 )
 .with_mcp(&CLAUDE_MCP)
-.with_skills(&CATALOG_SKILLS);
+.with_skills(&CLAUDE_SKILLS);
 
 static CLAUDE_DESKTOP_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::ClaudeDesktop,
@@ -253,7 +256,7 @@ static CODEX_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     &[],
 )
 .with_mcp(&CODEX_MCP)
-.with_skills(&CATALOG_SKILLS);
+.with_skills(&CODEX_SKILLS);
 
 static GEMINI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::Gemini,
@@ -265,7 +268,7 @@ static GEMINI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     &[],
 )
 .with_mcp(&GEMINI_MCP)
-.with_skills(&CATALOG_SKILLS);
+.with_skills(&GEMINI_SKILLS);
 
 static GROKBUILD_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::GrokBuild,
@@ -277,7 +280,7 @@ static GROKBUILD_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     &["grok-build", "grok_build", "grok"],
 )
 .with_mcp(&GROKBUILD_MCP)
-.with_skills(&CATALOG_SKILLS);
+.with_skills(&GROKBUILD_SKILLS);
 
 static OPENCODE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::OpenCode,
@@ -289,7 +292,7 @@ static OPENCODE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     &[],
 )
 .with_mcp(&OPENCODE_MCP)
-.with_skills(&CATALOG_SKILLS);
+.with_skills(&OPENCODE_SKILLS);
 
 static OPENCLAW_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::OpenClaw,
@@ -311,7 +314,7 @@ static HERMES_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     &[],
 )
 .with_mcp(&HERMES_MCP)
-.with_skills(&CATALOG_SKILLS);
+.with_skills(&HERMES_SKILLS);
 
 static PI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::Pi,
@@ -322,7 +325,7 @@ static PI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_PROMPTS_SKILLS,
     &[],
 )
-.with_skills(&NATIVE_PRESENCE_SKILLS);
+.with_skills(&PI_SKILLS);
 
 static BUILTIN_APP_DESCRIPTORS: [&AppDescriptor; 9] = [
     &CLAUDE_DESCRIPTOR,
@@ -427,6 +430,7 @@ mod tests {
 
     #[test]
     fn skill_capabilities_have_one_registry_owned_contract() {
+        let mut columns = HashSet::new();
         for descriptor in builtin_app_registry().descriptors() {
             assert_eq!(
                 descriptor.supports(AppCapability::Skills),
@@ -434,6 +438,18 @@ mod tests {
                 "{}",
                 descriptor.id()
             );
+            if let Some(contract) = descriptor.skill_contract() {
+                assert_eq!(
+                    contract.catalog_column().is_some(),
+                    contract.activation_source() == crate::SkillActivationSource::CatalogFlag,
+                    "{}",
+                    descriptor.id()
+                );
+                if let Some(column) = contract.catalog_column() {
+                    assert!(column.starts_with("enabled_"));
+                    assert!(columns.insert(column), "duplicate Skill column: {column}");
+                }
+            }
         }
         assert_eq!(
             builtin_app_registry()
