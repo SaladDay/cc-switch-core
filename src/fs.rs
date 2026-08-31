@@ -12,6 +12,10 @@ use thiserror::Error;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the common advisory-lock path for live configuration writes.
+///
+/// Hosts should begin their shared-catalog write transaction before taking an
+/// exclusive lock here, then hold the lock through commit or rollback. Keeping
+/// that order consistent avoids cross-product deadlocks and split state.
 pub fn shared_live_config_lock_path(home: &Path) -> PathBuf {
     home.join(".cc-switch/live-config.lock")
 }
