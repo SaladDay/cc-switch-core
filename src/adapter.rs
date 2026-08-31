@@ -37,7 +37,7 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
 
     /// Returns this application's MCP behavior, when supported.
     fn mcp_contract(&self) -> Option<&'static McpAppContract> {
-        crate::mcp_app_contract(self.descriptor().app())
+        self.descriptor().mcp_contract()
     }
 
     /// Extracts valid unified MCP servers from an observed live document.

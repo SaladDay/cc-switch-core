@@ -52,32 +52,32 @@ impl McpAppContract {
     }
 }
 
-const CLAUDE_MCP: McpAppContract = McpAppContract {
+pub(crate) const CLAUDE_MCP: McpAppContract = McpAppContract {
     target: McpConfigTarget::Claude,
     preserves_disabled_entry: false,
     supports_cwd: true,
 };
-const CODEX_MCP: McpAppContract = McpAppContract {
+pub(crate) const CODEX_MCP: McpAppContract = McpAppContract {
     target: McpConfigTarget::Codex,
     preserves_disabled_entry: true,
     supports_cwd: true,
 };
-const GEMINI_MCP: McpAppContract = McpAppContract {
+pub(crate) const GEMINI_MCP: McpAppContract = McpAppContract {
     target: McpConfigTarget::Gemini,
     preserves_disabled_entry: false,
     supports_cwd: true,
 };
-const GROKBUILD_MCP: McpAppContract = McpAppContract {
+pub(crate) const GROKBUILD_MCP: McpAppContract = McpAppContract {
     target: McpConfigTarget::GrokBuild,
     preserves_disabled_entry: true,
     supports_cwd: true,
 };
-const OPENCODE_MCP: McpAppContract = McpAppContract {
+pub(crate) const OPENCODE_MCP: McpAppContract = McpAppContract {
     target: McpConfigTarget::OpenCode,
     preserves_disabled_entry: true,
     supports_cwd: false,
 };
-const HERMES_MCP: McpAppContract = McpAppContract {
+pub(crate) const HERMES_MCP: McpAppContract = McpAppContract {
     target: McpConfigTarget::Hermes,
     preserves_disabled_entry: true,
     supports_cwd: false,
@@ -171,15 +171,7 @@ pub enum McpConfigError {
 
 /// Returns the MCP behavior declared for an application.
 pub fn mcp_app_contract(app: &AppType) -> Option<&'static McpAppContract> {
-    match app {
-        AppType::Claude => Some(&CLAUDE_MCP),
-        AppType::Codex => Some(&CODEX_MCP),
-        AppType::Gemini => Some(&GEMINI_MCP),
-        AppType::GrokBuild => Some(&GROKBUILD_MCP),
-        AppType::OpenCode => Some(&OPENCODE_MCP),
-        AppType::Hermes => Some(&HERMES_MCP),
-        AppType::ClaudeDesktop | AppType::OpenClaw | AppType::Pi => None,
-    }
+    crate::builtin_app_registry().for_app(app).mcp_contract()
 }
 
 /// Returns the live MCP target declared for an application.
