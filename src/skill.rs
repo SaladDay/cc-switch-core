@@ -66,7 +66,7 @@ pub struct SkillAppContract {
 }
 
 impl SkillAppContract {
-    /// Declares a catalog-backed application and its stable shared column.
+    /// Declares an application's stable selection column in the shared catalog.
     pub const fn with_catalog_column(column: &'static str) -> Self {
         Self {
             catalog_column: Some(column),
@@ -88,7 +88,7 @@ impl SkillAppContract {
         self
     }
 
-    /// Returns the shared catalog column when activation is catalog-backed.
+    /// Returns the shared catalog column used to persist the requested selection.
     pub const fn catalog_column(self) -> Option<&'static str> {
         self.catalog_column
     }
@@ -136,6 +136,14 @@ pub enum SkillDeploymentState {
     Missing,
     Linked,
     Copied,
+}
+
+/// How a directly discovered Skill relates to the selected catalog source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillDiscoveryState {
+    Missing,
+    Selected,
+    External,
 }
 
 /// A filesystem failure produced while inspecting or changing a Skill deployment.
@@ -383,6 +391,37 @@ pub fn inspect_skill_presence(
             }
         }
         Err(source) => Err(SkillConfigError::io(destination, source)),
+    }
+}
+
+/// Identifies whether a directly discovered Skill is the selected source.
+pub fn inspect_skill_discovery(
+    source_root: &Path,
+    discovery_root: &Path,
+    directory: &str,
+) -> Result<SkillDiscoveryState, SkillConfigError> {
+    validate_skill_directory(directory)?;
+    for root in [source_root, discovery_root] {
+        if !root.is_absolute() {
+            return Err(SkillConfigError::RelativeRoot {
+                path: root.to_owned(),
+            });
+        }
+    }
+    validate_skill_source(&source_root.join(directory))?;
+    if !inspect_skill_presence(discovery_root, directory)? {
+        return Ok(SkillDiscoveryState::Missing);
+    }
+    if resolve_candidate(source_root)? == resolve_candidate(discovery_root)? {
+        return Ok(SkillDiscoveryState::Selected);
+    }
+    match inspect_skill_deployment(source_root, discovery_root, directory) {
+        Ok(SkillDeploymentState::Missing) => Ok(SkillDiscoveryState::Missing),
+        Ok(SkillDeploymentState::Linked | SkillDeploymentState::Copied) => {
+            Ok(SkillDiscoveryState::Selected)
+        }
+        Err(SkillConfigError::Conflict { .. }) => Ok(SkillDiscoveryState::External),
+        Err(error) => Err(error),
     }
 }
 
@@ -1468,6 +1507,39 @@ mod tests {
             inspect_skill_deployment(&source, &destination, "docs"),
             Err(SkillConfigError::Conflict { .. })
         ));
+    }
+
+    #[test]
+    fn discovery_distinguishes_selected_and_external_skills() {
+        let (_temporary, source, destination) = roots();
+        assert_eq!(
+            inspect_skill_discovery(&source, &destination, "docs").unwrap(),
+            SkillDiscoveryState::Missing
+        );
+
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(
+            inspect_skill_discovery(&source, &destination, "docs").unwrap(),
+            SkillDiscoveryState::Selected
+        );
+
+        fs::write(destination.join("docs/extra"), "external").unwrap();
+        assert_eq!(
+            inspect_skill_discovery(&source, &destination, "docs").unwrap(),
+            SkillDiscoveryState::External
+        );
+    }
+
+    #[test]
+    fn discovery_accepts_the_catalog_as_the_direct_store() {
+        let (_temporary, source, _destination) = roots();
+        assert_eq!(
+            inspect_skill_discovery(&source, &source, "docs").unwrap(),
+            SkillDiscoveryState::Selected
+        );
     }
 
     #[test]

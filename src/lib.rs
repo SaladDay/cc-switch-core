@@ -75,8 +75,9 @@ pub use simple_provider::{
 };
 pub use skill::{
     apply_skill_deployment, inspect_skill_config_enabled, inspect_skill_deployment,
-    inspect_skill_presence, project_skill_config_enabled, skill_directory_key, skill_tree_digest,
-    validate_skill_directory, validate_skill_source, SkillAppContract, SkillConfigError,
-    SkillConfigTarget, SkillDeploymentReceipt, SkillDeploymentState, SkillSyncMethod,
-    UnifiedSkillControl, MAX_SKILL_TREE_BYTES, MAX_SKILL_TREE_ENTRIES,
+    inspect_skill_discovery, inspect_skill_presence, project_skill_config_enabled,
+    skill_directory_key, skill_tree_digest, validate_skill_directory, validate_skill_source,
+    SkillAppContract, SkillConfigError, SkillConfigTarget, SkillDeploymentReceipt,
+    SkillDeploymentState, SkillDiscoveryState, SkillSyncMethod, UnifiedSkillControl,
+    MAX_SKILL_TREE_BYTES, MAX_SKILL_TREE_ENTRIES,
 };
