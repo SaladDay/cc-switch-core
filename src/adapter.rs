@@ -5,7 +5,8 @@ use std::fmt;
 use crate::{
     builtin_app_registry, native_import, projection, AppDescriptor, AppType, LiveDocumentSet,
     LogicalTarget, NativeAction, NativeImportError, NativeImportStep, NativePlanError,
-    NativePlanRequest, OperationPlan, OperationPlanError, ProviderSnapshot,
+    NativePlanRequest, OperationPlan, OperationPlanError, ProviderSnapshot, SimpleProviderError,
+    SimpleProviderFormDescriptor, SimpleProviderValues,
 };
 
 mod sealed {
@@ -22,6 +23,34 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
 
     /// Returns every logical native document this adapter may manage.
     fn targets(&self) -> &'static [LogicalTarget];
+
+    /// Returns the product-neutral simple provider form for this application.
+    fn simple_provider_form(&self) -> &'static SimpleProviderFormDescriptor {
+        crate::simple_provider_form(self.descriptor().app())
+    }
+
+    /// Extracts the small, shared provider field set from native settings.
+    fn extract_simple_provider_values(
+        &self,
+        settings: &serde_json::Value,
+    ) -> Result<SimpleProviderValues, SimpleProviderError> {
+        crate::extract_simple_provider_values(self.descriptor().app(), settings)
+    }
+
+    /// Projects the small, shared provider field set into native settings.
+    fn project_simple_provider_settings(
+        &self,
+        provider_name: &str,
+        values: &SimpleProviderValues,
+        existing: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, SimpleProviderError> {
+        crate::project_simple_provider_settings(
+            self.descriptor().app(),
+            provider_name,
+            values,
+            existing,
+        )
+    }
 
     /// Returns the targets a host must observe for this native action.
     fn required_native_targets(

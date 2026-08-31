@@ -30,6 +30,7 @@ pub mod pi;
 mod projection;
 mod provider;
 mod registry;
+mod simple_provider;
 
 pub use adapter::{builtin_app_adapter, builtin_app_adapters, AppAdapter};
 pub use app_type::{AppType, ParseAppTypeError};
@@ -56,4 +57,10 @@ pub use provider::{ProviderEntry, ProviderSnapshot};
 pub use registry::{
     builtin_app_registry, AppCapability, AppDescriptor, BuiltinAppRegistry,
     ProviderConfigurationMode,
+};
+pub use simple_provider::{
+    builtin_simple_provider_forms, extract_simple_provider_values,
+    project_simple_provider_settings, simple_provider_form, SimpleProviderError,
+    SimpleProviderField, SimpleProviderFieldDescriptor, SimpleProviderFormDescriptor,
+    SimpleProviderPreset, SimpleProviderProtocol, SimpleProviderValues,
 };
