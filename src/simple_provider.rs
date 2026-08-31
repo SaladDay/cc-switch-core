@@ -601,6 +601,18 @@ fn set_optional_string(root: &mut Map<String, Value>, key: &str, value: &str) {
     }
 }
 
+fn set_anthropic_credential(env: &mut Map<String, Value>, api_key: &str) {
+    let uses_api_key =
+        env.contains_key("ANTHROPIC_API_KEY") && !env.contains_key("ANTHROPIC_AUTH_TOKEN");
+    let (credential_key, obsolete_key) = if uses_api_key {
+        ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+    } else {
+        ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+    };
+    env.insert(credential_key.to_owned(), Value::String(api_key.to_owned()));
+    env.remove(obsolete_key);
+}
+
 fn extract_claude_like(
     app: &AppType,
     root: &Map<String, Value>,
@@ -632,11 +644,7 @@ fn project_claude(
     values: &SimpleProviderValues,
 ) -> Result<(), SimpleProviderError> {
     let env = object_field_mut(&AppType::Claude, root, "env")?;
-    env.insert(
-        "ANTHROPIC_AUTH_TOKEN".to_owned(),
-        Value::String(values.api_key.clone()),
-    );
-    env.remove("ANTHROPIC_API_KEY");
+    set_anthropic_credential(env, &values.api_key);
     set_optional_string(env, "ANTHROPIC_BASE_URL", &values.base_url);
     set_optional_string(env, "ANTHROPIC_MODEL", &values.model);
     for key in [
@@ -1651,9 +1659,45 @@ future = "keep"
 
         assert!(projected.get("apiFormat").is_none());
         assert!(projected.get("openrouterCompatMode").is_none());
-        assert_eq!(projected["env"]["ANTHROPIC_AUTH_TOKEN"], "secret");
-        assert!(projected["env"].get("ANTHROPIC_API_KEY").is_none());
+        assert_eq!(projected["env"]["ANTHROPIC_API_KEY"], "secret");
+        assert!(projected["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
         assert_eq!(projected["env"]["future"], "keep");
+    }
+
+    #[test]
+    fn claude_projection_preserves_existing_credential_field() {
+        let values = sample_values(&AppType::Claude);
+        let projected = project_simple_provider_settings(
+            &AppType::Claude,
+            "Example",
+            &values,
+            Some(&json!({"env": {"ANTHROPIC_API_KEY": "old"}})),
+        )
+        .unwrap();
+        assert_eq!(projected["env"]["ANTHROPIC_API_KEY"], values.api_key);
+        assert!(projected["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
+
+        let created =
+            project_simple_provider_settings(&AppType::Claude, "Example", &values, None).unwrap();
+        assert_eq!(created["env"]["ANTHROPIC_AUTH_TOKEN"], values.api_key);
+        assert!(created["env"].get("ANTHROPIC_API_KEY").is_none());
+    }
+
+    #[test]
+    fn claude_desktop_projection_keeps_its_required_auth_token() {
+        let values = sample_values(&AppType::ClaudeDesktop);
+        let projected = project_simple_provider_settings(
+            &AppType::ClaudeDesktop,
+            "Example",
+            &values,
+            Some(&json!({"env": {"ANTHROPIC_API_KEY": "old"}})),
+        )
+        .unwrap();
+
+        assert_eq!(projected["env"]["ANTHROPIC_AUTH_TOKEN"], values.api_key);
+        assert!(projected["env"].get("ANTHROPIC_API_KEY").is_none());
+        claude_desktop::prepare_live_action(&projected, claude_desktop::ProviderMode::Direct, None)
+            .expect("projected Claude Desktop settings");
     }
 
     #[test]
