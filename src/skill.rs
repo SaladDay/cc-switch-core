@@ -844,7 +844,9 @@ fn remove_deployment(path: &Path) -> Result<(), SkillConfigError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(source) => return Err(SkillConfigError::io(path, source)),
     };
-    if metadata.file_type().is_symlink() || metadata.file_type().is_file() {
+    if metadata.file_type().is_symlink() {
+        remove_directory_symlink(path)
+    } else if metadata.file_type().is_file() {
         fs::remove_file(path).map_err(|source| SkillConfigError::io(path, source))
     } else if metadata.file_type().is_dir() {
         remove_directory(path)
@@ -853,6 +855,16 @@ fn remove_deployment(path: &Path) -> Result<(), SkillConfigError> {
             path: path.to_owned(),
         })
     }
+}
+
+#[cfg(unix)]
+fn remove_directory_symlink(path: &Path) -> Result<(), SkillConfigError> {
+    fs::remove_file(path).map_err(|source| SkillConfigError::io(path, source))
+}
+
+#[cfg(windows)]
+fn remove_directory_symlink(path: &Path) -> Result<(), SkillConfigError> {
+    fs::remove_dir(path).map_err(|source| SkillConfigError::io(path, source))
 }
 
 fn remove_directory(path: &Path) -> Result<(), SkillConfigError> {
