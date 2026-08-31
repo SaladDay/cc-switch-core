@@ -12,6 +12,8 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike};
 
 use crate::{AppType, MAX_OPERATION_CONTENT_BYTES};
 
+mod json_patch;
+
 const MAX_MCP_ID_BYTES: usize = 128;
 const MANAGED_SERVER_FIELDS: &[&str] = &["type", "command", "args", "env", "cwd", "url", "headers"];
 
@@ -640,9 +642,20 @@ fn project_json_section(
         }
     }
 
-    pretty_json(root)
-        .map(Some)
-        .map_err(|message| invalid_document(app, &message))
+    if let Some(original) = contents {
+        let original =
+            std::str::from_utf8(original).map_err(|_| invalid_document(app, "not UTF-8"))?;
+        let section_value = root
+            .get(section)
+            .expect("a changed JSON document contains its MCP section");
+        json_patch::replace_top_level_value(original, section, section_value)
+            .map(Some)
+            .map_err(|message| invalid_document(app, &message))
+    } else {
+        pretty_json(root)
+            .map(Some)
+            .map_err(|message| invalid_document(app, &message))
+    }
 }
 
 fn ensure_lossless_json_projection(
