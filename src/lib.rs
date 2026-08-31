@@ -72,8 +72,8 @@ pub use simple_provider::{
     SimpleProviderPreset, SimpleProviderProtocol, SimpleProviderValues,
 };
 pub use skill::{
-    apply_skill_deployment, inspect_skill_deployment, skill_tree_digest, validate_skill_directory,
-    validate_skill_source, SkillActivationSource, SkillAppContract, SkillConfigError,
-    SkillDeploymentReceipt, SkillDeploymentState, SkillSyncMethod, MAX_SKILL_TREE_BYTES,
-    MAX_SKILL_TREE_ENTRIES,
+    apply_skill_deployment, inspect_skill_deployment, inspect_skill_presence, skill_directory_key,
+    skill_tree_digest, validate_skill_directory, validate_skill_source, SkillActivationSource,
+    SkillAppContract, SkillConfigError, SkillDeploymentReceipt, SkillDeploymentState,
+    SkillSyncMethod, MAX_SKILL_TREE_BYTES, MAX_SKILL_TREE_ENTRIES,
 };

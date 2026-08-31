@@ -459,6 +459,11 @@ mod tests {
                 .activation_source(),
             crate::SkillActivationSource::NativePresence
         );
+        assert!(builtin_app_registry()
+            .for_app(&AppType::Pi)
+            .skill_contract()
+            .unwrap()
+            .discovers_unified_store());
     }
 
     #[test]

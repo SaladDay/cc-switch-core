@@ -1,7 +1,7 @@
 //! Shared contracts and guarded filesystem materialization for installed Skills.
 
 use std::{
-    fs::{self, File},
+    fs::{self, DirEntry, File},
     io::Read,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -11,6 +11,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
 /// Maximum number of entries accepted in one installed Skill tree.
 pub const MAX_SKILL_TREE_ENTRIES: usize = 10_000;
@@ -34,6 +35,7 @@ pub enum SkillActivationSource {
 pub struct SkillAppContract {
     activation_source: SkillActivationSource,
     catalog_column: Option<&'static str>,
+    discovers_unified_store: bool,
 }
 
 impl SkillAppContract {
@@ -42,6 +44,7 @@ impl SkillAppContract {
         Self {
             activation_source: SkillActivationSource::CatalogFlag,
             catalog_column: Some(column),
+            discovers_unified_store: false,
         }
     }
 
@@ -50,7 +53,14 @@ impl SkillAppContract {
         Self {
             activation_source: SkillActivationSource::NativePresence,
             catalog_column: None,
+            discovers_unified_store: false,
         }
+    }
+
+    /// Declares that the application discovers `~/.agents/skills` directly.
+    pub const fn with_unified_store_discovery(mut self) -> Self {
+        self.discovers_unified_store = true;
+        self
     }
 
     /// Returns the authoritative source for this application's enabled state.
@@ -62,6 +72,11 @@ impl SkillAppContract {
     pub const fn catalog_column(self) -> Option<&'static str> {
         self.catalog_column
     }
+
+    /// Returns whether the application discovers the unified Skill store directly.
+    pub const fn discovers_unified_store(self) -> bool {
+        self.discovers_unified_store
+    }
 }
 
 pub const CLAUDE_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_claude");
@@ -70,7 +85,8 @@ pub const GEMINI_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enab
 pub const GROKBUILD_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_grokbuild");
 pub const OPENCODE_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_opencode");
 pub const HERMES_SKILLS: SkillAppContract = SkillAppContract::catalog_flag("enabled_hermes");
-pub const PI_SKILLS: SkillAppContract = SkillAppContract::native_presence();
+pub const PI_SKILLS: SkillAppContract =
+    SkillAppContract::native_presence().with_unified_store_discovery();
 
 /// How an installed Skill is materialized in an application's native directory.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +252,11 @@ pub fn validate_skill_directory(directory: &str) -> Result<(), SkillConfigError>
         || directory.starts_with('.')
         || directory.contains('/')
         || directory.contains('\\')
+        || directory.ends_with('.')
+        || directory
+            .chars()
+            .any(|character| character.is_ascii_control() || "<>:\"|?*".contains(character))
+        || is_windows_reserved_name(directory)
     {
         return Err(SkillConfigError::InvalidDirectory {
             directory: directory.to_owned(),
@@ -253,6 +274,22 @@ pub fn validate_skill_directory(directory: &str) -> Result<(), SkillConfigError>
     Ok(())
 }
 
+/// Returns a stable, conservative key for detecting cross-platform directory aliases.
+pub fn skill_directory_key(directory: &str) -> Result<String, SkillConfigError> {
+    validate_skill_directory(directory)?;
+    Ok(directory.nfc().flat_map(char::to_lowercase).nfc().collect())
+}
+
+fn is_windows_reserved_name(directory: &str) -> bool {
+    let stem = directory.split('.').next().unwrap_or(directory);
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
+}
+
 /// Computes a deterministic digest of every regular file and directory in a Skill.
 pub fn skill_tree_digest(path: &Path) -> Result<String, SkillConfigError> {
     validate_skill_source(path)?;
@@ -267,6 +304,32 @@ pub fn inspect_skill_deployment(
 ) -> Result<SkillDeploymentState, SkillConfigError> {
     let paths = deployment_paths(source_root, destination_root, directory)?;
     inspect_paths(&paths.source, &paths.destination).map(|(state, _)| state)
+}
+
+/// Returns whether a native Skill directory is present, without claiming ownership of it.
+pub fn inspect_skill_presence(
+    destination_root: &Path,
+    directory: &str,
+) -> Result<bool, SkillConfigError> {
+    validate_skill_directory(directory)?;
+    if !destination_root.is_absolute() {
+        return Err(SkillConfigError::RelativeRoot {
+            path: destination_root.to_owned(),
+        });
+    }
+    let destination = destination_root.join(directory);
+    match fs::metadata(&destination) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(SkillConfigError::Conflict { path: destination }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(&destination) {
+                Ok(_) => Err(SkillConfigError::Conflict { path: destination }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(source) => Err(SkillConfigError::io(destination, source)),
+            }
+        }
+        Err(source) => Err(SkillConfigError::io(destination, source)),
+    }
 }
 
 /// Applies an enable or disable operation and returns a reversible receipt.
@@ -656,6 +719,7 @@ fn tree_digest(root: &Path) -> Result<String, SkillConfigError> {
     }
     let mut budget = TreeBudget::default();
     let mut hasher = Sha256::new();
+    hasher.update(b"cc-switch-skill-tree-v1\0");
     hash_directory(root, root, &mut budget, &mut hasher)?;
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -694,14 +758,9 @@ fn hash_directory(
     budget: &mut TreeBudget,
     hasher: &mut Sha256,
 ) -> Result<(), SkillConfigError> {
-    let mut entries = fs::read_dir(directory)
-        .map_err(|source| SkillConfigError::io(directory, source))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| SkillConfigError::io(directory, source))?;
-    entries.sort_by_key(|entry| entry.file_name());
+    let entries = read_directory_entries(directory, budget)?;
 
     for entry in entries {
-        budget.add_entry()?;
         let path = entry.path();
         let relative = path
             .strip_prefix(root)
@@ -736,6 +795,7 @@ fn hash_file(
     hasher: &mut Sha256,
 ) -> Result<(), SkillConfigError> {
     let mut file = File::open(path).map_err(|source| SkillConfigError::io(path, source))?;
+    hasher.update(before.len().to_le_bytes());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -775,13 +835,8 @@ fn copy_tree(
 ) -> Result<(), SkillConfigError> {
     fs::create_dir(destination)
         .map_err(|source_error| SkillConfigError::io(destination, source_error))?;
-    let mut entries = fs::read_dir(source)
-        .map_err(|source_error| SkillConfigError::io(source, source_error))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source_error| SkillConfigError::io(source, source_error))?;
-    entries.sort_by_key(|entry| entry.file_name());
+    let entries = read_directory_entries(source, budget)?;
     for entry in entries {
-        budget.add_entry()?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
         let metadata = fs::symlink_metadata(&source_path)
@@ -800,6 +855,21 @@ fn copy_tree(
         }
     }
     Ok(())
+}
+
+fn read_directory_entries(
+    directory: &Path,
+    budget: &mut TreeBudget,
+) -> Result<Vec<DirEntry>, SkillConfigError> {
+    let reader =
+        fs::read_dir(directory).map_err(|source| SkillConfigError::io(directory, source))?;
+    let mut entries = Vec::new();
+    for entry in reader {
+        budget.add_entry()?;
+        entries.push(entry.map_err(|source| SkillConfigError::io(directory, source))?);
+    }
+    entries.sort_by_key(DirEntry::file_name);
+    Ok(entries)
 }
 
 fn create_temporary_directory(parent: &Path) -> Result<PathBuf, SkillConfigError> {
@@ -889,9 +959,84 @@ mod tests {
     #[test]
     fn directory_names_are_single_normalized_components() {
         validate_skill_directory("docs").unwrap();
-        for invalid in ["", " docs", "docs ", ".docs", "../docs", "a/b", "a\\b"] {
+        for invalid in [
+            "", " docs", "docs ", ".docs", "../docs", "a/b", "a\\b", "docs.", "CON", "nul.txt",
+            "a:b",
+        ] {
             assert!(validate_skill_directory(invalid).is_err(), "{invalid:?}");
         }
+        assert_eq!(
+            skill_directory_key("É").unwrap(),
+            skill_directory_key("e\u{301}").unwrap()
+        );
+    }
+
+    #[test]
+    fn presence_is_independent_from_copy_ownership() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(destination.join("docs")).unwrap();
+        fs::write(destination.join("docs/SKILL.md"), "different").unwrap();
+
+        assert!(inspect_skill_presence(&destination, "docs").unwrap());
+        assert!(matches!(
+            inspect_skill_deployment(&source, &destination, "docs"),
+            Err(SkillConfigError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn directory_budget_is_enforced_while_entries_are_collected() {
+        let temporary = tempdir().unwrap();
+        fs::write(temporary.path().join("a"), "a").unwrap();
+        fs::write(temporary.path().join("b"), "b").unwrap();
+        let mut budget = TreeBudget {
+            entries: MAX_SKILL_TREE_ENTRIES - 1,
+            bytes: 0,
+        };
+
+        assert!(matches!(
+            read_directory_entries(temporary.path(), &mut budget),
+            Err(SkillConfigError::EntryLimit {
+                limit: MAX_SKILL_TREE_ENTRIES
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_digest_frames_file_contents_unambiguously() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        for root in [&source, &destination] {
+            fs::write(root.join("SKILL.md"), "manifest").unwrap();
+        }
+        fs::write(destination.join("a"), b"x").unwrap();
+        fs::write(destination.join("b"), b"y").unwrap();
+
+        let mode = fs::metadata(destination.join("b"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let mut ambiguous = b"x\0f\0b\0".to_vec();
+        ambiguous.extend_from_slice(&mode.to_le_bytes());
+        ambiguous.extend_from_slice(b"y");
+        fs::write(source.join("a"), ambiguous).unwrap();
+        fs::set_permissions(
+            source.join("a"),
+            fs::metadata(destination.join("a")).unwrap().permissions(),
+        )
+        .unwrap();
+
+        assert_ne!(
+            tree_digest(&source).unwrap(),
+            tree_digest(&destination).unwrap()
+        );
     }
 
     #[test]
