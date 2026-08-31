@@ -141,7 +141,9 @@ pub fn import_mcp_servers(
     app: &AppType,
     contents: Option<&[u8]>,
 ) -> Result<Vec<McpImport>, McpConfigError> {
-    let mut imports = match require_target(app)? {
+    let target = require_target(app)?;
+    validate_document_size(app, contents)?;
+    let mut imports = match target {
         McpConfigTarget::Claude => {
             import_json_section(app, contents, "mcpServers", JsonFlavor::Claude)?
         }
@@ -173,7 +175,9 @@ pub fn project_mcp_server(
     if let Some(server) = server {
         validate_mcp_server(id, server)?;
     }
-    let projected = match require_target(app)? {
+    let target = require_target(app)?;
+    validate_document_size(app, contents)?;
+    let projected = match target {
         McpConfigTarget::Claude => {
             project_json_section(app, contents, "mcpServers", id, server, JsonFlavor::Claude)
         }
@@ -203,6 +207,17 @@ fn require_target(app: &AppType) -> Result<McpConfigTarget, McpConfigError> {
     mcp_config_target(app).ok_or_else(|| McpConfigError::UnsupportedApp {
         app_id: app.as_str().to_owned(),
     })
+}
+
+fn validate_document_size(app: &AppType, contents: Option<&[u8]>) -> Result<(), McpConfigError> {
+    if contents.is_some_and(|contents| contents.len() > MAX_OPERATION_CONTENT_BYTES) {
+        Err(invalid_document(
+            app,
+            &format!("document exceeds {MAX_OPERATION_CONTENT_BYTES} bytes"),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_id(id: &str) -> Result<(), McpConfigError> {
@@ -685,7 +700,7 @@ fn project_toml_section(
             .get("mcp_servers")
             .and_then(Item::as_table_like)
             .and_then(|entries| entries.get(id))
-            .and_then(|item| item_to_json(item).ok())
+            .cloned()
             .or_else(|| {
                 (!grok)
                     .then(|| {
@@ -695,7 +710,7 @@ fn project_toml_section(
                             .and_then(|table| table.get("servers"))
                             .and_then(Item::as_table_like)
                             .and_then(|entries| entries.get(id))
-                            .and_then(|item| item_to_json(item).ok())
+                            .cloned()
                     })
                     .flatten()
             });
@@ -710,10 +725,7 @@ fn project_toml_section(
             .get_mut("mcp_servers")
             .and_then(Item::as_table_like_mut)
             .expect("MCP table initialized")
-            .insert(
-                id,
-                Item::Table(unified_to_toml_server(server, grok, existing.as_ref())?),
-            );
+            .insert(id, unified_to_toml_server(server, grok, existing)?);
         changed = true;
     } else if let Some(entries) = document.get_mut("mcp_servers") {
         changed |= entries
@@ -740,27 +752,33 @@ fn project_toml_section(
 fn unified_to_toml_server(
     server: &Value,
     grok: bool,
-    existing: Option<&Value>,
-) -> Result<Table, McpConfigError> {
+    existing: Option<Item>,
+) -> Result<Item, McpConfigError> {
     let source = server.as_object().expect("validated server object");
-    let mut merged = existing
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    clear_fields(
-        &mut merged,
-        &[
-            "type",
-            "command",
-            "args",
-            "env",
-            "cwd",
-            "url",
-            "headers",
-            "http_headers",
-        ],
-    );
-    merge_server_extensions(&mut merged, source, &["http_headers"]);
+    let mut output = existing.unwrap_or_else(|| Item::Table(Table::new()));
+    let table = output.as_table_like_mut().ok_or_else(|| {
+        McpConfigError::InvalidServer("existing TOML MCP entry must be a table".to_owned())
+    })?;
+    for key in [
+        "type",
+        "command",
+        "args",
+        "env",
+        "cwd",
+        "url",
+        "headers",
+        "http_headers",
+    ] {
+        table.remove(key);
+    }
+    for (key, value) in source {
+        if !MANAGED_SERVER_FIELDS.contains(&key.as_str())
+            && key != "http_headers"
+            && table.get(key).is_none()
+        {
+            table.insert(key, json_to_toml_item(value)?);
+        }
+    }
     for (key, value) in source {
         if !MANAGED_SERVER_FIELDS.contains(&key.as_str()) || grok && key == "type" {
             continue;
@@ -770,12 +788,7 @@ fn unified_to_toml_server(
         } else {
             key
         };
-        merged.insert(target_key.to_owned(), value.clone());
-    }
-
-    let mut output = Table::new();
-    for (key, value) in &merged {
-        output.insert(key, json_to_toml_item(value)?);
+        table.insert(target_key, json_to_toml_item(value)?);
     }
     Ok(output)
 }
@@ -1251,7 +1264,7 @@ mod tests {
 
     #[test]
     fn codex_and_grok_preserve_unrelated_toml() {
-        let original = b"model = \"keep\"\n[mcp_servers.old]\ncommand = \"old\"\n[mcp_servers.remote]\nurl = \"https://old.example\"\nfuture = \"keep\"\n";
+        let original = b"model = \"keep\"\n[mcp_servers.old]\ncommand = \"old\"\n[mcp_servers.remote]\nurl = \"https://old.example\"\nfuture = \"keep\"\nfuture_date = 1979-05-27T07:32:00Z\n";
         let server = json!({
             "type":"http", "url":"https://example.com/mcp",
             "headers":{"Authorization":"secret"}, "timeout":30
@@ -1263,6 +1276,8 @@ mod tests {
         assert!(codex.contains("[mcp_servers.old]"));
         assert!(codex.contains("http_headers"));
         assert!(codex.contains("future = \"keep\""));
+        assert!(codex.contains("future_date = 1979-05-27T07:32:00Z"));
+        assert!(!codex.contains("future_date = \"1979-05-27T07:32:00Z\""));
 
         let grok = project_mcp_server(&AppType::GrokBuild, Some(original), "remote", Some(&server))
             .unwrap()
@@ -1340,6 +1355,26 @@ mod tests {
         )
         .expect_err("oversized projected document");
         assert!(matches!(error, McpConfigError::InvalidDocument { .. }));
+    }
+
+    #[test]
+    fn public_entries_reject_oversized_input_before_parsing() {
+        let oversized = vec![b' '; MAX_OPERATION_CONTENT_BYTES + 1];
+        for result in [
+            import_mcp_servers(&AppType::Claude, Some(&oversized)).map(|_| ()),
+            project_mcp_server(
+                &AppType::Claude,
+                Some(&oversized),
+                "server",
+                Some(&json!({"command":"npx"})),
+            )
+            .map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(McpConfigError::InvalidDocument { .. })
+            ));
+        }
     }
 
     #[test]
