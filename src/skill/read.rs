@@ -25,6 +25,8 @@ const MAX_SKILL_TREE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SKILL_TREE_DEPTH: usize = 64;
 const MAX_SKILL_CATALOG_ENTRIES: usize = 10_000;
 const MAX_SKILL_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_SKILL_SNAPSHOT_ENTRIES: usize = 100_000;
+const MAX_SKILL_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_HERMES_PLATFORM_BYTES: usize = 128;
 
 /// Host-resolved runtime inputs for one application.
@@ -445,9 +447,10 @@ pub fn inspect_installed_skills(
     validate_distinct_roots(&runtime.source_root, &runtime.unified_root, &runtime.apps)?;
     validate_catalog_identity(catalog)?;
     let apps = runtime.apps().map(PreparedApp::new).collect::<Vec<_>>();
+    let mut budget = SnapshotBudget::default();
     Ok(catalog
         .iter()
-        .map(|entry| inspect_entry(entry, runtime, &apps))
+        .map(|entry| inspect_entry(entry, runtime, &apps, &mut budget))
         .collect())
 }
 
@@ -498,9 +501,10 @@ fn inspect_entry(
     entry: &SkillCatalogEntry,
     runtime: &SkillRuntime,
     apps: &[PreparedApp<'_>],
+    budget: &mut SnapshotBudget,
 ) -> InstalledSkillSnapshot {
     let source_path = runtime.source_root.join(entry.directory());
-    let source = inspect_source(&source_path);
+    let source = inspect_source(&source_path, budget);
     let apps = match source {
         SourceObservation::Ready(mut source) => {
             let reads_unified = apps.iter().any(|app| {
@@ -518,12 +522,13 @@ fn inspect_entry(
                     entry.directory(),
                     false,
                     true,
+                    budget,
                 )
             } else {
                 PathRelation::Missing
             };
             apps.iter()
-                .map(|app| inspect_app(entry, app, &mut source, &unified))
+                .map(|app| inspect_app(entry, app, &mut source, &unified, budget))
                 .collect()
         }
         SourceObservation::Missing => apps
@@ -578,6 +583,7 @@ fn inspect_app(
     prepared: &PreparedApp<'_>,
     source: &mut ReadySource,
     unified: &PathRelation,
+    budget: &mut SnapshotBudget,
 ) -> SkillAppState {
     let runtime = prepared.runtime;
     let descriptor = builtin_app_registry().for_app(&runtime.app);
@@ -592,6 +598,7 @@ fn inspect_app(
         entry.directory(),
         allow_matching_copy,
         false,
+        budget,
     );
     let selected = match contract.selection_store() {
         SkillSelectionStore::CatalogColumn(_) => catalog_selected,
@@ -681,7 +688,7 @@ struct ReadySource {
     digest: Option<[u8; 32]>,
 }
 
-fn inspect_source(path: &Path) -> SourceObservation {
+fn inspect_source(path: &Path, budget: &mut SnapshotBudget) -> SourceObservation {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -703,11 +710,19 @@ fn inspect_source(path: &Path) -> SourceObservation {
         }
         Err(_) => return SourceObservation::Unreadable,
     };
+    if budget.charge_entries(2).is_err() {
+        return SourceObservation::Unreadable;
+    }
     if manifest_metadata.len() > MAX_SKILL_MANIFEST_BYTES {
         return SourceObservation::Invalid;
     }
+    if manifest_metadata.len() > budget.remaining_bytes() {
+        budget.exhaust_bytes();
+        return SourceObservation::Unreadable;
+    }
+    let read_limit = MAX_SKILL_MANIFEST_BYTES.min(budget.remaining_bytes());
     let mut manifest = match File::open(&manifest_path) {
-        Ok(file) => file.take(MAX_SKILL_MANIFEST_BYTES + 1),
+        Ok(file) => file.take(read_limit.saturating_add(1)),
         Err(_) => return SourceObservation::Unreadable,
     };
     let mut contents = Vec::with_capacity(
@@ -716,9 +731,14 @@ fn inspect_source(path: &Path) -> SourceObservation {
             .min(MAX_SKILL_MANIFEST_BYTES as usize),
     );
     if manifest.read_to_end(&mut contents).is_err() {
+        let _ = budget.charge_bytes(contents.len() as u64);
         return SourceObservation::Unreadable;
     }
-    if contents.len() as u64 > MAX_SKILL_MANIFEST_BYTES || std::str::from_utf8(&contents).is_err() {
+    let content_bytes = contents.len() as u64;
+    if budget.charge_bytes(content_bytes).is_err() {
+        return SourceObservation::Unreadable;
+    }
+    if content_bytes > MAX_SKILL_MANIFEST_BYTES || std::str::from_utf8(&contents).is_err() {
         return SourceObservation::Invalid;
     }
     match fs::canonicalize(path) {
@@ -774,6 +794,7 @@ fn inspect_relation(
     directory: &str,
     allow_matching_copy: bool,
     allow_direct_source: bool,
+    budget: &mut SnapshotBudget,
 ) -> PathRelation {
     let destination = root.join(directory);
     let metadata = match fs::symlink_metadata(&destination) {
@@ -807,7 +828,7 @@ fn inspect_relation(
     if allow_matching_copy {
         let source_digest = match source.digest {
             Some(digest) => digest,
-            None => match tree_digest(&source.path) {
+            None => match tree_digest(&source.path, budget) {
                 Ok(digest) => {
                     source.digest = Some(digest);
                     digest
@@ -815,7 +836,7 @@ fn inspect_relation(
                 Err(_) => return PathRelation::Unreadable,
             },
         };
-        match tree_digest(&destination) {
+        match tree_digest(&destination, budget) {
             Ok(destination_digest) if destination_digest == source_digest => {
                 return PathRelation::Selected
             }
@@ -846,11 +867,53 @@ struct TreeBudget {
     bytes: u64,
 }
 
-fn tree_digest(root: &Path) -> Result<[u8; 32], ()> {
-    let mut budget = TreeBudget::default();
+#[derive(Default)]
+struct SnapshotBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+impl SnapshotBudget {
+    fn charge_entries(&mut self, count: usize) -> Result<(), ()> {
+        let Some(next) = self.entries.checked_add(count) else {
+            self.entries = MAX_SKILL_SNAPSHOT_ENTRIES;
+            return Err(());
+        };
+        if next > MAX_SKILL_SNAPSHOT_ENTRIES {
+            self.entries = MAX_SKILL_SNAPSHOT_ENTRIES;
+            return Err(());
+        }
+        self.entries = next;
+        Ok(())
+    }
+
+    fn charge_bytes(&mut self, count: u64) -> Result<(), ()> {
+        let Some(next) = self.bytes.checked_add(count) else {
+            self.exhaust_bytes();
+            return Err(());
+        };
+        if next > MAX_SKILL_SNAPSHOT_BYTES {
+            self.exhaust_bytes();
+            return Err(());
+        }
+        self.bytes = next;
+        Ok(())
+    }
+
+    fn remaining_bytes(&self) -> u64 {
+        MAX_SKILL_SNAPSHOT_BYTES.saturating_sub(self.bytes)
+    }
+
+    fn exhaust_bytes(&mut self) {
+        self.bytes = MAX_SKILL_SNAPSHOT_BYTES;
+    }
+}
+
+fn tree_digest(root: &Path, snapshot: &mut SnapshotBudget) -> Result<[u8; 32], ()> {
+    let mut tree = TreeBudget::default();
     let mut hasher = Sha256::new();
     hasher.update(b"cc-switch-skill-read-v1\0");
-    hash_directory(root, root, 0, &mut budget, &mut hasher)?;
+    hash_directory(root, root, 0, &mut tree, snapshot, &mut hasher)?;
     Ok(hasher.finalize().into())
 }
 
@@ -858,13 +921,14 @@ fn hash_directory(
     root: &Path,
     directory: &Path,
     depth: usize,
-    budget: &mut TreeBudget,
+    tree: &mut TreeBudget,
+    snapshot: &mut SnapshotBudget,
     hasher: &mut Sha256,
 ) -> Result<(), ()> {
     if depth > MAX_SKILL_TREE_DEPTH {
         return Err(());
     }
-    let mut entries = read_directory_entries(directory, budget)?;
+    let mut entries = read_directory_entries(directory, tree, snapshot)?;
     entries.sort_by_key(DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
@@ -875,12 +939,12 @@ fn hash_directory(
             hasher.update(b"d\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
-            hash_directory(root, &path, depth.saturating_add(1), budget, hasher)?;
+            hash_directory(root, &path, depth.saturating_add(1), tree, snapshot, hasher)?;
         } else if metadata.file_type().is_file() {
             hasher.update(b"f\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
-            hash_file(&path, &metadata, budget, hasher)?;
+            hash_file(&path, &metadata, tree, snapshot, hasher)?;
         } else {
             return Err(());
         }
@@ -888,11 +952,15 @@ fn hash_directory(
     Ok(())
 }
 
-fn read_directory_entries(directory: &Path, budget: &mut TreeBudget) -> Result<Vec<DirEntry>, ()> {
+fn read_directory_entries(
+    directory: &Path,
+    tree: &mut TreeBudget,
+    snapshot: &mut SnapshotBudget,
+) -> Result<Vec<DirEntry>, ()> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(directory).map_err(|_| ())? {
-        budget.entries = budget.entries.saturating_add(1);
-        if budget.entries > MAX_SKILL_TREE_ENTRIES {
+        tree.entries = tree.entries.saturating_add(1);
+        if tree.entries > MAX_SKILL_TREE_ENTRIES || snapshot.charge_entries(1).is_err() {
             return Err(());
         }
         entries.push(entry.map_err(|_| ())?);
@@ -903,7 +971,8 @@ fn read_directory_entries(directory: &Path, budget: &mut TreeBudget) -> Result<V
 fn hash_file(
     path: &Path,
     before: &fs::Metadata,
-    budget: &mut TreeBudget,
+    tree: &mut TreeBudget,
+    snapshot: &mut SnapshotBudget,
     hasher: &mut Sha256,
 ) -> Result<(), ()> {
     let mut file = File::open(path).map_err(|_| ())?;
@@ -916,8 +985,8 @@ fn hash_file(
             break;
         }
         let count_u64 = u64::try_from(count).map_err(|_| ())?;
-        budget.bytes = budget.bytes.saturating_add(count_u64);
-        if budget.bytes > MAX_SKILL_TREE_BYTES {
+        tree.bytes = tree.bytes.saturating_add(count_u64);
+        if tree.bytes > MAX_SKILL_TREE_BYTES || snapshot.charge_bytes(count_u64).is_err() {
             return Err(());
         }
         read_bytes = read_bytes.saturating_add(count_u64);
@@ -1432,6 +1501,35 @@ mod tests {
             inspect_installed_skills(&catalog, &runtime),
             Err(SkillReadError::CatalogTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn snapshots_share_manifest_and_tree_work_budgets() {
+        let temp = tempdir().expect("tempdir");
+        write_skill(temp.path(), "demo", "manifest");
+        let skill = temp.path().join("demo");
+
+        let mut manifest_budget = SnapshotBudget {
+            bytes: MAX_SKILL_SNAPSHOT_BYTES,
+            ..SnapshotBudget::default()
+        };
+        assert!(matches!(
+            inspect_source(&skill, &mut manifest_budget),
+            SourceObservation::Unreadable
+        ));
+
+        let mut tree_budget = SnapshotBudget {
+            entries: MAX_SKILL_SNAPSHOT_ENTRIES,
+            ..SnapshotBudget::default()
+        };
+        assert!(tree_digest(&skill, &mut tree_budget).is_err());
+
+        let mut tree_budget = SnapshotBudget {
+            bytes: MAX_SKILL_SNAPSHOT_BYTES - 1,
+            ..SnapshotBudget::default()
+        };
+        assert!(tree_digest(&skill, &mut tree_budget).is_err());
+        assert_eq!(tree_budget.bytes, MAX_SKILL_SNAPSHOT_BYTES);
     }
 
     #[test]

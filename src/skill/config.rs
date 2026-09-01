@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde_json::Value;
 use thiserror::Error;
 use toml_edit::DocumentMut;
@@ -16,14 +18,14 @@ pub(super) enum NativeSkillControl {
 pub(super) enum NativeSkillControls {
     Gemini {
         globally_enabled: bool,
-        disabled: Vec<String>,
+        disabled: HashSet<String>,
     },
     Grok {
-        disabled: Vec<String>,
+        disabled: HashSet<String>,
     },
     Hermes {
-        disabled: Vec<String>,
-        platform_disabled: Vec<String>,
+        disabled: HashSet<String>,
+        platform_disabled: HashSet<String>,
     },
 }
 
@@ -36,17 +38,14 @@ impl NativeSkillControls {
             } => {
                 if !globally_enabled {
                     NativeSkillControl::GloballyDisabled
-                } else if disabled
-                    .iter()
-                    .any(|candidate| candidate == &name.to_lowercase())
-                {
+                } else if disabled.contains(&name.to_lowercase()) {
                     NativeSkillControl::Disabled
                 } else {
                     NativeSkillControl::Enabled
                 }
             }
             Self::Grok { disabled } => {
-                if disabled.iter().any(|candidate| candidate == name) {
+                if disabled.contains(name) {
                     NativeSkillControl::Disabled
                 } else {
                     NativeSkillControl::Enabled
@@ -58,9 +57,9 @@ impl NativeSkillControls {
             } => {
                 if directory == "hermes-agent" {
                     NativeSkillControl::Required
-                } else if platform_disabled.iter().any(|candidate| candidate == name) {
+                } else if platform_disabled.contains(name) {
                     NativeSkillControl::ExternallyDisabled
-                } else if disabled.iter().any(|candidate| candidate == name) {
+                } else if disabled.contains(name) {
                     NativeSkillControl::Disabled
                 } else {
                     NativeSkillControl::Enabled
@@ -93,7 +92,7 @@ fn parse_gemini(
     let Some(skills) = root.get("skills") else {
         return Ok(NativeSkillControls::Gemini {
             globally_enabled: true,
-            disabled: Vec::new(),
+            disabled: HashSet::new(),
         });
     };
     let skills = skills
@@ -160,7 +159,7 @@ fn parse_grok(
     let document = parse_toml(target, contents)?;
     let Some(skills) = document.get("skills") else {
         return Ok(NativeSkillControls::Grok {
-            disabled: Vec::new(),
+            disabled: HashSet::new(),
         });
     };
     let skills = skills
@@ -168,7 +167,7 @@ fn parse_grok(
         .ok_or_else(|| invalid(target, "'skills' must be a table"))?;
     let Some(disabled) = skills.get("disabled") else {
         return Ok(NativeSkillControls::Grok {
-            disabled: Vec::new(),
+            disabled: HashSet::new(),
         });
     };
     let disabled = disabled
@@ -182,7 +181,7 @@ fn parse_grok(
                 .map(str::to_owned)
                 .ok_or_else(|| invalid(target, "'skills.disabled' must contain strings"))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<HashSet<_>, _>>()?;
     Ok(NativeSkillControls::Grok { disabled })
 }
 
@@ -208,14 +207,14 @@ fn parse_hermes(
     let skills_key = serde_yaml::Value::String("skills".to_owned());
     let Some(skills) = root.as_mapping().and_then(|root| root.get(&skills_key)) else {
         return Ok(NativeSkillControls::Hermes {
-            disabled: Vec::new(),
-            platform_disabled: Vec::new(),
+            disabled: HashSet::new(),
+            platform_disabled: HashSet::new(),
         });
     };
     if skills.is_null() {
         return Ok(NativeSkillControls::Hermes {
-            disabled: Vec::new(),
-            platform_disabled: Vec::new(),
+            disabled: HashSet::new(),
+            platform_disabled: HashSet::new(),
         });
     }
     let skills = skills
@@ -223,19 +222,21 @@ fn parse_hermes(
         .ok_or_else(|| invalid(target, "'skills' must be a mapping"))?;
 
     let platform_disabled = match platform {
-        None => Vec::new(),
+        None => HashSet::new(),
         Some(platform) => {
             let platform_key = serde_yaml::Value::String("platform_disabled".to_owned());
             match skills.get(&platform_key).filter(|value| !value.is_null()) {
-                None => Vec::new(),
+                None => HashSet::new(),
                 Some(platforms) => {
                     let platforms = platforms.as_mapping().ok_or_else(|| {
                         invalid(target, "'skills.platform_disabled' must be a mapping")
                     })?;
                     match platforms.get(serde_yaml::Value::String(platform.to_owned())) {
-                        None | Some(serde_yaml::Value::Null) => Vec::new(),
+                        None | Some(serde_yaml::Value::Null) => HashSet::new(),
                         Some(value) => {
                             yaml_name_list(target, value, "'skills.platform_disabled.*'")?
+                                .into_iter()
+                                .collect()
                         }
                     }
                 }
@@ -244,8 +245,10 @@ fn parse_hermes(
     };
     let disabled_key = serde_yaml::Value::String("disabled".to_owned());
     let disabled = match skills.get(&disabled_key) {
-        None | Some(serde_yaml::Value::Null) => Vec::new(),
-        Some(value) => yaml_name_list(target, value, "'skills.disabled'")?,
+        None | Some(serde_yaml::Value::Null) => HashSet::new(),
+        Some(value) => yaml_name_list(target, value, "'skills.disabled'")?
+            .into_iter()
+            .collect(),
     };
     Ok(NativeSkillControls::Hermes {
         disabled,
