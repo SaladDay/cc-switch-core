@@ -56,10 +56,10 @@ impl NativeSkillControls {
                 disabled,
                 platform_disabled,
             } => {
-                if platform_disabled.iter().any(|candidate| candidate == name) {
-                    NativeSkillControl::ExternallyDisabled
-                } else if name == "hermes-agent" {
+                if name == "hermes-agent" {
                     NativeSkillControl::Required
+                } else if platform_disabled.iter().any(|candidate| candidate == name) {
+                    NativeSkillControl::ExternallyDisabled
                 } else if disabled.iter().any(|candidate| candidate == name) {
                     NativeSkillControl::Disabled
                 } else {
@@ -73,6 +73,7 @@ impl NativeSkillControls {
 pub(super) fn parse_native_controls(
     target: SkillConfigTarget,
     contents: Option<&[u8]>,
+    platform: Option<&str>,
 ) -> Result<NativeSkillControls, SkillConfigReadError> {
     if contents.is_some_and(|contents| contents.len() > MAX_OPERATION_CONTENT_BYTES) {
         return Err(invalid(target, "document is too large"));
@@ -80,7 +81,7 @@ pub(super) fn parse_native_controls(
     match target {
         SkillConfigTarget::GeminiSettings => parse_gemini(target, contents),
         SkillConfigTarget::GrokConfig => parse_grok(target, contents),
-        SkillConfigTarget::HermesConfig => parse_hermes(target, contents),
+        SkillConfigTarget::HermesConfig => parse_hermes(target, contents, platform),
     }
 }
 
@@ -201,6 +202,7 @@ fn parse_toml(
 fn parse_hermes(
     target: SkillConfigTarget,
     contents: Option<&[u8]>,
+    platform: Option<&str>,
 ) -> Result<NativeSkillControls, SkillConfigReadError> {
     let root = parse_yaml(target, contents)?;
     let skills_key = serde_yaml::Value::String("skills".to_owned());
@@ -221,19 +223,20 @@ fn parse_hermes(
         .ok_or_else(|| invalid(target, "'skills' must be a mapping"))?;
 
     let platform_key = serde_yaml::Value::String("platform_disabled".to_owned());
-    let mut platform_disabled = Vec::new();
-    if let Some(platforms) = skills.get(&platform_key).filter(|value| !value.is_null()) {
-        let platforms = platforms
-            .as_mapping()
-            .ok_or_else(|| invalid(target, "'skills.platform_disabled' must be a mapping"))?;
-        for value in platforms.values() {
-            platform_disabled.extend(yaml_name_list(
-                target,
-                value,
-                "'skills.platform_disabled.*'",
-            )?);
-        }
-    }
+    let platform_disabled =
+        if let Some(platforms) = skills.get(&platform_key).filter(|value| !value.is_null()) {
+            let platforms = platforms
+                .as_mapping()
+                .ok_or_else(|| invalid(target, "'skills.platform_disabled' must be a mapping"))?;
+            match platform
+                .and_then(|platform| platforms.get(serde_yaml::Value::String(platform.to_owned())))
+            {
+                None | Some(serde_yaml::Value::Null) => Vec::new(),
+                Some(value) => yaml_name_list(target, value, "'skills.platform_disabled.*'")?,
+            }
+        } else {
+            Vec::new()
+        };
 
     let disabled_key = serde_yaml::Value::String("disabled".to_owned());
     let disabled = match skills.get(&disabled_key) {
@@ -320,7 +323,17 @@ mod tests {
         contents: Option<&[u8]>,
         name: &str,
     ) -> Result<NativeSkillControl, SkillConfigReadError> {
-        parse_native_controls(target, contents).map(|controls| controls.control_for(name))
+        parse_native_controls(target, contents, None).map(|controls| controls.control_for(name))
+    }
+
+    fn inspect_for_platform(
+        target: SkillConfigTarget,
+        contents: Option<&[u8]>,
+        name: &str,
+        platform: &str,
+    ) -> Result<NativeSkillControl, SkillConfigReadError> {
+        parse_native_controls(target, contents, Some(platform))
+            .map(|controls| controls.control_for(name))
     }
 
     #[test]
@@ -361,13 +374,42 @@ mod tests {
             inspect(SkillConfigTarget::HermesConfig, None, "hermes-agent"),
             Ok(NativeSkillControl::Required)
         );
+        let platform_controls =
+            b"skills:\n  platform_disabled:\n    telegram: [demo, hermes-agent]\n";
+        assert_eq!(
+            inspect_for_platform(
+                SkillConfigTarget::HermesConfig,
+                Some(platform_controls),
+                "demo",
+                "telegram",
+            ),
+            Ok(NativeSkillControl::ExternallyDisabled)
+        );
+        assert_eq!(
+            inspect_for_platform(
+                SkillConfigTarget::HermesConfig,
+                Some(platform_controls),
+                "demo",
+                "cli",
+            ),
+            Ok(NativeSkillControl::Enabled)
+        );
         assert_eq!(
             inspect(
                 SkillConfigTarget::HermesConfig,
-                Some(b"skills:\n  platform_disabled:\n    windows: demo\n"),
+                Some(platform_controls),
                 "demo",
             ),
-            Ok(NativeSkillControl::ExternallyDisabled)
+            Ok(NativeSkillControl::Enabled)
+        );
+        assert_eq!(
+            inspect_for_platform(
+                SkillConfigTarget::HermesConfig,
+                Some(platform_controls),
+                "hermes-agent",
+                "telegram",
+            ),
+            Ok(NativeSkillControl::Required)
         );
     }
 

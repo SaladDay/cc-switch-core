@@ -22,6 +22,7 @@ use super::{
 
 const MAX_SKILL_TREE_ENTRIES: usize = 10_000;
 const MAX_SKILL_TREE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_HERMES_PLATFORM_BYTES: usize = 128;
 
 /// Host-resolved runtime inputs for one application.
 ///
@@ -32,6 +33,7 @@ pub struct SkillAppRuntime {
     app: AppType,
     native_root: PathBuf,
     config: Option<ObservedDocument>,
+    hermes_platform: Option<String>,
 }
 
 impl SkillAppRuntime {
@@ -91,7 +93,33 @@ impl SkillAppRuntime {
             app,
             native_root,
             config,
+            hermes_platform: None,
         })
+    }
+
+    /// Selects the active Hermes gateway platform (for example `telegram`).
+    ///
+    /// Without this context, Core reports the global Hermes Skill state and
+    /// leaves platform-specific disables out of the snapshot.
+    pub fn try_with_hermes_platform(
+        mut self,
+        platform: impl Into<String>,
+    ) -> Result<Self, SkillRuntimeError> {
+        if self.app != AppType::Hermes {
+            return Err(SkillRuntimeError::UnexpectedHermesPlatform {
+                app: self.app.as_str().to_owned(),
+            });
+        }
+        let platform = platform.into();
+        if platform.is_empty()
+            || platform.trim() != platform
+            || platform.len() > MAX_HERMES_PLATFORM_BYTES
+            || platform.chars().any(char::is_control)
+        {
+            return Err(SkillRuntimeError::InvalidHermesPlatform);
+        }
+        self.hermes_platform = Some(platform);
+        Ok(self)
     }
 
     pub fn app(&self) -> &AppType {
@@ -100,6 +128,11 @@ impl SkillAppRuntime {
 
     pub fn native_root(&self) -> &Path {
         &self.native_root
+    }
+
+    /// Returns the active Hermes gateway platform, when the host supplied it.
+    pub fn hermes_platform(&self) -> Option<&str> {
+        self.hermes_platform.as_deref()
     }
 }
 
@@ -110,6 +143,7 @@ impl fmt::Debug for SkillAppRuntime {
             .field("app", &self.app)
             .field("native_root", &self.native_root)
             .field("config", &self.config)
+            .field("hermes_platform", &self.hermes_platform)
             .finish()
     }
 }
@@ -188,7 +222,8 @@ fn validate_distinct_roots(
 ) -> Result<(), SkillRuntimeError> {
     let source = resolve_root(source_root)?;
     let unified = resolve_root(unified_root)?;
-    if source != unified && roots_overlap(&source, &unified) {
+    let same_declared_root = source_root == unified_root;
+    if roots_overlap(&source, &unified) && !(same_declared_root && source == unified) {
         return Err(SkillRuntimeError::OverlappingRoots {
             left: source_root.to_owned(),
             right: unified_root.to_owned(),
@@ -424,7 +459,8 @@ impl<'a> PreparedApp<'a> {
                     .as_ref()
                     .expect("runtime validates required config observations")
                     .contents();
-                parse_native_controls(target, contents).map_err(|_| ())
+                parse_native_controls(target, contents, runtime.hermes_platform.as_deref())
+                    .map_err(|_| ())
             });
         Self { runtime, controls }
     }
@@ -490,9 +526,19 @@ fn unavailable_state(
     runtime: &SkillAppRuntime,
     reason: SkillControlReason,
 ) -> SkillAppState {
+    let contract = builtin_app_registry()
+        .for_app(&runtime.app)
+        .skill_contract()
+        .expect("Skill runtime construction requires a contract");
+    let selected = match contract.selection_store() {
+        SkillSelectionStore::CatalogColumn(_) => entry.selected_for(&runtime.app),
+        SkillSelectionStore::NativeDirectory => {
+            observe_native_directory_selection(&runtime.native_root, entry.directory())
+        }
+    };
     SkillAppState {
         app: runtime.app.clone(),
-        selected: entry.selected_for(&runtime.app),
+        selected,
         enabled: None,
         writable: false,
         reason: Some(reason),
@@ -511,7 +557,7 @@ fn inspect_app(
         .skill_contract()
         .expect("Skill runtime construction requires a contract");
     let catalog_selected = entry.selected_for(&runtime.app);
-    let allow_matching_copy = catalog_selected.unwrap_or(true);
+    let allow_matching_copy = catalog_selected == Some(true);
     let native = inspect_relation(
         source,
         &runtime.native_root,
@@ -560,7 +606,7 @@ fn inspect_app(
         ) => false,
     };
     let reason = match control {
-        Some(NativeSkillControl::Required) if enabled => Some(SkillControlReason::Required),
+        Some(NativeSkillControl::Required) => Some(SkillControlReason::Required),
         Some(NativeSkillControl::GloballyDisabled) => Some(SkillControlReason::GloballyDisabled),
         Some(NativeSkillControl::ExternallyDisabled) => {
             Some(SkillControlReason::ExternallyDisabled)
@@ -606,18 +652,18 @@ struct ReadySource {
 }
 
 fn inspect_source(path: &Path) -> SourceObservation {
-    let metadata = match fs::metadata(path) {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return SourceObservation::Missing
         }
         Err(_) => return SourceObservation::Unreadable,
     };
-    if !metadata.is_dir() {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return SourceObservation::Invalid;
     }
-    match fs::metadata(path.join("SKILL.md")) {
-        Ok(metadata) if metadata.is_file() => {}
+    match fs::symlink_metadata(path.join("SKILL.md")) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => return SourceObservation::Invalid,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return SourceObservation::Invalid
@@ -631,6 +677,20 @@ fn inspect_source(path: &Path) -> SourceObservation {
             digest: None,
         }),
         Err(_) => SourceObservation::Unreadable,
+    }
+}
+
+fn observe_native_directory_selection(root: &Path, directory: &str) -> Option<bool> {
+    let path = root.join(directory);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::metadata(path) {
+            Ok(target) => Some(target.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        },
+        Ok(metadata) => Some(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -857,6 +917,10 @@ pub enum SkillRuntimeError {
     },
     #[error("application '{app}' has duplicate Skill runtime inputs")]
     DuplicateApp { app: String },
+    #[error("application '{app}' cannot use a Hermes platform context")]
+    UnexpectedHermesPlatform { app: String },
+    #[error("Hermes platform context is invalid")]
+    InvalidHermesPlatform,
     #[error("at least one Skill application runtime is required")]
     NoApps,
     #[error("Skill roots overlap: {left:?}, {right:?}")]
@@ -961,6 +1025,26 @@ mod tests {
     }
 
     #[test]
+    fn pi_does_not_claim_an_unmarked_plain_copy() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let native = temp.path().join("native");
+        let unified = temp.path().join("unified");
+        write_skill(&source, "demo", "same");
+        write_skill(&native, "demo", "same");
+        let runtime = SkillRuntime::try_new(&source, &unified, [app_runtime(&native, AppType::Pi)])
+            .expect("runtime");
+
+        let snapshots =
+            inspect_installed_skills(&[catalog_entry("demo", false)], &runtime).expect("snapshots");
+        let pi = state(&snapshots[0], &AppType::Pi);
+        assert_eq!(pi.selected(), Some(true));
+        assert_eq!(pi.enabled(), None);
+        assert!(!pi.writable());
+        assert_eq!(pi.reason(), Some(SkillControlReason::NativeConflict));
+    }
+
+    #[test]
     fn direct_unified_discovery_is_visible_but_not_disableable_without_a_control() {
         let temp = tempdir().expect("tempdir");
         let unified = temp.path().join("unified");
@@ -1034,6 +1118,56 @@ mod tests {
     }
 
     #[test]
+    fn pi_selection_is_observed_when_the_source_is_missing() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("missing-source");
+        let native = temp.path().join("native");
+        let unified = temp.path().join("unified");
+        fs::create_dir_all(native.join("present")).expect("native Skill directory");
+        let runtime = SkillRuntime::try_new(&source, &unified, [app_runtime(&native, AppType::Pi)])
+            .expect("runtime");
+        let catalog = [
+            catalog_entry("present", false),
+            catalog_entry("missing", false),
+        ];
+
+        let snapshots = inspect_installed_skills(&catalog, &runtime).expect("snapshots");
+        assert_eq!(state(&snapshots[0], &AppType::Pi).selected(), Some(true));
+        assert_eq!(state(&snapshots[1], &AppType::Pi).selected(), Some(false));
+        for snapshot in &snapshots {
+            let pi = state(snapshot, &AppType::Pi);
+            assert_eq!(pi.enabled(), None);
+            assert!(!pi.writable());
+            assert_eq!(pi.reason(), Some(SkillControlReason::MissingSource));
+        }
+    }
+
+    #[test]
+    fn required_hermes_skill_stays_read_only_when_not_installed() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let native = temp.path().join("native");
+        let unified = temp.path().join("unified");
+        write_skill(&source, "hermes-agent", "source");
+        let config = ObservedDocument::present(
+            SkillConfigTarget::HermesConfig.logical_target(),
+            b"skills:\n  platform_disabled:\n    telegram: [hermes-agent]\n".to_vec(),
+        );
+        let hermes = SkillAppRuntime::try_new(AppType::Hermes, &native, Some(config))
+            .expect("Hermes runtime")
+            .try_with_hermes_platform("telegram")
+            .expect("Hermes platform");
+        let runtime = SkillRuntime::try_new(&source, &unified, [hermes]).expect("runtime");
+
+        let snapshots = inspect_installed_skills(&[catalog_entry("hermes-agent", false)], &runtime)
+            .expect("snapshots");
+        let hermes = state(&snapshots[0], &AppType::Hermes);
+        assert_eq!(hermes.enabled(), Some(false));
+        assert!(!hermes.writable());
+        assert_eq!(hermes.reason(), Some(SkillControlReason::Required));
+    }
+
+    #[test]
     fn runtime_rejects_wrong_or_unobserved_config_documents() {
         let temp = tempdir().expect("tempdir");
         let wrong = ObservedDocument::missing(crate::LogicalTarget::GrokConfig);
@@ -1045,6 +1179,11 @@ mod tests {
         assert!(matches!(
             SkillAppRuntime::try_new(AppType::Gemini, temp.path(), Some(unobserved)),
             Err(SkillRuntimeError::UnobservedConfig { .. })
+        ));
+        let claude = app_runtime(temp.path(), AppType::Claude);
+        assert!(matches!(
+            claude.try_with_hermes_platform("telegram"),
+            Err(SkillRuntimeError::UnexpectedHermesPlatform { .. })
         ));
     }
 
@@ -1059,6 +1198,51 @@ mod tests {
             SkillRuntime::try_new(&source, &unified, [claude]),
             Err(SkillRuntimeError::OverlappingRoots { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_rejects_distinct_aliases_for_the_same_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let alias = temp.path().join("source-alias");
+        let native = temp.path().join("native");
+        fs::create_dir_all(&source).expect("source root");
+        symlink(&source, &alias).expect("source alias");
+
+        assert!(matches!(
+            SkillRuntime::try_new(&source, &alias, [app_runtime(&native, AppType::Pi)]),
+            Err(SkillRuntimeError::OverlappingRoots { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_entries_cannot_escape_through_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let external = temp.path().join("external");
+        let native = temp.path().join("native");
+        let unified = temp.path().join("unified");
+        fs::create_dir_all(&source).expect("source root");
+        write_skill(&external, "demo", "external");
+        symlink(external.join("demo"), source.join("demo")).expect("source entry link");
+        fs::create_dir_all(&native).expect("native root");
+        symlink(external.join("demo"), native.join("demo")).expect("native entry link");
+        let runtime =
+            SkillRuntime::try_new(&source, &unified, [app_runtime(&native, AppType::Claude)])
+                .expect("runtime");
+
+        let snapshots =
+            inspect_installed_skills(&[catalog_entry("demo", true)], &runtime).expect("snapshots");
+        let claude = state(&snapshots[0], &AppType::Claude);
+        assert_eq!(claude.enabled(), None);
+        assert!(!claude.writable());
+        assert_eq!(claude.reason(), Some(SkillControlReason::InvalidSource));
     }
 
     #[test]
