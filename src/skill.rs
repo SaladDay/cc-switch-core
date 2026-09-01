@@ -1417,14 +1417,6 @@ fn append_normalized_suffix(
     Ok(resolved)
 }
 
-fn inspect_paths(
-    source: &Path,
-    destination: &Path,
-    directory: &str,
-) -> Result<(SkillDeploymentState, DeploymentExpectation), SkillConfigError> {
-    inspect_paths_with_policy(source, destination, directory, SkillCopyPolicy::ManagedOnly)
-}
-
 fn inspect_paths_with_policy(
     source: &Path,
     destination: &Path,
@@ -2092,7 +2084,7 @@ fn recover_interrupted_deployment(
     for (temporary_root, operation) in interrupted {
         match operation {
             InterruptedOperation::Enable => {
-                recover_interrupted_enable(paths, &temporary_root, directory, enabled)?
+                recover_interrupted_enable(paths, &temporary_root, directory, enabled, copy_policy)?
             }
             InterruptedOperation::Disable => recover_interrupted_disable(
                 paths,
@@ -2183,10 +2175,12 @@ fn recover_interrupted_enable(
     temporary_root: &Path,
     directory: &str,
     enabled: bool,
+    copy_policy: SkillCopyPolicy,
 ) -> Result<(), SkillConfigError> {
-    let (destination_state, _) = inspect_paths(&paths.source, &paths.destination, directory)?;
+    let (destination_state, _) =
+        inspect_paths_with_policy(&paths.source, &paths.destination, directory, copy_policy)?;
     let staged = temporary_root.join("deployment");
-    match inspect_paths(&paths.source, &staged, directory) {
+    match inspect_paths_with_policy(&paths.source, &staged, directory, copy_policy) {
         Ok((SkillDeploymentState::Linked | SkillDeploymentState::Copied, _)) => {
             if enabled && destination_state == SkillDeploymentState::Missing {
                 rename_path(&staged, &paths.destination)?;
@@ -3310,6 +3304,35 @@ mod tests {
             fs::read_to_string(destination.join("docs/SKILL.md")).unwrap(),
             "# Docs\n"
         );
+        assert!(!temporary_root.exists());
+    }
+
+    #[test]
+    fn interrupted_enable_reuses_host_evidence_for_a_legacy_copy() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        copy_tree(
+            &source.join("docs"),
+            &destination.join("docs"),
+            &mut TreeBudget::default(),
+        )
+        .unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Enable).unwrap();
+
+        apply_skill_deployment_with_policy(
+            &source,
+            &destination,
+            "docs",
+            true,
+            SkillSyncMethod::Copy,
+            SkillCopyPolicy::AllowMatching,
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
+
+        assert!(destination.join("docs/SKILL.md").is_file());
         assert!(!temporary_root.exists());
     }
 
