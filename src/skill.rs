@@ -30,7 +30,8 @@ const TEMP_MARKER_STAGING_FILE: &str = ".operation.json.pending";
 const TEMP_MARKER_VERSION: u8 = 1;
 const MAX_TEMP_MARKER_BYTES: u64 = 1024;
 const MANAGED_COPY_MARKER_FILE: &str = ".cc-switch-managed.json";
-const MANAGED_COPY_MARKER_VERSION: u8 = 1;
+const LEGACY_MANAGED_COPY_MARKER_VERSION: u8 = 1;
+const MANAGED_COPY_MARKER_VERSION: u8 = 2;
 const MAX_MANAGED_COPY_MARKER_BYTES: u64 = 1024;
 
 /// How an application finds installed Skills beyond its own native directory.
@@ -410,6 +411,8 @@ struct ManagedCopyMarker {
     version: u8,
     directory: String,
     source_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_tree_digest: Option<String>,
 }
 
 /// A reversible native Skill change.
@@ -476,7 +479,7 @@ impl SkillDeploymentReceipt {
                 expectation: _,
             } => {
                 require_expectation(&destination, &DeploymentExpectation::Missing)?;
-                rename_path(&backup, &destination)?;
+                rename_path_no_replace(&backup, &destination)?;
                 remove_directory(&temporary_root)
             }
         }
@@ -1552,7 +1555,7 @@ fn create_link_deployment(
     if let Err(error) = create_symlink(&paths.source, &staged) {
         return Err(cleanup_temporary(&temporary_root, error));
     }
-    if let Err(error) = rename_path(&staged, &paths.destination) {
+    if let Err(error) = rename_path_no_replace(&staged, &paths.destination) {
         return Err(cleanup_temporary(&temporary_root, error));
     }
     let receipt = SkillDeploymentReceipt {
@@ -1583,27 +1586,49 @@ fn create_copy(
     let temporary_root =
         create_temporary_directory(parent, directory, InterruptedOperation::Enable)?;
     let staged = temporary_root.join("deployment");
-    let staged_digest = (|| {
+    let copied = (|| {
+        create_private_directory(&staged)?;
         let mut budget = TreeBudget::default();
-        copy_tree(&paths.source, &staged, &mut budget)?;
+        copy_tree_entries(&paths.source, &staged, &mut budget)?;
         let source_digest = tree_digest(&paths.source)?;
-        let staged_digest = tree_digest(&staged)?;
-        if source_digest == staged_digest {
-            write_managed_copy_marker(&staged, directory, &source_digest)?;
-        }
-        Ok((source_digest, staged_digest))
+        let source_tree_digest = tree_digest_with_directory_permissions(&paths.source)?;
+        write_managed_copy_marker(&staged, directory, &source_digest, &source_tree_digest)?;
+        copy_directory_permissions(&paths.source, &staged)?;
+        let staged_digest = managed_copy_digest(&staged)?;
+        let staged_tree_digest = managed_copy_tree_digest(&staged)?;
+        let current_source_digest = tree_digest(&paths.source)?;
+        let current_source_tree_digest = tree_digest_with_directory_permissions(&paths.source)?;
+        Ok((
+            source_digest,
+            source_tree_digest,
+            staged_digest,
+            staged_tree_digest,
+            current_source_digest,
+            current_source_tree_digest,
+        ))
     })();
-    let (source_digest, staged_digest) = match staged_digest {
+    let (
+        source_digest,
+        source_tree_digest,
+        staged_digest,
+        staged_tree_digest,
+        current_source_digest,
+        current_source_tree_digest,
+    ) = match copied {
         Ok(digests) => digests,
         Err(error) => return Err(cleanup_temporary(&temporary_root, error)),
     };
-    if staged_digest != source_digest {
+    if staged_digest != source_digest
+        || staged_tree_digest != source_tree_digest
+        || current_source_digest != source_digest
+        || current_source_tree_digest != source_tree_digest
+    {
         return Err(cleanup_temporary(
             &temporary_root,
             SkillConfigError::Conflict { path: paths.source },
         ));
     }
-    if let Err(error) = rename_path(&staged, &paths.destination) {
+    if let Err(error) = rename_path_no_replace(&staged, &paths.destination) {
         return Err(cleanup_temporary(&temporary_root, error));
     }
     let receipt = SkillDeploymentReceipt {
@@ -1652,7 +1677,7 @@ fn disable_deployment(
     {
         return Err(cleanup_temporary(&temporary_root, error));
     }
-    if let Err(error) = rename_path(&paths.destination, &backup) {
+    if let Err(error) = rename_path_no_replace(&paths.destination, &backup) {
         return Err(cleanup_temporary(&temporary_root, error));
     }
     let receipt = SkillDeploymentReceipt {
@@ -1756,16 +1781,25 @@ fn canonicalize_optional(path: &Path) -> Result<Option<PathBuf>, SkillConfigErro
 }
 
 fn tree_digest(root: &Path) -> Result<String, SkillConfigError> {
-    tree_digest_with_managed_marker(root, false)
+    tree_digest_with_options(root, false, false)
+}
+
+fn tree_digest_with_directory_permissions(root: &Path) -> Result<String, SkillConfigError> {
+    tree_digest_with_options(root, false, true)
 }
 
 fn managed_copy_digest(root: &Path) -> Result<String, SkillConfigError> {
-    tree_digest_with_managed_marker(root, true)
+    tree_digest_with_options(root, true, false)
 }
 
-fn tree_digest_with_managed_marker(
+fn managed_copy_tree_digest(root: &Path) -> Result<String, SkillConfigError> {
+    tree_digest_with_options(root, true, true)
+}
+
+fn tree_digest_with_options(
     root: &Path,
     skip_managed_marker: bool,
+    include_directory_permissions: bool,
 ) -> Result<String, SkillConfigError> {
     let metadata =
         fs::symlink_metadata(root).map_err(|source| SkillConfigError::io(root, source))?;
@@ -1776,8 +1810,19 @@ fn tree_digest_with_managed_marker(
     }
     let mut budget = TreeBudget::default();
     let mut hasher = Sha256::new();
-    hasher.update(b"cc-switch-skill-tree-v1\0");
-    hash_directory(root, root, &mut budget, &mut hasher, skip_managed_marker)?;
+    if include_directory_permissions {
+        hasher.update(b"cc-switch-skill-tree-v2\0");
+    } else {
+        hasher.update(b"cc-switch-skill-tree-v1\0");
+    }
+    hash_directory(
+        root,
+        root,
+        &mut budget,
+        &mut hasher,
+        skip_managed_marker,
+        include_directory_permissions,
+    )?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -1796,11 +1841,23 @@ fn managed_copy_digest_if_owned(
     let Some(marker) = read_managed_copy_marker(destination)? else {
         return Ok(None);
     };
-    if marker.version != MANAGED_COPY_MARKER_VERSION || marker.directory != directory {
+    if marker.directory != directory {
         return Ok(None);
     }
     if managed_copy_digest(destination)? != marker.source_digest {
         return Ok(None);
+    }
+    match marker.version {
+        LEGACY_MANAGED_COPY_MARKER_VERSION if marker.source_tree_digest.is_none() => {}
+        MANAGED_COPY_MARKER_VERSION => {
+            let Some(source_tree_digest) = marker.source_tree_digest else {
+                return Ok(None);
+            };
+            if managed_copy_tree_digest(destination)? != source_tree_digest {
+                return Ok(None);
+            }
+        }
+        _ => return Ok(None),
     }
     Ok(Some(marker.source_digest))
 }
@@ -1826,12 +1883,14 @@ fn write_managed_copy_marker(
     destination: &Path,
     directory: &str,
     source_digest: &str,
+    source_tree_digest: &str,
 ) -> Result<(), SkillConfigError> {
     let path = destination.join(MANAGED_COPY_MARKER_FILE);
     let contents = serde_json::to_vec(&ManagedCopyMarker {
         version: MANAGED_COPY_MARKER_VERSION,
         directory: directory.to_owned(),
         source_digest: source_digest.to_owned(),
+        source_tree_digest: Some(source_tree_digest.to_owned()),
     })
     .map_err(|error| SkillConfigError::Recovery {
         message: format!("failed to encode managed Skill marker: {error}"),
@@ -1886,7 +1945,20 @@ fn hash_directory(
     budget: &mut TreeBudget,
     hasher: &mut Sha256,
     skip_managed_marker: bool,
+    include_directory_permissions: bool,
 ) -> Result<(), SkillConfigError> {
+    if include_directory_permissions {
+        let metadata = fs::symlink_metadata(directory)
+            .map_err(|source| SkillConfigError::io(directory, source))?;
+        if !metadata.file_type().is_dir() {
+            return Err(SkillConfigError::Conflict {
+                path: directory.to_owned(),
+            });
+        }
+        hasher.update(b"m\0");
+        hash_permissions(&metadata, hasher);
+        hasher.update(b"\0");
+    }
     let entries = read_directory_entries(directory, budget, skip_managed_marker)?;
 
     for entry in entries {
@@ -1904,7 +1976,14 @@ fn hash_directory(
             hasher.update(b"d\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
-            hash_directory(root, &path, budget, hasher, false)?;
+            hash_directory(
+                root,
+                &path,
+                budget,
+                hasher,
+                false,
+                include_directory_permissions,
+            )?;
         } else if metadata.file_type().is_file() {
             hasher.update(b"f\0");
             hasher.update(relative.as_bytes());
@@ -1925,13 +2004,7 @@ fn hash_file(
 ) -> Result<(), SkillConfigError> {
     let mut file = File::open(path).map_err(|source| SkillConfigError::io(path, source))?;
     hasher.update(before.len().to_le_bytes());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        hasher.update((before.permissions().mode() & 0o777).to_le_bytes());
-    }
-    #[cfg(not(unix))]
-    hasher.update([u8::from(before.permissions().readonly())]);
+    hash_permissions(before, hasher);
 
     let mut read_bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
@@ -1957,13 +2030,46 @@ fn hash_file(
     Ok(())
 }
 
+fn hash_permissions(metadata: &fs::Metadata, hasher: &mut Sha256) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        hasher.update((metadata.permissions().mode() & 0o777).to_le_bytes());
+    }
+    #[cfg(not(unix))]
+    hasher.update([u8::from(metadata.permissions().readonly())]);
+}
+
 fn copy_tree(
     source: &Path,
     destination: &Path,
     budget: &mut TreeBudget,
 ) -> Result<(), SkillConfigError> {
-    fs::create_dir(destination)
-        .map_err(|source_error| SkillConfigError::io(destination, source_error))?;
+    create_private_directory(destination)?;
+    copy_tree_entries(source, destination, budget)?;
+    copy_directory_permissions(source, destination)
+}
+
+fn create_private_directory(path: &Path) -> Result<(), SkillConfigError> {
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
+    builder
+        .create(path)
+        .map_err(|source| SkillConfigError::io(path, source))
+}
+
+fn copy_tree_entries(
+    source: &Path,
+    destination: &Path,
+    budget: &mut TreeBudget,
+) -> Result<(), SkillConfigError> {
     let entries = read_directory_entries(source, budget, false)?;
     for entry in entries {
         let source_path = entry.path();
@@ -1986,6 +2092,19 @@ fn copy_tree(
             return Err(SkillConfigError::UnsupportedEntry { path: source_path });
         }
     }
+    sync_directory(destination)
+}
+
+fn copy_directory_permissions(source: &Path, destination: &Path) -> Result<(), SkillConfigError> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|source_error| SkillConfigError::io(source, source_error))?;
+    if !metadata.file_type().is_dir() {
+        return Err(SkillConfigError::Conflict {
+            path: source.to_owned(),
+        });
+    }
+    fs::set_permissions(destination, metadata.permissions())
+        .map_err(|source_error| SkillConfigError::io(destination, source_error))?;
     sync_directory(destination)
 }
 
@@ -2026,9 +2145,7 @@ fn recover_interrupted_deployment(
     };
     let mut interrupted = Vec::new();
     for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
-        };
+        let entry = entry.map_err(|source| SkillConfigError::io(parent, source))?;
         let name = entry.file_name();
         if !name
             .to_str()
@@ -2145,7 +2262,7 @@ fn read_operation_marker(
     let staging = temporary_root.join(TEMP_MARKER_STAGING_FILE);
     match read_operation_marker_file(&staging)? {
         OperationMarkerFile::Valid(marker) => {
-            rename_path(&staging, &path)?;
+            rename_path_no_replace(&staging, &path)?;
             Ok(Some(marker))
         }
         OperationMarkerFile::Missing | OperationMarkerFile::Invalid => Ok(None),
@@ -2183,7 +2300,7 @@ fn recover_interrupted_enable(
     match inspect_paths_with_policy(&paths.source, &staged, directory, copy_policy) {
         Ok((SkillDeploymentState::Linked, _)) => {
             if enabled && destination_state == SkillDeploymentState::Missing {
-                rename_path(&staged, &paths.destination)?;
+                rename_path_no_replace(&staged, &paths.destination)?;
             }
         }
         Ok((SkillDeploymentState::Copied, expectation)) => {
@@ -2198,13 +2315,13 @@ fn recover_interrupted_enable(
                     })
                 }
             };
-            if tree_digest(&paths.source)? != staged_digest {
+            if !copied_stage_matches_source(&paths.source, &staged, &staged_digest)? {
                 // The source changed after this copy was staged. Discard the
                 // Core-owned stage so the caller rebuilds it from the current source.
                 return remove_directory(temporary_root);
             }
             if enabled && destination_state == SkillDeploymentState::Missing {
-                rename_path(&staged, &paths.destination)?;
+                rename_path_no_replace(&staged, &paths.destination)?;
             }
         }
         Ok((SkillDeploymentState::Missing, _)) => {}
@@ -2216,6 +2333,22 @@ fn recover_interrupted_enable(
         Err(error) => return Err(error),
     }
     remove_directory(temporary_root)
+}
+
+fn copied_stage_matches_source(
+    source: &Path,
+    staged: &Path,
+    staged_digest: &str,
+) -> Result<bool, SkillConfigError> {
+    if tree_digest(source)? != staged_digest {
+        return Ok(false);
+    }
+    let staged_tree_digest = if read_managed_copy_marker(staged)?.is_some() {
+        managed_copy_tree_digest(staged)?
+    } else {
+        tree_digest_with_directory_permissions(staged)?
+    };
+    Ok(tree_digest_with_directory_permissions(source)? == staged_tree_digest)
 }
 
 fn recover_interrupted_disable(
@@ -2251,7 +2384,7 @@ fn recover_interrupted_disable(
     };
     if destination_state == SkillDeploymentState::Missing {
         if enabled && backup_state != SkillDeploymentState::Missing {
-            rename_path(&backup, &paths.destination)?;
+            rename_path_no_replace(&backup, &paths.destination)?;
         }
         return remove_directory(temporary_root);
     }
@@ -2356,7 +2489,7 @@ fn write_operation_marker(
         return Err(SkillConfigError::io(&staging, source));
     }
     drop(file);
-    if let Err(error) = rename_path(&staging, &path) {
+    if let Err(error) = rename_path_no_replace(&staging, &path) {
         let _ = fs::remove_file(&staging);
         return Err(error);
     }
@@ -2367,12 +2500,16 @@ fn sync_directory(path: &Path) -> Result<(), SkillConfigError> {
     crate::fs::sync_directory(path).map_err(|source| SkillConfigError::io(path, source))
 }
 
-fn rename_path(source: &Path, destination: &Path) -> Result<(), SkillConfigError> {
-    #[cfg(windows)]
-    crate::fs::move_path_write_through(source, destination)
-        .map_err(|error| SkillConfigError::io(destination, error))?;
-    #[cfg(not(windows))]
-    fs::rename(source, destination).map_err(|error| SkillConfigError::io(destination, error))?;
+fn rename_path_no_replace(source: &Path, destination: &Path) -> Result<(), SkillConfigError> {
+    if let Err(source) = crate::fs::move_path_no_replace(source, destination) {
+        return if source.kind() == std::io::ErrorKind::AlreadyExists {
+            Err(SkillConfigError::Conflict {
+                path: destination.to_owned(),
+            })
+        } else {
+            Err(SkillConfigError::io(destination, source))
+        };
+    }
 
     #[cfg(not(windows))]
     if let Some(parent) = source.parent() {
@@ -2510,7 +2647,7 @@ mod tests {
         fs::write(source.join("SKILL.md"), "# Skill\n").unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o300)).unwrap();
 
-        let result = rename_path(&source, &destination);
+        let result = rename_path_no_replace(&source, &destination);
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
 
         assert!(matches!(result, Err(SkillConfigError::Recovery { .. })));
@@ -2519,6 +2656,24 @@ mod tests {
             fs::read_to_string(destination.join("SKILL.md")).unwrap(),
             "# Skill\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_never_replaces_an_external_destination() {
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "# Skill\n").unwrap();
+        fs::write(&destination, "external").unwrap();
+
+        assert!(matches!(
+            rename_path_no_replace(&source, &destination),
+            Err(SkillConfigError::Conflict { .. })
+        ));
+        assert!(source.join("SKILL.md").is_file());
+        assert_eq!(fs::read_to_string(destination).unwrap(), "external");
     }
 
     #[test]
@@ -3143,6 +3298,77 @@ mod tests {
         assert!(!destination.join("docs").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn copied_deployment_preserves_and_verifies_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temporary, source, destination) = roots();
+        fs::create_dir(source.join("docs/private")).unwrap();
+        fs::write(source.join("docs/private/data"), "private").unwrap();
+        fs::set_permissions(source.join("docs"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            source.join("docs/private"),
+            fs::Permissions::from_mode(0o710),
+        )
+        .unwrap();
+
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert_eq!(
+            fs::metadata(destination.join("docs"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(destination.join("docs/private"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o710
+        );
+        fs::set_permissions(
+            destination.join("docs/private"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(matches!(
+            inspect_skill_deployment(&source, &destination, "docs"),
+            Err(SkillConfigError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_managed_copy_marker_remains_valid() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        let copied = destination.join("docs");
+        copy_tree(&source.join("docs"), &copied, &mut TreeBudget::default()).unwrap();
+        let marker = ManagedCopyMarker {
+            version: LEGACY_MANAGED_COPY_MARKER_VERSION,
+            directory: "docs".to_owned(),
+            source_digest: tree_digest(&source.join("docs")).unwrap(),
+            source_tree_digest: None,
+        };
+        fs::write(
+            copied.join(MANAGED_COPY_MARKER_FILE),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            inspect_skill_deployment(&source, &destination, "docs").unwrap(),
+            SkillDeploymentState::Copied
+        );
+    }
+
     #[test]
     fn identical_unmanaged_copy_is_read_only_and_preserved() {
         let (_temporary, source, destination) = roots();
@@ -3271,7 +3497,14 @@ mod tests {
         )
         .unwrap();
         let digest = tree_digest(&source.join("docs")).unwrap();
-        write_managed_copy_marker(&temporary_root.join("deployment"), "docs", &digest).unwrap();
+        let tree_digest = tree_digest_with_directory_permissions(&source.join("docs")).unwrap();
+        write_managed_copy_marker(
+            &temporary_root.join("deployment"),
+            "docs",
+            &digest,
+            &tree_digest,
+        )
+        .unwrap();
 
         apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
             .unwrap()
@@ -3298,7 +3531,14 @@ mod tests {
         )
         .unwrap();
         let digest = tree_digest(&source.join("docs")).unwrap();
-        write_managed_copy_marker(&temporary_root.join("deployment"), "docs", &digest).unwrap();
+        let tree_digest = tree_digest_with_directory_permissions(&source.join("docs")).unwrap();
+        write_managed_copy_marker(
+            &temporary_root.join("deployment"),
+            "docs",
+            &digest,
+            &tree_digest,
+        )
+        .unwrap();
         fs::write(source.join("docs/SKILL.md"), "# Current Docs\n").unwrap();
 
         apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)

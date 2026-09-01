@@ -423,9 +423,50 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
     Ok(())
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
+pub(crate) fn move_path_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        source,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))
+))]
+pub(crate) fn move_path_no_replace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ))
+}
+
 #[cfg(windows)]
-pub(crate) fn move_path_write_through(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn move_path_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     move_path_windows(source, destination, 0)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn move_path_no_replace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ))
 }
 
 #[cfg(windows)]
