@@ -39,6 +39,7 @@ dependencies = [
  "toml_edit",
  "unicode-casefold",
  "unicode-normalization",
+ "windows-sys",
 ]
 
 [[package]]

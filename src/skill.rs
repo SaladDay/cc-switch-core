@@ -2031,36 +2031,11 @@ fn recover_unidentified_operation(
     directory: &str,
     marker_issue: &str,
 ) -> Result<(), SkillConfigError> {
-    let deployment = temporary_root.join("deployment");
-    match fs::symlink_metadata(&deployment) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let entries = fs::read_dir(temporary_root)
-                .map_err(|source| SkillConfigError::io(temporary_root, source))?;
-            for entry in entries {
-                let entry = entry.map_err(|source| SkillConfigError::io(temporary_root, source))?;
-                let known_marker = matches!(
-                    entry.file_name().to_str(),
-                    Some(TEMP_MARKER_FILE | TEMP_MARKER_STAGING_FILE)
-                ) && entry
-                    .file_type()
-                    .map_err(|source| SkillConfigError::io(entry.path(), source))?
-                    .is_file();
-                if !known_marker {
-                    return Err(SkillConfigError::Recovery {
-                        message: format!(
-                            "cannot remove unidentified Skill operation for '{directory}' at {temporary_root:?}: unexpected files are present"
-                        ),
-                    });
-                }
-            }
-            remove_directory(temporary_root)
-        }
-        Ok(_) | Err(_) => Err(SkillConfigError::Recovery {
-            message: format!(
-                "cannot identify interrupted Skill operation for '{directory}' at {temporary_root:?}: {marker_issue}"
-            ),
-        }),
-    }
+    Err(SkillConfigError::Recovery {
+        message: format!(
+            "cannot identify interrupted Skill operation for '{directory}' at {temporary_root:?}: {marker_issue}"
+        ),
+    })
 }
 
 fn read_operation_marker(
@@ -2245,29 +2220,8 @@ fn write_operation_marker(
     Ok(())
 }
 
-#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), SkillConfigError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| SkillConfigError::io(path, source))
-}
-
-#[cfg(windows)]
-fn sync_directory(path: &Path) -> Result<(), SkillConfigError> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| SkillConfigError::io(path, source))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn sync_directory(_path: &Path) -> Result<(), SkillConfigError> {
-    Ok(())
+    crate::fs::sync_directory(path).map_err(|source| SkillConfigError::io(path, source))
 }
 
 fn rename_path(source: &Path, destination: &Path) -> Result<(), SkillConfigError> {
@@ -3199,6 +3153,24 @@ mod tests {
         assert_eq!(
             fs::read(temporary_root.join("keep.txt")).unwrap(),
             b"unknown"
+        );
+    }
+
+    #[test]
+    fn unidentified_marker_only_operation_is_never_deleted() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Enable).unwrap();
+        fs::write(temporary_root.join(TEMP_MARKER_FILE), b"{").unwrap();
+
+        assert!(matches!(
+            apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy),
+            Err(SkillConfigError::Recovery { .. })
+        ));
+        assert_eq!(
+            fs::read(temporary_root.join(TEMP_MARKER_FILE)).unwrap(),
+            b"{"
         );
     }
 

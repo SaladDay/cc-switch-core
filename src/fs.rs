@@ -44,6 +44,13 @@ pub enum FileError {
         #[source]
         source: std::io::Error,
     },
+    /// A visible replacement or removal could not be made durable.
+    #[error("filesystem change at {path:?} is visible but could not be made durable: {source}")]
+    Durability {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// JSON could not be decoded from a file.
     #[error("JSON parse error at {path:?}: {source}")]
     JsonParse {
@@ -65,6 +72,11 @@ impl FileError {
             path: path.into(),
             source,
         }
+    }
+
+    /// Returns whether the filesystem may already contain the requested change.
+    pub const fn recovery_incomplete(&self) -> bool {
+        matches!(self, Self::Durability { .. })
     }
 }
 
@@ -166,7 +178,29 @@ fn atomic_write_with_unix_mode(
     }
     drop(file);
 
-    replace_file(&temporary, path)
+    replace_file(&temporary, path)?;
+    sync_directory(parent).map_err(|source| FileError::Durability {
+        path: parent.to_owned(),
+        source,
+    })
+}
+
+/// Removes a file and makes the directory entry durable before returning.
+pub fn remove_file_durable(path: &Path) -> Result<(), FileError> {
+    fs::remove_file(path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            FileError::NotFound {
+                path: path.to_owned(),
+            }
+        } else {
+            FileError::io(path, source)
+        }
+    })?;
+    let parent = usable_parent(path)?;
+    sync_directory(parent).map_err(|source| FileError::Durability {
+        path: parent.to_owned(),
+        source,
+    })
 }
 
 fn usable_parent(path: &Path) -> Result<&Path, FileError> {
@@ -223,6 +257,7 @@ fn destination_unix_mode(path: &Path, unix_mode: Option<u32>) -> Result<Option<u
     }
 }
 
+#[cfg(not(windows))]
 fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
     if let Err(source) = fs::rename(temporary, destination) {
         let _ = fs::remove_file(temporary);
@@ -232,6 +267,88 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
             source,
         });
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    fn wide_path(path: &Path) -> Result<Vec<u16>, std::io::Error> {
+        let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if value.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows paths cannot contain NUL",
+            ));
+        }
+        if path.is_absolute()
+            && !value.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+            && !value.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
+        {
+            if value.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+                let mut extended = "\\\\?\\UNC\\".encode_utf16().collect::<Vec<_>>();
+                extended.extend_from_slice(&value[2..]);
+                value = extended;
+            } else {
+                let mut extended = "\\\\?\\".encode_utf16().collect::<Vec<_>>();
+                extended.extend(value);
+                value = extended;
+            }
+        }
+        value.push(0);
+        Ok(value)
+    }
+
+    let result = wide_path(temporary).and_then(|temporary_wide| {
+        let destination_wide = wide_path(destination)?;
+        // Both pointers remain valid and NUL-terminated for the duration of the call.
+        let moved = unsafe {
+            MoveFileExW(
+                temporary_wide.as_ptr(),
+                destination_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(source) = result {
+        let _ = fs::remove_file(temporary);
+        return Err(FileError::AtomicReplace {
+            temporary: temporary.to_owned(),
+            destination: destination.to_owned(),
+            source,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn sync_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -288,6 +405,21 @@ mod tests {
 
         assert_eq!(fs::read(&path).expect("read file"), b"new");
         assert!(temporary_files(path.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn durable_remove_deletes_an_existing_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.json");
+        fs::write(&path, b"contents").expect("seed file");
+
+        remove_file_durable(&path).expect("remove file");
+
+        assert!(!path.exists());
+        assert!(matches!(
+            remove_file_durable(&path),
+            Err(FileError::NotFound { .. })
+        ));
     }
 
     #[test]
