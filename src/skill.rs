@@ -374,12 +374,6 @@ fn is_windows_reserved_name(directory: &str) -> bool {
             })
 }
 
-/// Computes a deterministic digest of every regular file and directory in a Skill.
-pub fn skill_tree_digest(path: &Path) -> Result<String, SkillConfigError> {
-    validate_skill_source(path)?;
-    tree_digest(path)
-}
-
 /// Resolves an absolute Skill path without requiring its final components to exist.
 /// Hosts can compare these identities before allowing multiple applications to
 /// share or nest native Skill roots.
