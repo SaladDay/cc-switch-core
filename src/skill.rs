@@ -67,6 +67,7 @@ pub enum SkillConfigTarget {
 pub enum SkillConfigState {
     Enabled,
     Disabled,
+    Required,
     GloballyDisabled,
     ExternallyDisabled,
 }
@@ -142,6 +143,7 @@ impl SkillAppContract {
 pub enum SkillControlReason {
     ExternalDiscovery,
     DirectUnifiedDiscovery,
+    Required,
     GloballyDisabled,
     ExternallyDisabled,
     NativeControlUnavailable,
@@ -235,6 +237,7 @@ pub fn resolve_skill_effective_state(
         Some(SkillConfigState::ExternallyDisabled) => {
             constrained(None, SkillControlReason::ExternallyDisabled)
         }
+        Some(SkillConfigState::Required) => constrained(Some(true), SkillControlReason::Required),
         Some(state @ (SkillConfigState::Enabled | SkillConfigState::Disabled)) => {
             let configured = state == SkillConfigState::Enabled;
             SkillEffectiveState {
@@ -313,6 +316,11 @@ pub enum SkillConfigError {
         "{target:?} cannot enable a Skill while a platform-specific native setting disables it"
     )]
     ExternallyDisabled { target: SkillConfigTarget },
+    #[error("{target:?} requires Skill {name:?} to remain enabled")]
+    RequiredSkill {
+        target: SkillConfigTarget,
+        name: String,
+    },
     #[error("Skill source and destination roots overlap: {source_root:?}, {destination_root:?}")]
     OverlappingRoots {
         source_root: PathBuf,
@@ -456,8 +464,7 @@ impl SkillDeploymentReceipt {
                 expectation: _,
             } => {
                 require_expectation(&destination, &DeploymentExpectation::Missing)?;
-                fs::rename(&backup, &destination)
-                    .map_err(|source| SkillConfigError::io(&destination, source))?;
+                rename_path(&backup, &destination)?;
                 remove_directory(&temporary_root)
             }
         }
@@ -632,6 +639,9 @@ pub fn inspect_skill_config_state(
     name: &str,
 ) -> Result<SkillConfigState, SkillConfigError> {
     validate_skill_name(name)?;
+    if native_skill_is_required(target, name) {
+        return Ok(SkillConfigState::Required);
+    }
     let disabled = match target {
         SkillConfigTarget::GeminiSettings => {
             ensure_json_skill_control_writable(target, contents)?;
@@ -673,6 +683,12 @@ pub fn project_skill_config_enabled(
     enabled: bool,
 ) -> Result<Option<String>, SkillConfigError> {
     validate_skill_name(name)?;
+    if !enabled && native_skill_is_required(target, name) {
+        return Err(SkillConfigError::RequiredSkill {
+            target,
+            name: name.to_owned(),
+        });
+    }
     match target {
         SkillConfigTarget::GeminiSettings => {
             project_json_skill_enabled(target, contents, name, enabled)
@@ -710,6 +726,10 @@ fn native_skill_names_equal(target: SkillConfigTarget, left: &str, right: &str) 
         SkillConfigTarget::GeminiSettings => left.to_lowercase() == right.to_lowercase(),
         SkillConfigTarget::GrokConfig | SkillConfigTarget::HermesConfig => left == right,
     }
+}
+
+fn native_skill_is_required(target: SkillConfigTarget, name: &str) -> bool {
+    target == SkillConfigTarget::HermesConfig && name == "hermes-agent"
 }
 
 fn json_skills_object(
@@ -1219,7 +1239,7 @@ pub fn apply_skill_deployment_with_policy(
     copy_policy: SkillCopyPolicy,
 ) -> Result<SkillDeploymentReceipt, SkillConfigError> {
     let paths = deployment_paths(source_root, destination_root, directory)?;
-    recover_interrupted_deployment(&paths, directory)?;
+    recover_interrupted_deployment(&paths, directory, enabled)?;
     let (state, expectation) =
         inspect_paths_with_policy(&paths.source, &paths.destination, directory, copy_policy)?;
     if enabled {
@@ -1458,8 +1478,9 @@ fn enable_deployment(
     let parent = paths
         .destination
         .parent()
-        .expect("a deployment has a destination root");
-    fs::create_dir_all(parent).map_err(|source| SkillConfigError::io(parent, source))?;
+        .expect("a deployment has a destination root")
+        .to_owned();
+    fs::create_dir_all(&parent).map_err(|source| SkillConfigError::io(&parent, source))?;
 
     if !matches!(sync_method, SkillSyncMethod::Copy) {
         match create_symlink(&paths.source, &paths.destination) {
@@ -1473,6 +1494,9 @@ fn enable_deployment(
                     },
                 };
                 if let Err(error) = receipt.verify() {
+                    return Err(recover_created(receipt, error));
+                }
+                if let Err(error) = sync_directory(&parent) {
                     return Err(recover_created(receipt, error));
                 }
                 return Ok(receipt);
@@ -1526,11 +1550,8 @@ fn create_copy(
             SkillConfigError::Conflict { path: paths.source },
         ));
     }
-    if let Err(source) = fs::rename(&staged, &paths.destination) {
-        return Err(cleanup_temporary(
-            &temporary_root,
-            SkillConfigError::io(&paths.destination, source),
-        ));
+    if let Err(error) = rename_path(&staged, &paths.destination) {
+        return Err(cleanup_temporary(&temporary_root, error));
     }
     let receipt = SkillDeploymentReceipt {
         change: DeploymentChange::Created {
@@ -1570,11 +1591,8 @@ fn disable_deployment(
     let temporary_root =
         create_temporary_directory(parent, directory, InterruptedOperation::Disable)?;
     let backup = temporary_root.join("deployment");
-    if let Err(source) = fs::rename(&destination, &backup) {
-        return Err(cleanup_temporary(
-            &temporary_root,
-            SkillConfigError::io(&destination, source),
-        ));
+    if let Err(error) = rename_path(&destination, &backup) {
+        return Err(cleanup_temporary(&temporary_root, error));
     }
     let receipt = SkillDeploymentReceipt {
         change: DeploymentChange::Removed {
@@ -1766,7 +1784,8 @@ fn write_managed_copy_marker(
         .map_err(|source| SkillConfigError::io(&path, source))?;
     file.write_all(&contents)
         .and_then(|()| file.sync_all())
-        .map_err(|source| SkillConfigError::io(&path, source))
+        .map_err(|source| SkillConfigError::io(&path, source))?;
+    sync_directory(destination)
 }
 
 #[derive(Default)]
@@ -1896,11 +1915,14 @@ fn copy_tree(
             if copied != metadata.len() {
                 return Err(SkillConfigError::Conflict { path: source_path });
             }
+            File::open(&destination_path)
+                .and_then(|file| file.sync_all())
+                .map_err(|source_error| SkillConfigError::io(&destination_path, source_error))?;
         } else {
             return Err(SkillConfigError::UnsupportedEntry { path: source_path });
         }
     }
-    Ok(())
+    sync_directory(destination)
 }
 
 fn read_directory_entries(
@@ -1926,6 +1948,7 @@ fn read_directory_entries(
 fn recover_interrupted_deployment(
     paths: &DeploymentPaths,
     directory: &str,
+    enabled: bool,
 ) -> Result<(), SkillConfigError> {
     let parent = paths
         .destination
@@ -1993,10 +2016,10 @@ fn recover_interrupted_deployment(
     for (temporary_root, operation) in interrupted {
         match operation {
             InterruptedOperation::Enable => {
-                recover_interrupted_enable(paths, &temporary_root, directory)?
+                recover_interrupted_enable(paths, &temporary_root, directory, enabled)?
             }
             InterruptedOperation::Disable => {
-                recover_interrupted_disable(paths, &temporary_root, directory)?
+                recover_interrupted_disable(paths, &temporary_root, directory, enabled)?
             }
         }
     }
@@ -2011,6 +2034,25 @@ fn recover_unidentified_operation(
     let deployment = temporary_root.join("deployment");
     match fs::symlink_metadata(&deployment) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let entries = fs::read_dir(temporary_root)
+                .map_err(|source| SkillConfigError::io(temporary_root, source))?;
+            for entry in entries {
+                let entry = entry.map_err(|source| SkillConfigError::io(temporary_root, source))?;
+                let known_marker = matches!(
+                    entry.file_name().to_str(),
+                    Some(TEMP_MARKER_FILE | TEMP_MARKER_STAGING_FILE)
+                ) && entry
+                    .file_type()
+                    .map_err(|source| SkillConfigError::io(entry.path(), source))?
+                    .is_file();
+                if !known_marker {
+                    return Err(SkillConfigError::Recovery {
+                        message: format!(
+                            "cannot remove unidentified Skill operation for '{directory}' at {temporary_root:?}: unexpected files are present"
+                        ),
+                    });
+                }
+            }
             remove_directory(temporary_root)
         }
         Ok(_) | Err(_) => Err(SkillConfigError::Recovery {
@@ -2042,14 +2084,14 @@ fn recover_interrupted_enable(
     paths: &DeploymentPaths,
     temporary_root: &Path,
     directory: &str,
+    enabled: bool,
 ) -> Result<(), SkillConfigError> {
     let (destination_state, _) = inspect_paths(&paths.source, &paths.destination, directory)?;
-    if destination_state == SkillDeploymentState::Missing {
+    if enabled && destination_state == SkillDeploymentState::Missing {
         let staged = temporary_root.join("deployment");
         match inspect_paths(&paths.source, &staged, directory) {
             Ok((SkillDeploymentState::Linked | SkillDeploymentState::Copied, _)) => {
-                fs::rename(&staged, &paths.destination)
-                    .map_err(|source| SkillConfigError::io(&paths.destination, source))?;
+                rename_path(&staged, &paths.destination)?;
             }
             Ok((SkillDeploymentState::Missing, _)) | Err(SkillConfigError::Conflict { .. }) => {}
             Err(error) => return Err(error),
@@ -2062,10 +2104,22 @@ fn recover_interrupted_disable(
     paths: &DeploymentPaths,
     temporary_root: &Path,
     directory: &str,
+    enabled: bool,
 ) -> Result<(), SkillConfigError> {
     let backup = temporary_root.join("deployment");
     let (destination_state, _) = inspect_paths(&paths.source, &paths.destination, directory)?;
     if destination_state == SkillDeploymentState::Missing {
+        if enabled {
+            let original_parent = paths
+                .destination
+                .parent()
+                .expect("a deployment has a destination root");
+            let (backup_state, _) =
+                inspect_paths_with_link_parent(&paths.source, &backup, directory, original_parent)?;
+            if backup_state != SkillDeploymentState::Missing {
+                rename_path(&backup, &paths.destination)?;
+            }
+        }
         return remove_directory(temporary_root);
     }
     let original_parent = paths
@@ -2075,10 +2129,7 @@ fn recover_interrupted_disable(
     let (backup_state, _) =
         inspect_paths_with_link_parent(&paths.source, &backup, directory, original_parent)?;
     match backup_state {
-        SkillDeploymentState::Missing => {
-            remove_deployment(&paths.destination)?;
-            remove_directory(temporary_root)
-        }
+        SkillDeploymentState::Missing => remove_directory(temporary_root),
         SkillDeploymentState::Linked | SkillDeploymentState::Copied => {
             Err(SkillConfigError::Recovery {
                 message: format!(
@@ -2178,11 +2229,11 @@ fn write_operation_marker(
         return Err(SkillConfigError::io(&staging, source));
     }
     drop(file);
-    if let Err(source) = fs::rename(&staging, &path) {
+    if let Err(error) = rename_path(&staging, &path) {
         let _ = fs::remove_file(&staging);
-        return Err(SkillConfigError::io(&path, source));
+        return Err(error);
     }
-    sync_directory(temporary_root)
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2192,8 +2243,34 @@ fn sync_directory(path: &Path) -> Result<(), SkillConfigError> {
         .map_err(|source| SkillConfigError::io(path, source))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<(), SkillConfigError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| SkillConfigError::io(path, source))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn sync_directory(_path: &Path) -> Result<(), SkillConfigError> {
+    Ok(())
+}
+
+fn rename_path(source: &Path, destination: &Path) -> Result<(), SkillConfigError> {
+    fs::rename(source, destination).map_err(|error| SkillConfigError::io(destination, error))?;
+    if let Some(parent) = source.parent() {
+        sync_directory(parent)?;
+    }
+    if destination.parent() != source.parent() {
+        if let Some(parent) = destination.parent() {
+            sync_directory(parent)?;
+        }
+    }
     Ok(())
 }
 
@@ -2216,16 +2293,20 @@ fn remove_deployment(path: &Path) -> Result<(), SkillConfigError> {
         Err(source) => return Err(SkillConfigError::io(path, source)),
     };
     if metadata.file_type().is_symlink() {
-        remove_directory_symlink(path)
+        remove_directory_symlink(path)?;
     } else if metadata.file_type().is_file() {
-        fs::remove_file(path).map_err(|source| SkillConfigError::io(path, source))
+        fs::remove_file(path).map_err(|source| SkillConfigError::io(path, source))?;
     } else if metadata.file_type().is_dir() {
-        remove_directory(path)
+        return remove_directory(path);
     } else {
-        Err(SkillConfigError::UnsupportedEntry {
+        return Err(SkillConfigError::UnsupportedEntry {
             path: path.to_owned(),
-        })
+        });
     }
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2239,7 +2320,11 @@ fn remove_directory_symlink(path: &Path) -> Result<(), SkillConfigError> {
 }
 
 fn remove_directory(path: &Path) -> Result<(), SkillConfigError> {
-    fs::remove_dir_all(path).map_err(|source| SkillConfigError::io(path, source))
+    fs::remove_dir_all(path).map_err(|source| SkillConfigError::io(path, source))?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2278,6 +2363,14 @@ mod tests {
             .enabled(),
             Some(true)
         );
+        let required = resolve_skill_effective_state(
+            controlled,
+            SkillDiscoveryState::Selected,
+            Some(false),
+            Some(SkillConfigState::Required),
+        );
+        assert_eq!(required.enabled(), Some(true));
+        assert_eq!(required.reason(), Some(SkillControlReason::Required));
 
         let direct = SkillAppContract::host_managed().with_unified_store_discovery();
         assert_eq!(
@@ -2630,6 +2723,43 @@ mod tests {
     }
 
     #[test]
+    fn hermes_required_skill_is_enabled_and_read_only() {
+        let original = b"skills:\n  disabled: [hermes-agent, docs]\n";
+
+        assert_eq!(
+            inspect_skill_config_state(
+                SkillConfigTarget::HermesConfig,
+                Some(original),
+                "hermes-agent"
+            )
+            .unwrap(),
+            SkillConfigState::Required
+        );
+        assert!(matches!(
+            project_skill_config_enabled(
+                SkillConfigTarget::HermesConfig,
+                Some(original),
+                "hermes-agent",
+                false
+            ),
+            Err(SkillConfigError::RequiredSkill {
+                target: SkillConfigTarget::HermesConfig,
+                ..
+            })
+        ));
+        let normalized = project_skill_config_enabled(
+            SkillConfigTarget::HermesConfig,
+            Some(original),
+            "hermes-agent",
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!normalized.contains("hermes-agent"));
+        assert!(normalized.contains("docs"));
+    }
+
+    #[test]
     fn hermes_skill_comments_are_never_silently_rewritten() {
         let original = b"model: local\nskills:\n  # keep this note\n  disabled: [old]\n";
 
@@ -2953,6 +3083,27 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_disable_is_rolled_back_when_retry_enables() {
+        let (_temporary, source, destination) = roots();
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Disable)
+                .unwrap();
+        fs::rename(destination.join("docs"), temporary_root.join("deployment")).unwrap();
+
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert!(destination.join("docs/SKILL.md").is_file());
+        assert!(!temporary_root.exists());
+    }
+
+    #[test]
     fn interrupted_disable_finishes_after_partial_backup_cleanup() {
         let (_temporary, source, destination) = roots();
         apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
@@ -2998,6 +3149,25 @@ mod tests {
             .commit()
             .unwrap();
         assert!(destination.join("other/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn unidentified_temporary_content_is_never_deleted() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Enable).unwrap();
+        fs::write(temporary_root.join(TEMP_MARKER_FILE), b"{").unwrap();
+        fs::write(temporary_root.join("keep.txt"), b"unknown").unwrap();
+
+        assert!(matches!(
+            apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy),
+            Err(SkillConfigError::Recovery { .. })
+        ));
+        assert_eq!(
+            fs::read(temporary_root.join("keep.txt")).unwrap(),
+            b"unknown"
+        );
     }
 
     #[test]
