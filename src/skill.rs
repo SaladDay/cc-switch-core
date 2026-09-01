@@ -2181,7 +2181,28 @@ fn recover_interrupted_enable(
         inspect_paths_with_policy(&paths.source, &paths.destination, directory, copy_policy)?;
     let staged = temporary_root.join("deployment");
     match inspect_paths_with_policy(&paths.source, &staged, directory, copy_policy) {
-        Ok((SkillDeploymentState::Linked | SkillDeploymentState::Copied, _)) => {
+        Ok((SkillDeploymentState::Linked, _)) => {
+            if enabled && destination_state == SkillDeploymentState::Missing {
+                rename_path(&staged, &paths.destination)?;
+            }
+        }
+        Ok((SkillDeploymentState::Copied, expectation)) => {
+            let staged_digest = match expectation {
+                DeploymentExpectation::Copied { digest, .. }
+                | DeploymentExpectation::MatchingCopy { digest } => digest,
+                _ => {
+                    return Err(SkillConfigError::Recovery {
+                        message: format!(
+                            "interrupted Skill enable has an invalid copied stage at {staged:?}"
+                        ),
+                    })
+                }
+            };
+            if tree_digest(&paths.source)? != staged_digest {
+                // The source changed after this copy was staged. Discard the
+                // Core-owned stage so the caller rebuilds it from the current source.
+                return remove_directory(temporary_root);
+            }
             if enabled && destination_state == SkillDeploymentState::Missing {
                 rename_path(&staged, &paths.destination)?;
             }
@@ -3260,6 +3281,34 @@ mod tests {
         assert_eq!(
             inspect_skill_deployment(&source, &destination, "docs").unwrap(),
             SkillDeploymentState::Copied
+        );
+        assert!(!temporary_root.exists());
+    }
+
+    #[test]
+    fn interrupted_copy_is_rebuilt_when_its_source_changes() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Enable).unwrap();
+        copy_tree(
+            &source.join("docs"),
+            &temporary_root.join("deployment"),
+            &mut TreeBudget::default(),
+        )
+        .unwrap();
+        let digest = tree_digest(&source.join("docs")).unwrap();
+        write_managed_copy_marker(&temporary_root.join("deployment"), "docs", &digest).unwrap();
+        fs::write(source.join("docs/SKILL.md"), "# Current Docs\n").unwrap();
+
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("docs/SKILL.md")).unwrap(),
+            "# Current Docs\n"
         );
         assert!(!temporary_root.exists());
     }
