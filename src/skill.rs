@@ -43,6 +43,16 @@ pub enum SkillDiscoveryMode {
     Unified,
 }
 
+/// Who owns the persisted per-application Skill selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkillSelectionMode {
+    /// The host product persists a requested selection for this application.
+    HostManaged,
+    /// Selection is controlled outside the host product.
+    External,
+}
+
 /// Native document containing a supported per-Skill disabled list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,25 +85,25 @@ impl SkillConfigTarget {
 /// Product-neutral Skill behavior declared by an application descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkillAppContract {
-    catalog_column: Option<&'static str>,
+    selection: SkillSelectionMode,
     discovery: SkillDiscoveryMode,
     config_target: Option<SkillConfigTarget>,
 }
 
 impl SkillAppContract {
-    /// Declares an application's stable selection column in the shared catalog.
-    pub const fn with_catalog_column(column: &'static str) -> Self {
+    /// Declares an application whose requested selection is persisted by the host.
+    pub const fn host_managed() -> Self {
         Self {
-            catalog_column: Some(column),
+            selection: SkillSelectionMode::HostManaged,
             discovery: SkillDiscoveryMode::Managed,
             config_target: None,
         }
     }
 
-    /// Declares an application that has no column in the shared catalog.
-    pub const fn without_catalog() -> Self {
+    /// Declares an application whose selection is controlled externally.
+    pub const fn externally_managed() -> Self {
         Self {
-            catalog_column: None,
+            selection: SkillSelectionMode::External,
             discovery: SkillDiscoveryMode::Managed,
             config_target: None,
         }
@@ -111,9 +121,9 @@ impl SkillAppContract {
         self
     }
 
-    /// Returns the shared catalog column used to persist the requested selection.
-    pub const fn catalog_column(self) -> Option<&'static str> {
-        self.catalog_column
+    /// Returns who owns the requested per-application selection.
+    pub const fn selection(self) -> SkillSelectionMode {
+        self.selection
     }
 
     /// Returns how this application discovers installed Skills.
@@ -124,6 +134,119 @@ impl SkillAppContract {
     /// Returns the native document used for per-Skill enablement, when supported.
     pub const fn config_target(self) -> Option<SkillConfigTarget> {
         self.config_target
+    }
+}
+
+/// Why an application's effective Skill state cannot be represented as a normal switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillControlReason {
+    ExternalDiscovery,
+    DirectUnifiedDiscovery,
+    GloballyDisabled,
+    ExternallyDisabled,
+    NativeControlUnavailable,
+}
+
+/// Product-neutral routing decision for one Skill and application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkillRoute {
+    config_target: Option<SkillConfigTarget>,
+    deploy_native: bool,
+}
+
+impl SkillRoute {
+    pub const fn config_target(self) -> Option<SkillConfigTarget> {
+        self.config_target
+    }
+
+    pub const fn deploy_native(self) -> bool {
+        self.deploy_native
+    }
+}
+
+/// Product-neutral effective state for one Skill and application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkillEffectiveState {
+    enabled: Option<bool>,
+    reason: Option<SkillControlReason>,
+}
+
+impl SkillEffectiveState {
+    pub const fn enabled(self) -> Option<bool> {
+        self.enabled
+    }
+
+    pub const fn reason(self) -> Option<SkillControlReason> {
+        self.reason
+    }
+}
+
+/// Resolves whether a host may edit native configuration or deployment state.
+pub fn resolve_skill_route(
+    contract: SkillAppContract,
+    discovery: SkillDiscoveryState,
+) -> Result<SkillRoute, SkillControlReason> {
+    if discovery == SkillDiscoveryState::External {
+        return Err(SkillControlReason::ExternalDiscovery);
+    }
+    if contract.discovery() == SkillDiscoveryMode::Unified
+        && contract.config_target().is_none()
+        && discovery == SkillDiscoveryState::Selected
+    {
+        return Err(SkillControlReason::DirectUnifiedDiscovery);
+    }
+    Ok(SkillRoute {
+        config_target: contract.config_target(),
+        deploy_native: contract.discovery() == SkillDiscoveryMode::Managed
+            || discovery == SkillDiscoveryState::Missing,
+    })
+}
+
+/// Resolves the effective user-level state from observed native inputs.
+pub fn resolve_skill_effective_state(
+    contract: SkillAppContract,
+    discovery: SkillDiscoveryState,
+    native_enabled: Option<bool>,
+    config_state: Option<SkillConfigState>,
+) -> SkillEffectiveState {
+    let constrained = |enabled, reason| SkillEffectiveState {
+        enabled,
+        reason: Some(reason),
+    };
+    if discovery == SkillDiscoveryState::External {
+        return constrained(None, SkillControlReason::ExternalDiscovery);
+    }
+    if contract.discovery() == SkillDiscoveryMode::Unified
+        && contract.config_target().is_none()
+        && discovery == SkillDiscoveryState::Selected
+    {
+        return constrained(None, SkillControlReason::DirectUnifiedDiscovery);
+    }
+    if contract.config_target().is_none() {
+        return SkillEffectiveState {
+            enabled: native_enabled,
+            reason: None,
+        };
+    }
+    match config_state {
+        Some(SkillConfigState::GloballyDisabled) => {
+            constrained(Some(false), SkillControlReason::GloballyDisabled)
+        }
+        Some(SkillConfigState::ExternallyDisabled) => {
+            constrained(None, SkillControlReason::ExternallyDisabled)
+        }
+        Some(state @ (SkillConfigState::Enabled | SkillConfigState::Disabled)) => {
+            let configured = state == SkillConfigState::Enabled;
+            SkillEffectiveState {
+                enabled: if discovery == SkillDiscoveryState::Selected || !configured {
+                    Some(configured)
+                } else {
+                    native_enabled
+                },
+                reason: None,
+            }
+        }
+        None => constrained(None, SkillControlReason::NativeControlUnavailable),
     }
 }
 
@@ -138,6 +261,16 @@ pub enum SkillSyncMethod {
     Symlink,
     /// Materialize a Core-marked, verified copy.
     Copy,
+}
+
+/// Evidence a host may use when classifying an unmarked copied Skill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SkillCopyPolicy {
+    /// Only a Core ownership marker proves that a copied directory is managed.
+    #[default]
+    ManagedOnly,
+    /// An unmarked directory may be treated as managed while it exactly matches the source.
+    AllowMatching,
 }
 
 /// The verified state of one native Skill destination.
@@ -217,6 +350,7 @@ enum DeploymentExpectation {
     Missing,
     Linked { target: PathBuf },
     Copied { digest: String, directory: String },
+    MatchingCopy { digest: String },
 }
 
 #[derive(Debug)]
@@ -398,8 +532,24 @@ pub fn inspect_skill_deployment(
     destination_root: &Path,
     directory: &str,
 ) -> Result<SkillDeploymentState, SkillConfigError> {
+    inspect_skill_deployment_with_policy(
+        source_root,
+        destination_root,
+        directory,
+        SkillCopyPolicy::ManagedOnly,
+    )
+}
+
+/// Inspects a native destination using host-supplied evidence for legacy copies.
+pub fn inspect_skill_deployment_with_policy(
+    source_root: &Path,
+    destination_root: &Path,
+    directory: &str,
+    copy_policy: SkillCopyPolicy,
+) -> Result<SkillDeploymentState, SkillConfigError> {
     let paths = deployment_paths(source_root, destination_root, directory)?;
-    inspect_paths(&paths.source, &paths.destination, directory).map(|(state, _)| state)
+    inspect_paths_with_policy(&paths.source, &paths.destination, directory, copy_policy)
+        .map(|(state, _)| state)
 }
 
 /// Returns whether a native Skill directory is present, without claiming ownership of it.
@@ -434,6 +584,21 @@ pub fn inspect_skill_discovery(
     discovery_root: &Path,
     directory: &str,
 ) -> Result<SkillDiscoveryState, SkillConfigError> {
+    inspect_skill_discovery_with_policy(
+        source_root,
+        discovery_root,
+        directory,
+        SkillCopyPolicy::ManagedOnly,
+    )
+}
+
+/// Inspects direct discovery using host-supplied evidence for legacy copies.
+pub fn inspect_skill_discovery_with_policy(
+    source_root: &Path,
+    discovery_root: &Path,
+    directory: &str,
+    copy_policy: SkillCopyPolicy,
+) -> Result<SkillDiscoveryState, SkillConfigError> {
     validate_skill_directory(directory)?;
     for root in [source_root, discovery_root] {
         if !root.is_absolute() {
@@ -449,7 +614,8 @@ pub fn inspect_skill_discovery(
     if resolve_candidate(source_root)? == resolve_candidate(discovery_root)? {
         return Ok(SkillDiscoveryState::Selected);
     }
-    match inspect_skill_deployment(source_root, discovery_root, directory) {
+    match inspect_skill_deployment_with_policy(source_root, discovery_root, directory, copy_policy)
+    {
         Ok(SkillDeploymentState::Missing) => Ok(SkillDiscoveryState::Missing),
         Ok(SkillDeploymentState::Linked | SkillDeploymentState::Copied) => {
             Ok(SkillDiscoveryState::Selected)
@@ -705,6 +871,12 @@ fn toml_disabled_names(
     let disabled = disabled
         .as_array()
         .ok_or_else(|| invalid_skill_config(target, "'skills.disabled' must be an array"))?;
+    if toml_array_has_comments(disabled) {
+        return Err(invalid_skill_config(
+            target,
+            "'skills.disabled' contains comments that cannot be preserved safely",
+        ));
+    }
     disabled
         .iter()
         .map(|entry| {
@@ -713,6 +885,24 @@ fn toml_disabled_names(
             })
         })
         .collect()
+}
+
+fn toml_array_has_comments(array: &Array) -> bool {
+    toml_raw_has_comment(array.trailing())
+        || array
+            .iter()
+            .any(|value| toml_decor_has_comment(value.decor()))
+}
+
+fn toml_decor_has_comment(decor: &toml_edit::Decor) -> bool {
+    [decor.prefix(), decor.suffix()]
+        .into_iter()
+        .flatten()
+        .any(toml_raw_has_comment)
+}
+
+fn toml_raw_has_comment(raw: &toml_edit::RawString) -> bool {
+    raw.as_str().is_none_or(|raw| raw.contains('#'))
 }
 
 fn project_toml_skill_enabled(
@@ -995,15 +1185,37 @@ pub fn apply_skill_deployment(
     enabled: bool,
     sync_method: SkillSyncMethod,
 ) -> Result<SkillDeploymentReceipt, SkillConfigError> {
+    apply_skill_deployment_with_policy(
+        source_root,
+        destination_root,
+        directory,
+        enabled,
+        sync_method,
+        SkillCopyPolicy::ManagedOnly,
+    )
+}
+
+/// Applies a deployment using host-supplied evidence for legacy copied directories.
+pub fn apply_skill_deployment_with_policy(
+    source_root: &Path,
+    destination_root: &Path,
+    directory: &str,
+    enabled: bool,
+    sync_method: SkillSyncMethod,
+    copy_policy: SkillCopyPolicy,
+) -> Result<SkillDeploymentReceipt, SkillConfigError> {
     let paths = deployment_paths(source_root, destination_root, directory)?;
     recover_interrupted_deployment(&paths, directory)?;
-    let (state, expectation) = inspect_paths(&paths.source, &paths.destination, directory)?;
+    let (state, expectation) =
+        inspect_paths_with_policy(&paths.source, &paths.destination, directory, copy_policy)?;
     if enabled {
         return match state {
             SkillDeploymentState::Linked | SkillDeploymentState::Copied => {
                 Ok(observed_receipt(paths.destination, expectation))
             }
-            SkillDeploymentState::Missing => enable_deployment(paths, directory, sync_method),
+            SkillDeploymentState::Missing => {
+                enable_deployment(paths, directory, sync_method, copy_policy)
+            }
         };
     }
 
@@ -1125,10 +1337,19 @@ fn inspect_paths(
     destination: &Path,
     directory: &str,
 ) -> Result<(SkillDeploymentState, DeploymentExpectation), SkillConfigError> {
+    inspect_paths_with_policy(source, destination, directory, SkillCopyPolicy::ManagedOnly)
+}
+
+fn inspect_paths_with_policy(
+    source: &Path,
+    destination: &Path,
+    directory: &str,
+    copy_policy: SkillCopyPolicy,
+) -> Result<(SkillDeploymentState, DeploymentExpectation), SkillConfigError> {
     let link_parent = destination
         .parent()
         .expect("a deployment has a destination root");
-    inspect_paths_with_link_parent(source, destination, directory, link_parent)
+    inspect_paths_with_link_parent_policy(source, destination, directory, link_parent, copy_policy)
 }
 
 fn inspect_paths_with_link_parent(
@@ -1136,6 +1357,22 @@ fn inspect_paths_with_link_parent(
     destination: &Path,
     directory: &str,
     link_parent: &Path,
+) -> Result<(SkillDeploymentState, DeploymentExpectation), SkillConfigError> {
+    inspect_paths_with_link_parent_policy(
+        source,
+        destination,
+        directory,
+        link_parent,
+        SkillCopyPolicy::ManagedOnly,
+    )
+}
+
+fn inspect_paths_with_link_parent_policy(
+    source: &Path,
+    destination: &Path,
+    directory: &str,
+    link_parent: &Path,
+    copy_policy: SkillCopyPolicy,
 ) -> Result<(SkillDeploymentState, DeploymentExpectation), SkillConfigError> {
     let metadata = match fs::symlink_metadata(destination) {
         Ok(metadata) => metadata,
@@ -1179,6 +1416,18 @@ fn inspect_paths_with_link_parent(
                 },
             ));
         }
+        if copy_policy == SkillCopyPolicy::AllowMatching {
+            let source_digest = tree_digest(source)?;
+            let destination_digest = tree_digest(destination)?;
+            if source_digest == destination_digest {
+                return Ok((
+                    SkillDeploymentState::Copied,
+                    DeploymentExpectation::MatchingCopy {
+                        digest: destination_digest,
+                    },
+                ));
+            }
+        }
     }
 
     Err(SkillConfigError::Conflict {
@@ -1190,6 +1439,7 @@ fn enable_deployment(
     paths: DeploymentPaths,
     directory: &str,
     sync_method: SkillSyncMethod,
+    copy_policy: SkillCopyPolicy,
 ) -> Result<SkillDeploymentReceipt, SkillConfigError> {
     let parent = paths
         .destination
@@ -1214,7 +1464,12 @@ fn enable_deployment(
                 return Ok(receipt);
             }
             Err(error) if matches!(sync_method, SkillSyncMethod::Symlink) => return Err(error),
-            Err(_) => match inspect_paths(&paths.source, &paths.destination, directory)? {
+            Err(_) => match inspect_paths_with_policy(
+                &paths.source,
+                &paths.destination,
+                directory,
+                copy_policy,
+            )? {
                 (SkillDeploymentState::Missing, _) => {}
                 (_, expectation) => {
                     return Ok(observed_receipt(paths.destination, expectation));
@@ -1376,6 +1631,12 @@ fn require_expectation(
             Ok(metadata) if metadata.file_type().is_dir() => {
                 managed_copy_matches(path, directory, digest)?
             }
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(source) => return Err(SkillConfigError::io(path, source)),
+        },
+        DeploymentExpectation::MatchingCopy { digest } => match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_dir() => tree_digest(path)? == *digest,
             Ok(_) => false,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(source) => return Err(SkillConfigError::io(path, source)),
@@ -1983,6 +2244,35 @@ mod tests {
     }
 
     #[test]
+    fn contracts_resolve_routes_and_effective_state() {
+        let controlled = SkillAppContract::host_managed()
+            .with_unified_store_discovery()
+            .with_config_target(SkillConfigTarget::GeminiSettings);
+        let route = resolve_skill_route(controlled, SkillDiscoveryState::Selected).unwrap();
+        assert_eq!(
+            route.config_target(),
+            Some(SkillConfigTarget::GeminiSettings)
+        );
+        assert!(!route.deploy_native());
+        assert_eq!(
+            resolve_skill_effective_state(
+                controlled,
+                SkillDiscoveryState::Selected,
+                Some(false),
+                Some(SkillConfigState::Enabled)
+            )
+            .enabled(),
+            Some(true)
+        );
+
+        let direct = SkillAppContract::host_managed().with_unified_store_discovery();
+        assert_eq!(
+            resolve_skill_route(direct, SkillDiscoveryState::Selected),
+            Err(SkillControlReason::DirectUnifiedDiscovery)
+        );
+    }
+
+    #[test]
     fn directory_names_are_single_normalized_components() {
         validate_skill_directory("docs").unwrap();
         for invalid in [
@@ -2232,6 +2522,25 @@ mod tests {
     }
 
     #[test]
+    fn grok_disabled_list_comments_are_read_only() {
+        let original = b"[skills]\ndisabled = [\n  # team policy\n  \"Docs\",\n  \"Other\",\n]\n";
+
+        assert!(matches!(
+            inspect_skill_config_state(SkillConfigTarget::GrokConfig, Some(original), "Docs"),
+            Err(SkillConfigError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            project_skill_config_enabled(
+                SkillConfigTarget::GrokConfig,
+                Some(original),
+                "Docs",
+                true
+            ),
+            Err(SkillConfigError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
     fn hermes_disabled_names_preserve_unrelated_yaml_and_platform_controls() {
         let original = b"# keep this comment\nmodel:\n  default: local\nskills:\n  config:\n    token: keep\n  disabled: [old]\n  platform_disabled:\n    telegram: [mobile]\n";
         let disabled = project_skill_config_enabled(
@@ -2458,6 +2767,42 @@ mod tests {
             Err(SkillConfigError::Conflict { .. })
         ));
         assert!(destination.join("docs/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn host_evidence_can_manage_an_exact_legacy_copy() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        copy_tree(
+            &source.join("docs"),
+            &destination.join("docs"),
+            &mut TreeBudget::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            inspect_skill_deployment_with_policy(
+                &source,
+                &destination,
+                "docs",
+                SkillCopyPolicy::AllowMatching
+            )
+            .unwrap(),
+            SkillDeploymentState::Copied
+        );
+        apply_skill_deployment_with_policy(
+            &source,
+            &destination,
+            "docs",
+            false,
+            SkillSyncMethod::Copy,
+            SkillCopyPolicy::AllowMatching,
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
+        assert!(!destination.join("docs").exists());
+        assert!(source.join("docs/SKILL.md").exists());
     }
 
     #[test]

@@ -221,22 +221,21 @@ const PROVIDER_LIVE: &[AppCapability] = &[
 
 static BUILTIN_APP_REGISTRY: BuiltinAppRegistry = BuiltinAppRegistry { _private: () };
 
-static CLAUDE_SKILLS: SkillAppContract = SkillAppContract::with_catalog_column("enabled_claude");
+static CLAUDE_SKILLS: SkillAppContract = SkillAppContract::host_managed();
 static CODEX_SKILLS: SkillAppContract =
-    SkillAppContract::with_catalog_column("enabled_codex").with_unified_store_discovery();
-static GEMINI_SKILLS: SkillAppContract = SkillAppContract::with_catalog_column("enabled_gemini")
+    SkillAppContract::host_managed().with_unified_store_discovery();
+static GEMINI_SKILLS: SkillAppContract = SkillAppContract::host_managed()
     .with_unified_store_discovery()
     .with_config_target(SkillConfigTarget::GeminiSettings);
-static GROKBUILD_SKILLS: SkillAppContract =
-    SkillAppContract::with_catalog_column("enabled_grokbuild")
-        .with_unified_store_discovery()
-        .with_config_target(SkillConfigTarget::GrokConfig);
+static GROKBUILD_SKILLS: SkillAppContract = SkillAppContract::host_managed()
+    .with_unified_store_discovery()
+    .with_config_target(SkillConfigTarget::GrokConfig);
 static OPENCODE_SKILLS: SkillAppContract =
-    SkillAppContract::with_catalog_column("enabled_opencode").with_unified_store_discovery();
-static HERMES_SKILLS: SkillAppContract = SkillAppContract::with_catalog_column("enabled_hermes")
-    .with_config_target(SkillConfigTarget::HermesConfig);
+    SkillAppContract::host_managed().with_unified_store_discovery();
+static HERMES_SKILLS: SkillAppContract =
+    SkillAppContract::host_managed().with_config_target(SkillConfigTarget::HermesConfig);
 static PI_SKILLS: SkillAppContract =
-    SkillAppContract::without_catalog().with_unified_store_discovery();
+    SkillAppContract::externally_managed().with_unified_store_discovery();
 
 static CLAUDE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::Claude,
@@ -444,7 +443,6 @@ mod tests {
 
     #[test]
     fn skill_capabilities_have_one_registry_owned_contract() {
-        let mut columns = HashSet::new();
         let mut unified_discovery = Vec::new();
         for descriptor in builtin_app_registry().descriptors() {
             assert_eq!(
@@ -454,21 +452,19 @@ mod tests {
                 descriptor.id()
             );
             if let Some(contract) = descriptor.skill_contract() {
-                if let Some(column) = contract.catalog_column() {
-                    assert!(column.starts_with("enabled_"));
-                    assert!(columns.insert(column), "duplicate Skill column: {column}");
-                }
                 if contract.discovery() == crate::SkillDiscoveryMode::Unified {
                     unified_discovery.push(descriptor.id());
                 }
             }
         }
-        assert!(builtin_app_registry()
-            .for_app(&AppType::Pi)
-            .skill_contract()
-            .unwrap()
-            .catalog_column()
-            .is_none());
+        assert_eq!(
+            builtin_app_registry()
+                .for_app(&AppType::Pi)
+                .skill_contract()
+                .unwrap()
+                .selection(),
+            crate::SkillSelectionMode::External
+        );
         assert_eq!(
             unified_discovery,
             ["codex", "gemini", "grokbuild", "opencode", "pi"]
