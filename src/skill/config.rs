@@ -90,6 +90,7 @@ fn parse_gemini(
     target: SkillConfigTarget,
     contents: Option<&[u8]>,
 ) -> Result<NativeSkillControls, SkillConfigReadError> {
+    validate_gemini_consumed_fields(target, contents)?;
     let root = parse_json(target, contents)?;
     let Some(skills) = root.get("skills") else {
         return Ok(NativeSkillControls::Gemini {
@@ -114,6 +115,22 @@ fn parse_gemini(
         globally_enabled,
         disabled,
     })
+}
+
+fn validate_gemini_consumed_fields(
+    target: SkillConfigTarget,
+    contents: Option<&[u8]>,
+) -> Result<(), SkillConfigReadError> {
+    let Some(contents) = contents.filter(|contents| !contents.is_empty()) else {
+        return Ok(());
+    };
+    let text =
+        std::str::from_utf8(contents).map_err(|_| invalid(target, "document is not UTF-8"))?;
+    json5_patch::validate_unique_object_paths(
+        text,
+        &[&["skills", "enabled"], &["skills", "disabled"]],
+    )
+    .map_err(|message| invalid(target, &message))
 }
 
 fn parse_json(
@@ -347,6 +364,7 @@ fn project_gemini(
     name: &str,
     enabled: bool,
 ) -> Result<Option<String>, SkillConfigWriteError> {
+    validate_gemini_consumed_fields(target, contents).map_err(SkillConfigWriteError::from_read)?;
     let original = optional_utf8(target, contents)?;
     if let Some(original) = original.filter(|original| !original.is_empty()) {
         if json5_patch::object_path_has_comments(original, &["skills", "disabled"])
@@ -785,6 +803,22 @@ mod tests {
     #[test]
     fn malformed_native_controls_are_not_guessed() {
         assert!(inspect(SkillConfigTarget::GeminiSettings, Some(b"[]"), "demo").is_err());
+        let duplicate_enabled = b"{ skills: { enabled: false, enabled: true, disabled: [] } }";
+        assert!(inspect(
+            SkillConfigTarget::GeminiSettings,
+            Some(duplicate_enabled),
+            "demo"
+        )
+        .is_err());
+        assert!(project_native_control(
+            SkillConfigTarget::GeminiSettings,
+            Some(duplicate_enabled),
+            None,
+            "demo",
+            "demo",
+            false,
+        )
+        .is_err());
         assert!(inspect(SkillConfigTarget::GrokConfig, Some(b"skills = 1"), "demo").is_err());
         assert!(inspect(SkillConfigTarget::HermesConfig, Some(b"skills: []"), "demo").is_err());
     }

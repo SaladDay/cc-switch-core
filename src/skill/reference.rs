@@ -14,7 +14,7 @@ use crate::{fs::sync_directory, AppType};
 
 use super::read::{resolve_root, roots_overlap};
 
-const OWNER_VERSION: u8 = 1;
+const OWNER_VERSION: u8 = 2;
 const MAX_OWNER_BYTES: u64 = 4096;
 static OWNER_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -84,6 +84,7 @@ impl SkillReferencePlan {
 struct ReferencePaths {
     source: PathBuf,
     destination: PathBuf,
+    destination_fingerprint: String,
     owner: PathBuf,
 }
 
@@ -94,18 +95,20 @@ struct ReferenceOwner {
     skill_id: String,
     app: String,
     directory: String,
+    destination: String,
     target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_target: Option<String>,
 }
 
 impl ReferenceOwner {
-    fn stable(plan: &SkillReferencePlan, target: String) -> Self {
+    fn stable(plan: &SkillReferencePlan, destination: String, target: String) -> Self {
         Self {
             version: OWNER_VERSION,
             skill_id: plan.skill_id.clone(),
             app: plan.app.as_str().to_owned(),
             directory: plan.directory.clone(),
+            destination,
             target,
             pending_target: None,
         }
@@ -167,12 +170,23 @@ pub(super) fn inspect_skill_reference(
         directory,
         true,
     );
+    let destination_fingerprint = match destination_fingerprint(destination_root, directory) {
+        Ok(fingerprint) => fingerprint,
+        Err(_) => return SkillReferenceObservation::Unreadable,
+    };
     let paths = ReferencePaths {
         source: source.to_owned(),
         destination: destination_root.join(directory),
-        owner: owner_path(state_root, app, skill_id, directory),
+        owner: owner_path(
+            state_root,
+            app,
+            skill_id,
+            directory,
+            &destination_fingerprint,
+        ),
+        destination_fingerprint,
     };
-    let owner = match read_owner(&paths.owner, &plan) {
+    let owner = match read_owner(&paths.owner, &plan, &paths.destination_fingerprint) {
         Ok(owner) => owner,
         Err(SkillReferenceError::Io { .. }) => return SkillReferenceObservation::Unreadable,
         Err(_) => return SkillReferenceObservation::Conflict,
@@ -221,10 +235,13 @@ pub struct SkillReferenceReceipt {
 impl SkillReferenceReceipt {
     pub fn verify(&self) -> Result<(), SkillReferenceError> {
         if self.plan.enabled {
-            let owner = read_owner(&self.paths.owner, &self.plan)?.ok_or_else(|| {
-                SkillReferenceError::Conflict {
-                    path: self.paths.owner.clone(),
-                }
+            let owner = read_owner(
+                &self.paths.owner,
+                &self.plan,
+                &self.paths.destination_fingerprint,
+            )?
+            .ok_or_else(|| SkillReferenceError::Conflict {
+                path: self.paths.owner.clone(),
             })?;
             if !owner.accepts(&self.target_fingerprint) {
                 return Err(SkillReferenceError::Conflict {
@@ -242,7 +259,11 @@ impl SkillReferenceReceipt {
         if self.plan.enabled {
             write_owner(
                 &self.paths.owner,
-                &ReferenceOwner::stable(&self.plan, self.target_fingerprint),
+                &ReferenceOwner::stable(
+                    &self.plan,
+                    self.paths.destination_fingerprint,
+                    self.target_fingerprint,
+                ),
             )
         } else {
             remove_owner_if_present(&self.paths.owner)
@@ -263,7 +284,10 @@ impl SkillReferenceReceipt {
 ///
 /// Core never adopts or removes an unowned path. On Unix it creates a
 /// symbolic link; on Windows it creates an NTFS junction, avoiding recursive
-/// directory copies and deletes entirely.
+/// directory copies and deletes entirely. The host must first create
+/// [`SkillReferencePlan::destination_root`] and
+/// [`SkillReferencePlan::state_root`] as real directories while holding the
+/// shared live-config lock; Core deliberately does not create host-owned roots.
 pub fn apply_skill_reference(
     plan: &SkillReferencePlan,
 ) -> Result<SkillReferenceReceipt, SkillReferenceError> {
@@ -308,13 +332,21 @@ fn prepare_paths(plan: &SkillReferencePlan) -> Result<ReferencePaths, SkillRefer
     validate_root_pair(&plan.destination_root, &plan.state_root)?;
     require_real_directory(&plan.destination_root)?;
     require_real_directory(&plan.state_root)?;
-    let owner = owner_path(&plan.state_root, &plan.app, &plan.skill_id, &plan.directory);
+    let destination_fingerprint = destination_fingerprint(&plan.destination_root, &plan.directory)?;
+    let owner = owner_path(
+        &plan.state_root,
+        &plan.app,
+        &plan.skill_id,
+        &plan.directory,
+        &destination_fingerprint,
+    );
     validate_root_pair(&plan.source_root, &plan.destination_root)?;
     validate_root_pair(&plan.source_root, &plan.state_root)?;
     validate_root_pair(&plan.destination_root, &plan.state_root)?;
     Ok(ReferencePaths {
         source,
         destination: plan.destination_root.join(&plan.directory),
+        destination_fingerprint,
         owner,
     })
 }
@@ -366,7 +398,7 @@ fn manageable_state(
     plan: &SkillReferencePlan,
     paths: &ReferencePaths,
 ) -> Result<ManagedState, SkillReferenceError> {
-    let owner = read_owner(&paths.owner, plan)?;
+    let owner = read_owner(&paths.owner, plan, &paths.destination_fingerprint)?;
     match (owner, inspect_destination(&paths.destination)?) {
         (None, DestinationState::Missing) => Ok(ManagedState::Missing { owner: None }),
         (None, _) => Err(SkillReferenceError::Unowned {
@@ -409,7 +441,11 @@ fn apply_enabled(
         ManagedState::Missing { owner: None } => {
             publish_owner(
                 &paths.owner,
-                &ReferenceOwner::stable(plan, target_fingerprint.to_owned()),
+                &ReferenceOwner::stable(
+                    plan,
+                    paths.destination_fingerprint.clone(),
+                    target_fingerprint.to_owned(),
+                ),
             )?;
             create_reference(target, &paths.destination)
         }
@@ -481,7 +517,12 @@ fn restore_previous(
                     })
                 }
             }
-            restore_owner(&paths.owner, plan, owner.as_ref())
+            restore_owner(
+                &paths.owner,
+                plan,
+                &paths.destination_fingerprint,
+                owner.as_ref(),
+            )
         }
         ManagedState::Reference {
             owner,
@@ -507,7 +548,12 @@ fn restore_previous(
                     })
                 }
             }
-            restore_owner(&paths.owner, plan, Some(owner))
+            restore_owner(
+                &paths.owner,
+                plan,
+                &paths.destination_fingerprint,
+                Some(owner),
+            )
         }
     }
 }
@@ -515,32 +561,52 @@ fn restore_previous(
 fn restore_owner(
     path: &Path,
     plan: &SkillReferencePlan,
+    destination_fingerprint: &str,
     owner: Option<&ReferenceOwner>,
 ) -> Result<(), SkillReferenceError> {
     match owner {
         Some(owner) => write_owner(path, owner),
-        None => match read_owner(path, plan)? {
+        None => match read_owner(path, plan, destination_fingerprint)? {
             Some(_) => remove_owner_if_present(path),
             None => Ok(()),
         },
     }
 }
 
-fn owner_path(state_root: &Path, app: &AppType, skill_id: &str, directory: &str) -> PathBuf {
+fn owner_path(
+    state_root: &Path,
+    app: &AppType,
+    skill_id: &str,
+    directory: &str,
+    destination_fingerprint: &str,
+) -> PathBuf {
     let mut hasher = Sha256::new();
-    hasher.update(b"cc-switch-skill-reference-v1\0");
+    hasher.update(b"cc-switch-skill-reference-v2\0");
     hasher.update(app.as_str().as_bytes());
     hasher.update(b"\0");
     hasher.update(skill_id.as_bytes());
     hasher.update(b"\0");
     hasher.update(directory.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(destination_fingerprint.as_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     state_root.join(format!("{}.json", encode_digest(digest)))
+}
+
+fn destination_fingerprint(
+    destination_root: &Path,
+    directory: &str,
+) -> Result<String, SkillReferenceError> {
+    let root = resolve_root(destination_root).map_err(|error| SkillReferenceError::Root {
+        message: error.to_string(),
+    })?;
+    Ok(path_fingerprint(&root.join(directory)))
 }
 
 fn read_owner(
     path: &Path,
     plan: &SkillReferencePlan,
+    destination_fingerprint: &str,
 ) -> Result<Option<ReferenceOwner>, SkillReferenceError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => metadata,
@@ -570,6 +636,8 @@ fn read_owner(
         || owner.skill_id != plan.skill_id
         || owner.app != plan.app.as_str()
         || owner.directory != plan.directory
+        || owner.destination != destination_fingerprint
+        || !valid_digest(&owner.destination)
         || !valid_digest(&owner.target)
         || owner
             .pending_target
@@ -1010,6 +1078,30 @@ mod tests {
         assert!(destination.join("demo/SKILL.md").is_file());
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ownership_does_not_transfer_between_native_roots() {
+        let (temporary, source, destination_a, state) = roots();
+        let enabled_a = plan(&source, &destination_a, &state, true);
+        apply_skill_reference(&enabled_a).unwrap().commit().unwrap();
+
+        let destination_b = temporary.path().join("destination-b");
+        fs::create_dir(&destination_b).unwrap();
+        let target = fs::canonicalize(source.join("demo")).unwrap();
+        create_reference(&target, &destination_b.join("demo")).unwrap();
+        let disabled_b = plan(&source, &destination_b, &state, false);
+
+        assert!(matches!(
+            apply_skill_reference(&disabled_b),
+            Err(SkillReferenceError::Unowned { .. })
+        ));
+        assert!(destination_b.join("demo/SKILL.md").is_file());
+        assert_ne!(
+            prepare_paths(&enabled_a).unwrap().owner,
+            prepare_paths(&disabled_b).unwrap().owner
+        );
+    }
+
     #[test]
     fn an_owner_without_a_link_converges_from_committed_selection() {
         let (_temporary, source, destination, state) = roots();
@@ -1018,7 +1110,11 @@ mod tests {
         let target = fs::canonicalize(source.join("demo")).unwrap();
         publish_owner(
             &paths.owner,
-            &ReferenceOwner::stable(&enabled, path_fingerprint(&target)),
+            &ReferenceOwner::stable(
+                &enabled,
+                paths.destination_fingerprint.clone(),
+                path_fingerprint(&target),
+            ),
         )
         .unwrap();
 
@@ -1039,7 +1135,11 @@ mod tests {
         let target = fs::canonicalize(source.join("demo")).unwrap();
         publish_owner(
             &paths.owner,
-            &ReferenceOwner::stable(&enabled, path_fingerprint(&target)),
+            &ReferenceOwner::stable(
+                &enabled,
+                paths.destination_fingerprint.clone(),
+                path_fingerprint(&target),
+            ),
         )
         .unwrap();
         fs::create_dir(&paths.destination).unwrap();
