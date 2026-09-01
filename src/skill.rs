@@ -2054,6 +2054,9 @@ fn recover_interrupted_deployment(
         let marker = match read_operation_marker(&temporary_root) {
             Ok(Some(marker)) => marker,
             Ok(None) if tagged_for_directory => {
+                if remove_empty_interrupted_operation(&temporary_root)? {
+                    continue;
+                }
                 recover_unidentified_operation(&temporary_root, directory, "missing or invalid")?;
                 continue;
             }
@@ -2101,6 +2104,28 @@ fn recover_interrupted_deployment(
         }
     }
     Ok(())
+}
+
+fn remove_empty_interrupted_operation(path: &Path) -> Result<bool, SkillConfigError> {
+    let mut entries = fs::read_dir(path).map_err(|source| SkillConfigError::io(path, source))?;
+    match entries.next() {
+        Some(Ok(_)) => return Ok(false),
+        Some(Err(source)) => return Err(SkillConfigError::io(path, source)),
+        None => {}
+    }
+    match fs::remove_dir(path) {
+        Ok(()) => {
+            #[cfg(not(windows))]
+            if let Some(parent) = path.parent() {
+                sync_directory(parent)
+                    .map_err(|error| post_visible_error("empty operation cleanup", error))?;
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(false),
+        Err(source) => Err(SkillConfigError::io(path, source)),
+    }
 }
 
 fn recover_unidentified_operation(
@@ -3242,6 +3267,25 @@ mod tests {
             inspect_skill_deployment(&source, &destination, "docs").unwrap(),
             SkillDeploymentState::Copied
         );
+        assert!(!temporary_root.exists());
+    }
+
+    #[test]
+    fn empty_tagged_operation_is_removed_and_retried() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        let temporary_root = destination.join(format!(
+            "{TEMP_DIRECTORY_PREFIX}{}.crash",
+            operation_directory_tag("docs")
+        ));
+        fs::create_dir(&temporary_root).unwrap();
+
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert!(destination.join("docs/SKILL.md").is_file());
         assert!(!temporary_root.exists());
     }
 
