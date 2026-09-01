@@ -30,6 +30,9 @@ const MAX_HERMES_PLATFORM_BYTES: usize = 128;
 ///
 /// Path overrides and platform-specific resolution remain host-owned. Core
 /// owns the common observation and state policy once those paths are supplied.
+/// Observation accepts roots that do not exist yet. Before executing a write,
+/// the host must create the selected native root and Core state root as real
+/// directories while holding the shared live-config lock.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SkillAppRuntime {
     app: AppType,
@@ -155,6 +158,10 @@ impl fmt::Debug for SkillAppRuntime {
 }
 
 /// Complete read-only runtime context for a requested set of applications.
+///
+/// Missing roots are valid for read-only snapshots. Hosts must create the
+/// native and state roots before applying a prepared reference plan; Core does
+/// not create host-owned directory trees.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SkillRuntime {
     source_root: PathBuf,

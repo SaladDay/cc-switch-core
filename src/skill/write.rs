@@ -447,8 +447,9 @@ impl<E: Error + 'static> Error for SkillLiveRollbackError<E> {}
 /// reject duplicate path and native-control identities before writing.
 ///
 /// The host owns the transaction boundary. It should begin its shared-catalog
-/// write transaction, take `shared_live_config_lock_path`, then re-read all
-/// inputs, prepare and apply this plan. While still holding both, it verifies
+/// write transaction, take `shared_live_config_lock_path`, create any missing
+/// native/state roots as real directories, then re-read all inputs, prepare
+/// and apply this plan. While still holding both, it verifies
 /// `catalog_guard`, compare-and-swaps `catalog_change` when present, and
 /// commits. If the commit outcome is uncertain, it re-reads the row and uses
 /// [`SkillSwitchPlan::decide_catalog`] before releasing the live lock. Startup

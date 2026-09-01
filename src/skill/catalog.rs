@@ -153,15 +153,36 @@ fn validate_directory(directory: &str) -> Result<(), SkillCatalogEntryError> {
     if !valid_component
         || directory.trim() != directory
         || directory.starts_with('.')
-        || directory.contains(['/', '\\'])
+        || directory.ends_with('.')
+        || directory.contains(['/', '\\', '<', '>', ':', '"', '|', '?', '*'])
         || directory.len() > MAX_SKILL_DIRECTORY_BYTES
         || directory.chars().any(char::is_control)
+        || is_windows_reserved_directory(directory)
     {
         return Err(SkillCatalogEntryError::InvalidDirectory {
             directory: directory.to_owned(),
         });
     }
     Ok(())
+}
+
+fn is_windows_reserved_directory(directory: &str) -> bool {
+    let stem = directory.split('.').next().unwrap_or(directory);
+    let upper = stem.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    ["COM", "LPT"].into_iter().any(|prefix| {
+        upper.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
 }
 
 /// A malformed shared-catalog row rejected before any path is joined.
@@ -254,7 +275,22 @@ mod tests {
 
     #[test]
     fn unsafe_directories_are_rejected_before_path_use() {
-        for directory in ["", ".hidden", "..", "../escape", "a/b", "a\\b", " demo"] {
+        for directory in [
+            "",
+            ".hidden",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            " demo",
+            "demo.",
+            "name:stream",
+            "bad?name",
+            "CON",
+            "nul.txt",
+            "COM1",
+            "lpt³.log",
+        ] {
             assert!(matches!(
                 SkillCatalogEntry::try_new("id", "name", None, directory, selections()),
                 Err(SkillCatalogEntryError::InvalidDirectory { .. })

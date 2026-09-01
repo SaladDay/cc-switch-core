@@ -29,6 +29,18 @@ pub(crate) fn object_path_has_comments(source: &str, path: &[&str]) -> Result<bo
     Ok(find_path(&document.value, path)?.is_some_and(value_has_comments))
 }
 
+pub(crate) fn validate_unique_object_paths(source: &str, paths: &[&[&str]]) -> Result<(), String> {
+    let document: JSONText =
+        parse_json5(source).map_err(|_| "round-trip JSON5 could not be parsed".to_owned())?;
+    for path in paths {
+        if path.is_empty() {
+            return Err("JSON5 object path is empty".to_owned());
+        }
+        let _ = find_path(&document.value, path)?;
+    }
+    Ok(())
+}
+
 fn find_path<'a>(node: &'a JSONValue, path: &[&str]) -> Result<Option<&'a JSONValue>, String> {
     let JSONValue::JSONObject {
         key_value_pairs, ..
@@ -326,5 +338,15 @@ mod tests {
         assert!(
             !object_path_has_comments("{ // keep\n skills: {} }", &["skills", "disabled"]).unwrap()
         );
+    }
+
+    #[test]
+    fn consumed_paths_must_be_unique() {
+        let source = "{ skills: { enabled: false, enabled: true, disabled: [] } }";
+        assert!(validate_unique_object_paths(
+            source,
+            &[&["skills", "enabled"], &["skills", "disabled"],],
+        )
+        .is_err());
     }
 }
