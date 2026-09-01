@@ -218,17 +218,9 @@ fn closing_whitespace(value: &str) -> String {
 }
 
 fn json5_key(key: &str) -> JSONValue {
-    let mut characters = key.chars();
-    let identifier = characters
-        .next()
-        .is_some_and(|first| matches!(first, 'a'..='z' | 'A'..='Z' | '_' | '$'))
-        && characters
-            .all(|character| matches!(character, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '$'));
-    if identifier {
-        JSONValue::Identifier(key.to_owned())
-    } else {
-        JSONValue::DoubleQuotedString(key.to_owned())
-    }
+    // Inserted keys must also be valid in strict JSON/JSONC documents. Existing
+    // JSON5 spelling is preserved because only newly-created keys pass here.
+    JSONValue::DoubleQuotedString(key.to_owned())
 }
 
 fn contains_comment(source: &str) -> bool {
@@ -315,6 +307,16 @@ mod tests {
     fn escaped_duplicate_keys_are_rejected() {
         let source = r#"{ skills: {}, "sk\u0069lls": {} }"#;
         assert!(replace_object_path_value(source, &["skills", "disabled"], &json!([])).is_err());
+    }
+
+    #[test]
+    fn inserted_paths_remain_strict_json() {
+        let source = r#"{"theme":"dark"}"#;
+        let output =
+            replace_object_path_value(source, &["skills", "disabled"], &json!(["demo"])).unwrap();
+
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["skills"]["disabled"], json!(["demo"]));
     }
 
     #[test]

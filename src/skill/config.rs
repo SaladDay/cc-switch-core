@@ -519,7 +519,7 @@ fn project_hermes(
     if yaml_patch::has_duplicate_top_level_key(original, "skills") {
         return Err(write_invalid(target, "contains duplicate 'skills' fields"));
     }
-    let mut root = parse_yaml(target, contents).map_err(SkillConfigWriteError::from_read)?;
+    let root = parse_yaml(target, contents).map_err(SkillConfigWriteError::from_read)?;
     let controls =
         parse_hermes(target, contents, platform).map_err(SkillConfigWriteError::from_read)?;
     if enabled && controls.control_for(name, directory) == NativeSkillControl::ExternallyDisabled {
@@ -562,31 +562,11 @@ fn project_hermes(
     }
 
     let next = changed_names(disabled, name, enabled, |left, right| left == right);
-    let root = root
-        .as_mapping_mut()
-        .expect("validated Hermes config has a mapping root");
-    if !root
-        .get(&skills_key)
-        .is_some_and(serde_yaml::Value::is_mapping)
-    {
-        root.insert(
-            skills_key.clone(),
-            serde_yaml::Value::Mapping(Default::default()),
-        );
-    }
-    let skills = root
-        .get_mut(&skills_key)
-        .and_then(serde_yaml::Value::as_mapping_mut)
-        .expect("projected Hermes skills are a mapping");
-    skills.insert(
-        disabled_key,
-        serde_yaml::Value::Sequence(next.into_iter().map(serde_yaml::Value::String).collect()),
-    );
-    let projected = yaml_patch::replace_top_level_section(
+    let projected = yaml_patch::replace_top_level_string_sequence(
         original,
         "skills",
-        root.get(&skills_key)
-            .expect("projected Hermes config contains skills"),
+        "disabled",
+        &next,
         section_existed,
     )
     .map_err(|message| write_invalid(target, &message))?;
@@ -836,6 +816,24 @@ mod tests {
     }
 
     #[test]
+    fn gemini_projection_keeps_strict_json_strict() {
+        let output = project_native_control(
+            SkillConfigTarget::GeminiSettings,
+            Some(br#"{"theme":"dark"}"#),
+            None,
+            "demo",
+            "demo",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["theme"], "dark");
+        assert_eq!(parsed["skills"]["disabled"][0], "demo");
+    }
+
+    #[test]
     fn projection_is_idempotent_and_preserves_unrelated_toml() {
         let input = b"theme = 'dark'\n[skills]\ndisabled = ['old']\n";
         assert_eq!(
@@ -901,6 +899,15 @@ mod tests {
             "old",
             "old",
             true,
+        )
+        .is_err());
+        assert!(project_native_control(
+            SkillConfigTarget::HermesConfig,
+            Some(b"skills: {disabled: [], custom: \"001\"}\n...\n"),
+            None,
+            "old",
+            "old",
+            false,
         )
         .is_err());
         assert!(matches!(

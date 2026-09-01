@@ -185,6 +185,11 @@ pub(super) fn inspect_skill_reference(
         (None, DestinationState::Missing) => SkillReferenceObservation::Missing,
         (None, _) => SkillReferenceObservation::Unmanaged,
         (Some(_), DestinationState::Missing) => SkillReferenceObservation::ManagedMissing,
+        (Some(_), DestinationState::Other) => match is_incomplete_reference(&paths.destination) {
+            Ok(true) => SkillReferenceObservation::ManagedMissing,
+            Ok(false) => SkillReferenceObservation::Conflict,
+            Err(_) => SkillReferenceObservation::Unreadable,
+        },
         (
             Some(owner),
             DestinationState::Reference {
@@ -370,6 +375,10 @@ fn manageable_state(
         (Some(owner), DestinationState::Missing) => {
             Ok(ManagedState::Missing { owner: Some(owner) })
         }
+        (Some(owner), DestinationState::Other) if is_incomplete_reference(&paths.destination)? => {
+            remove_incomplete_reference(&paths.destination)?;
+            Ok(ManagedState::Missing { owner: Some(owner) })
+        }
         (
             Some(owner),
             DestinationState::Reference {
@@ -462,6 +471,9 @@ fn restore_previous(
                     if fingerprint == applied_target =>
                 {
                     remove_reference(&paths.destination, applied_target)?;
+                }
+                DestinationState::Other if is_incomplete_reference(&paths.destination)? => {
+                    remove_incomplete_reference(&paths.destination)?;
                 }
                 _ => {
                     return Err(SkillReferenceError::Conflict {
@@ -679,7 +691,11 @@ fn inspect_destination(path: &Path) -> Result<DestinationState, SkillReferenceEr
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound && declared_target.is_absolute() =>
         {
-            (declared_target, false)
+            let target =
+                resolve_root(&declared_target).map_err(|error| SkillReferenceError::Root {
+                    message: error.to_string(),
+                })?;
+            (target, false)
         }
         Err(source) => return Err(SkillReferenceError::io(path, source)),
     };
@@ -717,8 +733,19 @@ fn is_reference(_path: &Path, metadata: &fs::Metadata) -> Result<bool, SkillRefe
 }
 
 #[cfg(windows)]
-fn is_reference(path: &Path, _metadata: &fs::Metadata) -> Result<bool, SkillReferenceError> {
-    junction::exists(path).map_err(|source| SkillReferenceError::io(path, source))
+fn is_reference(path: &Path, metadata: &fs::Metadata) -> Result<bool, SkillReferenceError> {
+    if !metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    match junction::get_target(path) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if error.raw_os_error().is_none() && error.kind() == std::io::ErrorKind::Other =>
+        {
+            Ok(false)
+        }
+        Err(source) => Err(SkillReferenceError::io(path, source)),
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -783,7 +810,10 @@ fn remove_reference_unchecked(path: &Path) -> Result<(), SkillReferenceError> {
 
 #[cfg(windows)]
 fn remove_reference_unchecked(path: &Path) -> Result<(), SkillReferenceError> {
-    junction::delete(path).map_err(|source| SkillReferenceError::io(path, source))
+    // RemoveDirectoryW deletes the junction directory entry itself. The
+    // junction crate's `delete` only clears the reparse point and leaves an
+    // empty ordinary directory behind.
+    fs::remove_dir(path).map_err(|source| SkillReferenceError::io(path, source))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -791,6 +821,38 @@ fn remove_reference_unchecked(path: &Path) -> Result<(), SkillReferenceError> {
     Err(SkillReferenceError::UnsupportedPlatform {
         path: path.to_owned(),
     })
+}
+
+#[cfg(windows)]
+fn is_incomplete_reference(path: &Path) -> Result<bool, SkillReferenceError> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| SkillReferenceError::io(path, source))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Ok(false);
+    }
+    let mut entries = fs::read_dir(path).map_err(|source| SkillReferenceError::io(path, source))?;
+    match entries.next() {
+        None => Ok(true),
+        Some(Ok(_)) => Ok(false),
+        Some(Err(source)) => Err(SkillReferenceError::io(path, source)),
+    }
+}
+
+#[cfg(not(windows))]
+fn is_incomplete_reference(_path: &Path) -> Result<bool, SkillReferenceError> {
+    Ok(false)
+}
+
+fn remove_incomplete_reference(path: &Path) -> Result<(), SkillReferenceError> {
+    fs::remove_dir(path).map_err(|source| SkillReferenceError::io(path, source))?;
+    let parent = path.parent().expect("reference has a parent");
+    sync_directory(parent).map_err(|source| SkillReferenceError::io(parent, source))
 }
 
 fn path_fingerprint(path: &Path) -> String {
@@ -968,6 +1030,44 @@ mod tests {
         assert!(!paths.owner.exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn an_owned_empty_junction_placeholder_is_recoverable() {
+        let (_temporary, source, destination, state) = roots();
+        let enabled = plan(&source, &destination, &state, true);
+        let paths = prepare_paths(&enabled).unwrap();
+        let target = fs::canonicalize(source.join("demo")).unwrap();
+        publish_owner(
+            &paths.owner,
+            &ReferenceOwner::stable(&enabled, path_fingerprint(&target)),
+        )
+        .unwrap();
+        fs::create_dir(&paths.destination).unwrap();
+
+        assert_eq!(
+            inspect_skill_reference(
+                &state,
+                &AppType::Claude,
+                enabled.skill_id(),
+                enabled.directory(),
+                &paths.source,
+                &destination,
+            ),
+            SkillReferenceObservation::ManagedMissing
+        );
+        apply_skill_reference(&enabled).unwrap().commit().unwrap();
+        assert!(destination.join("demo/SKILL.md").is_file());
+
+        apply_skill_reference(&plan(&source, &destination, &state, false))
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert!(matches!(
+            fs::symlink_metadata(&paths.destination),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn source_relocation_is_reversible() {
@@ -992,7 +1092,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn a_broken_owned_link_converges_to_the_current_source() {
         let (temporary, source, destination, state) = roots();
