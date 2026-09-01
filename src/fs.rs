@@ -148,7 +148,7 @@ fn atomic_write_with_unix_mode(
     let _ = unix_mode;
 
     let parent = usable_parent(path)?;
-    fs::create_dir_all(parent).map_err(|source| FileError::io(parent, source))?;
+    create_dir_all_durable(parent).map_err(|source| FileError::io(parent, source))?;
 
     path.file_name().ok_or_else(|| FileError::InvalidPath {
         path: path.to_path_buf(),
@@ -195,6 +195,7 @@ fn atomic_write_with_unix_mode(
 }
 
 /// Removes a file and makes the directory entry durable before returning.
+#[cfg(not(windows))]
 pub fn remove_file_durable(path: &Path) -> Result<(), FileError> {
     fs::remove_file(path).map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
@@ -212,6 +213,70 @@ pub fn remove_file_durable(path: &Path) -> Result<(), FileError> {
     })
 }
 
+#[cfg(windows)]
+pub fn remove_file_durable(path: &Path) -> Result<(), FileError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            FileError::NotFound {
+                path: path.to_owned(),
+            }
+        } else {
+            FileError::io(path, source)
+        }
+    })?;
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        return Err(FileError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "expected a file, found a directory",
+            ),
+        ));
+    }
+    let tombstone = move_path_to_tombstone_write_through(path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            FileError::NotFound {
+                path: path.to_owned(),
+            }
+        } else {
+            FileError::io(path, source)
+        }
+    })?;
+    fs::remove_file(&tombstone).map_err(|source| FileError::Durability {
+        path: tombstone,
+        source,
+    })
+}
+
+pub(crate) fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut current = if path.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        path.to_owned()
+    };
+    loop {
+        match fs::metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("path is not a directory: {current:?}"),
+                ))
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(current.clone());
+                current = usable_parent_io(&current)?.to_owned();
+            }
+            Err(source) => return Err(source),
+        }
+    }
+    for directory in missing.iter().rev() {
+        create_directory_durable(directory)?;
+    }
+    Ok(())
+}
+
 fn usable_parent(path: &Path) -> Result<&Path, FileError> {
     let parent = path.parent().ok_or_else(|| FileError::InvalidPath {
         path: path.to_path_buf(),
@@ -221,6 +286,69 @@ fn usable_parent(path: &Path) -> Result<&Path, FileError> {
     } else {
         Ok(parent)
     }
+}
+
+fn usable_parent_io(path: &Path) -> std::io::Result<&Path> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("path has no parent: {path:?}"),
+        )
+    })?;
+    if parent.as_os_str().is_empty() {
+        Ok(Path::new("."))
+    } else {
+        Ok(parent)
+    }
+}
+
+#[cfg(not(windows))]
+fn create_directory_durable(path: &Path) -> std::io::Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => sync_directory(usable_parent_io(path)?),
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::metadata(path)?.is_dir() {
+                sync_directory(usable_parent_io(path)?)
+            } else {
+                Err(source)
+            }
+        }
+        Err(source) => Err(source),
+    }
+}
+
+#[cfg(windows)]
+fn create_directory_durable(path: &Path) -> std::io::Result<()> {
+    let parent = usable_parent_io(path)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut last_collision = None;
+    for _ in 0..16 {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let staging = parent.join(format!(
+            ".cc-switch.mkdir.{}.{timestamp}.{counter}",
+            std::process::id()
+        ));
+        match fs::create_dir(&staging) {
+            Ok(()) => match move_path_windows(&staging, path, 0) {
+                Ok(()) => return Ok(()),
+                Err(source) => {
+                    let _ = fs::remove_dir(&staging);
+                    if fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+                        return Ok(());
+                    }
+                    return Err(source);
+                }
+            },
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_collision = Some(source);
+            }
+            Err(source) => return Err(source),
+        }
+    }
+    Err(last_collision.expect("temporary directory loop must run"))
 }
 
 fn create_temporary_file(parent: &Path, timestamp: u128) -> Result<(PathBuf, fs::File), FileError> {
@@ -301,6 +429,31 @@ pub(crate) fn move_path_write_through(source: &Path, destination: &Path) -> std:
 }
 
 #[cfg(windows)]
+pub(crate) fn move_path_to_tombstone_write_through(path: &Path) -> std::io::Result<PathBuf> {
+    let parent = usable_parent_io(path)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut last_collision = None;
+    for _ in 0..16 {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tombstone = parent.join(format!(
+            ".cc-switch.removed.{}.{timestamp}.{counter}",
+            std::process::id()
+        ));
+        match move_path_windows(path, &tombstone, 0) {
+            Ok(()) => return Ok(tombstone),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_collision = Some(source);
+            }
+            Err(source) => return Err(source),
+        }
+    }
+    Err(last_collision.expect("tombstone filename loop must run"))
+}
+
+#[cfg(windows)]
 fn move_path_windows(source: &Path, destination: &Path, flags: u32) -> std::io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
 
@@ -325,6 +478,7 @@ fn move_path_windows(source: &Path, destination: &Path, flags: u32) -> std::io::
 fn wide_windows_path(path: &Path) -> std::io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
 
+    let path = std::path::absolute(path)?;
     let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
     if value.contains(&0) {
         return Err(std::io::Error::new(
@@ -332,8 +486,7 @@ fn wide_windows_path(path: &Path) -> std::io::Result<Vec<u16>> {
             "Windows paths cannot contain NUL",
         ));
     }
-    if path.is_absolute()
-        && !value.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+    if !value.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
         && !value.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
     {
         if value.starts_with(&[b'\\' as u16, b'\\' as u16]) {
@@ -438,6 +591,17 @@ mod tests {
     }
 
     #[test]
+    fn durable_directory_creation_builds_missing_ancestors() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nested = dir.path().join("one/two/three");
+
+        create_dir_all_durable(&nested).expect("create nested directories");
+        create_dir_all_durable(&nested).expect("reuse nested directories");
+
+        assert!(nested.is_dir());
+    }
+
+    #[test]
     fn a_relative_file_uses_the_current_directory_as_its_parent() {
         assert_eq!(
             usable_parent(Path::new("config.json")).unwrap(),
@@ -479,6 +643,16 @@ mod tests {
         drop(held_file);
         assert_eq!(fs::read(&path).unwrap(), b"old");
         assert!(temporary_files(dir.path()).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_move_paths_are_normalized_before_the_verbatim_prefix() {
+        let encoded = wide_windows_path(Path::new(r"C:/cc-switch/child/../config.json"))
+            .expect("normalize Windows path");
+        let path = String::from_utf16(&encoded[..encoded.len() - 1]).expect("decode Windows path");
+
+        assert_eq!(path, r"\\?\C:\cc-switch\config.json");
     }
 
     #[cfg(windows)]

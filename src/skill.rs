@@ -1239,7 +1239,7 @@ pub fn apply_skill_deployment_with_policy(
     copy_policy: SkillCopyPolicy,
 ) -> Result<SkillDeploymentReceipt, SkillConfigError> {
     let paths = deployment_paths(source_root, destination_root, directory)?;
-    recover_interrupted_deployment(&paths, directory, enabled)?;
+    recover_interrupted_deployment(&paths, directory, enabled, copy_policy)?;
     let (state, expectation) =
         inspect_paths_with_policy(&paths.source, &paths.destination, directory, copy_policy)?;
     if enabled {
@@ -1386,21 +1386,6 @@ fn inspect_paths_with_policy(
     inspect_paths_with_link_parent_policy(source, destination, directory, link_parent, copy_policy)
 }
 
-fn inspect_paths_with_link_parent(
-    source: &Path,
-    destination: &Path,
-    directory: &str,
-    link_parent: &Path,
-) -> Result<(SkillDeploymentState, DeploymentExpectation), SkillConfigError> {
-    inspect_paths_with_link_parent_policy(
-        source,
-        destination,
-        directory,
-        link_parent,
-        SkillCopyPolicy::ManagedOnly,
-    )
-}
-
 fn inspect_paths_with_link_parent_policy(
     source: &Path,
     destination: &Path,
@@ -1480,28 +1465,18 @@ fn enable_deployment(
         .parent()
         .expect("a deployment has a destination root")
         .to_owned();
-    fs::create_dir_all(&parent).map_err(|source| SkillConfigError::io(&parent, source))?;
+    crate::fs::create_dir_all_durable(&parent)
+        .map_err(|source| SkillConfigError::io(&parent, source))?;
 
     if !matches!(sync_method, SkillSyncMethod::Copy) {
-        match create_symlink(&paths.source, &paths.destination) {
-            Ok(()) => {
-                let receipt = SkillDeploymentReceipt {
-                    change: DeploymentChange::Created {
-                        destination: paths.destination,
-                        expectation: DeploymentExpectation::Linked {
-                            target: paths.source,
-                        },
-                    },
-                };
-                if let Err(error) = receipt.verify() {
-                    return Err(recover_created(receipt, error));
-                }
-                if let Err(error) = sync_directory(&parent) {
-                    return Err(recover_created(receipt, error));
-                }
-                return Ok(receipt);
+        match create_link_deployment(&paths, directory) {
+            Ok(receipt) => return Ok(receipt),
+            Err(error)
+                if matches!(sync_method, SkillSyncMethod::Symlink)
+                    || matches!(&error, SkillConfigError::Recovery { .. }) =>
+            {
+                return Err(error)
             }
-            Err(error) if matches!(sync_method, SkillSyncMethod::Symlink) => return Err(error),
             Err(_) => match inspect_paths_with_policy(
                 &paths.source,
                 &paths.destination,
@@ -1517,6 +1492,40 @@ fn enable_deployment(
     }
 
     create_copy(paths, directory)
+}
+
+fn create_link_deployment(
+    paths: &DeploymentPaths,
+    directory: &str,
+) -> Result<SkillDeploymentReceipt, SkillConfigError> {
+    let parent = paths
+        .destination
+        .parent()
+        .expect("a deployment has a destination root");
+    let temporary_root =
+        create_temporary_directory(parent, directory, InterruptedOperation::Enable)?;
+    let staged = temporary_root.join("deployment");
+    if let Err(error) = create_symlink(&paths.source, &staged) {
+        return Err(cleanup_temporary(&temporary_root, error));
+    }
+    if let Err(error) = rename_path(&staged, &paths.destination) {
+        return Err(cleanup_temporary(&temporary_root, error));
+    }
+    let receipt = SkillDeploymentReceipt {
+        change: DeploymentChange::Created {
+            destination: paths.destination.clone(),
+            expectation: DeploymentExpectation::Linked {
+                target: paths.source.clone(),
+            },
+        },
+    };
+    if let Err(error) = remove_directory(&temporary_root) {
+        return Err(recover_created(receipt, error));
+    }
+    if let Err(error) = receipt.verify() {
+        return Err(recover_created(receipt, error));
+    }
+    Ok(receipt)
 }
 
 fn create_copy(
@@ -1952,6 +1961,7 @@ fn recover_interrupted_deployment(
     paths: &DeploymentPaths,
     directory: &str,
     enabled: bool,
+    copy_policy: SkillCopyPolicy,
 ) -> Result<(), SkillConfigError> {
     let parent = paths
         .destination
@@ -2021,9 +2031,13 @@ fn recover_interrupted_deployment(
             InterruptedOperation::Enable => {
                 recover_interrupted_enable(paths, &temporary_root, directory, enabled)?
             }
-            InterruptedOperation::Disable => {
-                recover_interrupted_disable(paths, &temporary_root, directory, enabled)?
-            }
+            InterruptedOperation::Disable => recover_interrupted_disable(
+                paths,
+                &temporary_root,
+                directory,
+                enabled,
+                copy_policy,
+            )?,
         }
     }
     Ok(())
@@ -2090,25 +2104,32 @@ fn recover_interrupted_disable(
     temporary_root: &Path,
     directory: &str,
     enabled: bool,
+    copy_policy: SkillCopyPolicy,
 ) -> Result<(), SkillConfigError> {
     let backup = temporary_root.join("deployment");
-    let (destination_state, _) = inspect_paths(&paths.source, &paths.destination, directory)?;
+    let (destination_state, _) =
+        inspect_paths_with_policy(&paths.source, &paths.destination, directory, copy_policy)?;
     let original_parent = paths
         .destination
         .parent()
         .expect("a deployment has a destination root");
-    let (backup_state, _) =
-        match inspect_paths_with_link_parent(&paths.source, &backup, directory, original_parent) {
-            Ok(state) => state,
-            Err(SkillConfigError::Conflict { .. }) => {
-                return Err(SkillConfigError::Recovery {
-                    message: format!(
-                        "interrupted Skill disable has an unverified backup at {backup:?}"
-                    ),
-                });
-            }
-            Err(error) => return Err(error),
-        };
+    let (backup_state, _) = match inspect_paths_with_link_parent_policy(
+        &paths.source,
+        &backup,
+        directory,
+        original_parent,
+        copy_policy,
+    ) {
+        Ok(state) => state,
+        Err(SkillConfigError::Conflict { .. }) => {
+            return Err(SkillConfigError::Recovery {
+                message: format!(
+                    "interrupted Skill disable has an unverified backup at {backup:?}"
+                ),
+            });
+        }
+        Err(error) => return Err(error),
+    };
     if destination_state == SkillDeploymentState::Missing {
         if enabled && backup_state != SkillDeploymentState::Missing {
             rename_path(&backup, &paths.destination)?;
@@ -2265,6 +2286,7 @@ fn create_symlink(source: &Path, destination: &Path) -> Result<(), SkillConfigEr
         .map_err(|error| SkillConfigError::io(destination, error))
 }
 
+#[cfg(not(windows))]
 fn remove_deployment(path: &Path) -> Result<(), SkillConfigError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -2288,6 +2310,31 @@ fn remove_deployment(path: &Path) -> Result<(), SkillConfigError> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn remove_deployment(path: &Path) -> Result<(), SkillConfigError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(SkillConfigError::io(path, source)),
+    };
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        return remove_directory(path);
+    }
+    if !metadata.file_type().is_symlink() && !metadata.file_type().is_file() {
+        return Err(SkillConfigError::UnsupportedEntry {
+            path: path.to_owned(),
+        });
+    }
+    let tombstone = crate::fs::move_path_to_tombstone_write_through(path)
+        .map_err(|source| SkillConfigError::io(path, source))?;
+    let removed = if metadata.file_type().is_symlink() {
+        remove_directory_symlink(&tombstone)
+    } else {
+        fs::remove_file(&tombstone).map_err(|source| SkillConfigError::io(&tombstone, source))
+    };
+    removed.map_err(|error| post_visible_error("deployment removal", error))
+}
+
 #[cfg(unix)]
 fn remove_directory_symlink(path: &Path) -> Result<(), SkillConfigError> {
     fs::remove_file(path).map_err(|source| SkillConfigError::io(path, source))
@@ -2298,12 +2345,22 @@ fn remove_directory_symlink(path: &Path) -> Result<(), SkillConfigError> {
     fs::remove_dir(path).map_err(|source| SkillConfigError::io(path, source))
 }
 
+#[cfg(not(windows))]
 fn remove_directory(path: &Path) -> Result<(), SkillConfigError> {
     fs::remove_dir_all(path).map_err(|source| SkillConfigError::io(path, source))?;
     if let Some(parent) = path.parent() {
         sync_directory(parent).map_err(|error| post_visible_error("directory removal", error))?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn remove_directory(path: &Path) -> Result<(), SkillConfigError> {
+    let tombstone = crate::fs::move_path_to_tombstone_write_through(path)
+        .map_err(|source| SkillConfigError::io(path, source))?;
+    fs::remove_dir_all(&tombstone)
+        .map_err(|source| SkillConfigError::io(&tombstone, source))
+        .map_err(|error| post_visible_error("directory removal", error))
 }
 
 #[cfg(test)]
@@ -2997,6 +3054,37 @@ mod tests {
         .unwrap();
         assert!(!destination.join("docs").exists());
         assert!(source.join("docs/SKILL.md").exists());
+    }
+
+    #[test]
+    fn interrupted_legacy_copy_disable_reuses_host_evidence() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        copy_tree(
+            &source.join("docs"),
+            &destination.join("docs"),
+            &mut TreeBudget::default(),
+        )
+        .unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Disable)
+                .unwrap();
+        fs::rename(destination.join("docs"), temporary_root.join("deployment")).unwrap();
+
+        apply_skill_deployment_with_policy(
+            &source,
+            &destination,
+            "docs",
+            false,
+            SkillSyncMethod::Copy,
+            SkillCopyPolicy::AllowMatching,
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
+
+        assert!(!destination.join("docs").exists());
+        assert!(!temporary_root.exists());
     }
 
     #[test]
