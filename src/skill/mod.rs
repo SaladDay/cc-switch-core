@@ -7,11 +7,33 @@
 
 use crate::LogicalTarget;
 
+/// A schema-backed `skills` selection column declared by Core.
+///
+/// Hosts can read its identifier but cannot construct arbitrary columns.
+///
+/// ```compile_fail
+/// use cc_switch_core::SkillCatalogColumn;
+/// let _ = SkillCatalogColumn("enabled_unknown");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SkillCatalogColumn(&'static str);
+
+impl SkillCatalogColumn {
+    pub(crate) const fn new(column: &'static str) -> Self {
+        Self(column)
+    }
+
+    /// Returns the fixed database identifier.
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
 /// Where one application's requested per-Skill selection is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SkillSelectionStore {
     /// The shared `skills` table stores the requested state in this column.
-    CatalogColumn(&'static str),
+    CatalogColumn(SkillCatalogColumn),
     /// Presence in the application's native Skill directory stores selection.
     ///
     /// Unified discovery may still make the Skill visible independently.
@@ -22,7 +44,7 @@ impl SkillSelectionStore {
     /// Returns the shared catalog column, when selection is catalog-backed.
     pub const fn catalog_column(self) -> Option<&'static str> {
         match self {
-            Self::CatalogColumn(column) => Some(column),
+            Self::CatalogColumn(column) => Some(column.as_str()),
             Self::NativeDirectory => None,
         }
     }
@@ -82,7 +104,7 @@ impl SkillAppContract {
         config_target: Option<SkillConfigTarget>,
     ) -> Self {
         Self {
-            selection_store: SkillSelectionStore::CatalogColumn(column),
+            selection_store: SkillSelectionStore::CatalogColumn(SkillCatalogColumn::new(column)),
             discovery,
             config_target,
         }

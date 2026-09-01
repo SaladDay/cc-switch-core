@@ -71,4 +71,6 @@ pub use simple_provider::{
     SimpleProviderField, SimpleProviderFieldDescriptor, SimpleProviderFormDescriptor,
     SimpleProviderPreset, SimpleProviderProtocol, SimpleProviderValues,
 };
-pub use skill::{SkillAppContract, SkillConfigTarget, SkillDiscovery, SkillSelectionStore};
+pub use skill::{
+    SkillAppContract, SkillCatalogColumn, SkillConfigTarget, SkillDiscovery, SkillSelectionStore,
+};

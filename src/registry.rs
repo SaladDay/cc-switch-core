@@ -562,6 +562,7 @@ mod tests {
     #[test]
     fn skill_contract_matrix_is_stable() {
         use crate::SkillSelectionStore::{CatalogColumn, NativeDirectory};
+        let catalog = |column| CatalogColumn(crate::SkillCatalogColumn::new(column));
 
         let actual = builtin_app_registry()
             .descriptors()
@@ -580,34 +581,29 @@ mod tests {
         assert_eq!(
             actual,
             [
-                ("claude", CatalogColumn("enabled_claude"), NativeOnly, None),
-                (
-                    "codex",
-                    CatalogColumn("enabled_codex"),
-                    NativeAndUnified,
-                    None,
-                ),
+                ("claude", catalog("enabled_claude"), NativeOnly, None),
+                ("codex", catalog("enabled_codex"), NativeAndUnified, None,),
                 (
                     "gemini",
-                    CatalogColumn("enabled_gemini"),
+                    catalog("enabled_gemini"),
                     NativeAndUnified,
                     Some(GeminiSettings),
                 ),
                 (
                     "grokbuild",
-                    CatalogColumn("enabled_grokbuild"),
+                    catalog("enabled_grokbuild"),
                     NativeAndUnified,
                     Some(GrokConfig),
                 ),
                 (
                     "opencode",
-                    CatalogColumn("enabled_opencode"),
+                    catalog("enabled_opencode"),
                     NativeAndUnified,
                     None,
                 ),
                 (
                     "hermes",
-                    CatalogColumn("enabled_hermes"),
+                    catalog("enabled_hermes"),
                     NativeOnly,
                     Some(HermesConfig),
                 ),
