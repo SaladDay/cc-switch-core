@@ -235,6 +235,16 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn sort_json_keys(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
