@@ -14,7 +14,7 @@ use crate::{fs::sync_directory, AppType};
 
 use super::read::{resolve_root, roots_overlap};
 
-const OWNER_VERSION: u8 = 4;
+const OWNER_VERSION: u8 = 5;
 const MAX_OWNER_BYTES: u64 = 4096;
 static OWNER_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -113,6 +113,14 @@ struct ObjectIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PendingReference {
+    name: String,
+    identity: ObjectIdentity,
+    target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReferenceOwner {
     version: u8,
     skill_id: String,
@@ -126,6 +134,10 @@ struct ReferenceOwner {
     reference_identity: Option<ObjectIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     anchor_identity: Option<ObjectIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_reference: Option<PendingReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_anchor: Option<PendingReference>,
     #[serde(default, skip_serializing_if = "is_false")]
     replacing_anchor: bool,
 }
@@ -146,6 +158,8 @@ impl ReferenceOwner {
             pending_source: None,
             reference_identity: None,
             anchor_identity: None,
+            pending_reference: None,
+            pending_anchor: None,
             replacing_anchor: false,
         }
     }
@@ -322,6 +336,7 @@ pub fn apply_skill_reference(
     let source = fs::canonicalize(&paths.source)
         .map_err(|source| SkillReferenceError::io(&paths.source, source))?;
     let target_source = path_fingerprint(&source);
+    recover_pending_references(plan, &paths)?;
     let previous = managed_state(plan, &paths)?;
 
     let applied = if plan.enabled {
@@ -416,6 +431,11 @@ fn managed_state(
             path: first_present_path(paths, &destination, &stage, &anchor),
         });
     };
+    if owner.pending_reference.is_some() || owner.pending_anchor.is_some() {
+        return Err(SkillReferenceError::Conflict {
+            path: paths.owner.clone(),
+        });
+    }
 
     let destination_present = require_direct_anchor(
         &destination,
@@ -433,6 +453,11 @@ fn managed_state(
     if owner.reference_identity.is_none() && destination_present.is_some() {
         return Err(SkillReferenceError::Unowned {
             path: paths.destination.clone(),
+        });
+    }
+    if owner.reference_identity.is_none() && stage_present.is_some() {
+        return Err(SkillReferenceError::Unowned {
+            path: paths.stage.clone(),
         });
     }
 
@@ -462,6 +487,11 @@ fn managed_state(
             })
         }
     };
+    if owner.anchor_identity.is_none() && anchor_identity.is_some() {
+        return Err(SkillReferenceError::Unowned {
+            path: paths.anchor.clone(),
+        });
+    }
 
     let location = if destination_present.is_some() {
         ManagedLocation::Destination
@@ -520,6 +550,129 @@ fn require_direct_anchor(
     }
 }
 
+fn recover_pending_references(
+    plan: &SkillReferencePlan,
+    paths: &ReferencePaths,
+) -> Result<(), SkillReferenceError> {
+    let Some(mut owner) = read_owner(&paths.owner, plan, &paths.destination_fingerprint)? else {
+        return Ok(());
+    };
+    if owner.pending_anchor.is_some() {
+        finish_pending_anchor(paths, &mut owner)?;
+    }
+    if owner.pending_reference.is_some() {
+        finish_pending_reference(paths, &mut owner)?;
+    }
+    Ok(())
+}
+
+fn finish_pending_anchor(
+    paths: &ReferencePaths,
+    owner: &mut ReferenceOwner,
+) -> Result<(), SkillReferenceError> {
+    let pending = owner
+        .pending_anchor
+        .clone()
+        .ok_or_else(|| SkillReferenceError::Conflict {
+            path: paths.owner.clone(),
+        })?;
+    if !owner.replacing_anchor
+        || owner.anchor_identity.is_some()
+        || !owner.accepts_source(&pending.target)
+    {
+        return Err(SkillReferenceError::InvalidOwner {
+            path: paths.owner.clone(),
+        });
+    }
+    publish_pending_reference(paths, &pending, &paths.anchor)?;
+    owner.source = pending.target;
+    owner.pending_source = None;
+    owner.anchor_identity = Some(pending.identity);
+    owner.pending_anchor = None;
+    owner.replacing_anchor = false;
+    write_owner(&paths.owner, owner)
+}
+
+fn finish_pending_reference(
+    paths: &ReferencePaths,
+    owner: &mut ReferenceOwner,
+) -> Result<(), SkillReferenceError> {
+    let pending = owner
+        .pending_reference
+        .clone()
+        .ok_or_else(|| SkillReferenceError::Conflict {
+            path: paths.owner.clone(),
+        })?;
+    if owner.replacing_anchor
+        || owner.anchor_identity.is_none()
+        || owner.reference_identity.is_some()
+        || pending.target != paths.anchor_fingerprint
+    {
+        return Err(SkillReferenceError::InvalidOwner {
+            path: paths.owner.clone(),
+        });
+    }
+    publish_pending_reference(paths, &pending, &paths.stage)?;
+    owner.reference_identity = Some(pending.identity);
+    owner.pending_reference = None;
+    write_owner(&paths.owner, owner)
+}
+
+fn publish_pending_reference(
+    paths: &ReferencePaths,
+    pending: &PendingReference,
+    destination: &Path,
+) -> Result<(), SkillReferenceError> {
+    let parent = paths
+        .owner
+        .parent()
+        .ok_or_else(|| SkillReferenceError::Conflict {
+            path: paths.owner.clone(),
+        })?;
+    let source = parent.join(&pending.name);
+    let source_entry = inspect_reference(&source)?;
+    let destination_entry = inspect_reference(destination)?;
+    match (&source_entry, &destination_entry) {
+        (entry, ReferenceEntry::Missing) if pending_reference_matches(entry, pending) => {
+            move_noreplace(&source, destination)?;
+            sync_move_parents(&source, destination)?;
+        }
+        (ReferenceEntry::Missing, entry) if pending_reference_matches(entry, pending) => {}
+        (ReferenceEntry::Missing, ReferenceEntry::Missing) => {
+            return Err(SkillReferenceError::Conflict { path: source })
+        }
+        (ReferenceEntry::Missing, _) => {
+            return Err(SkillReferenceError::Unowned {
+                path: destination.to_owned(),
+            })
+        }
+        (_, ReferenceEntry::Missing) => return Err(SkillReferenceError::Unowned { path: source }),
+        _ => {
+            return Err(SkillReferenceError::Conflict {
+                path: destination.to_owned(),
+            })
+        }
+    }
+    if pending_reference_matches(&inspect_reference(destination)?, pending) {
+        Ok(())
+    } else {
+        Err(SkillReferenceError::Unowned {
+            path: destination.to_owned(),
+        })
+    }
+}
+
+fn pending_reference_matches(entry: &ReferenceEntry, pending: &PendingReference) -> bool {
+    matches!(
+        entry,
+        ReferenceEntry::Reference {
+            identity,
+            declared_fingerprint,
+            ..
+        } if *identity == pending.identity && declared_fingerprint == &pending.target
+    )
+}
+
 fn converge_enabled(
     plan: &SkillReferencePlan,
     paths: &ReferencePaths,
@@ -551,22 +704,19 @@ fn converge_enabled(
     match state.location {
         ManagedLocation::Destination => {}
         ManagedLocation::Stage => {
-            let identity = bind_reference_identity(paths, &mut owner, &state)?;
+            let identity = bound_reference_identity(paths, &owner, &state)?;
             unpark_destination(paths, identity)?;
         }
         ManagedLocation::Missing => {
-            create_private_reference(&paths.anchor, &paths.stage)?;
-            let identity = require_direct_anchor(
-                &inspect_reference(&paths.stage)?,
-                paths,
-                &paths.stage,
-                None,
-            )?
-            .ok_or_else(|| SkillReferenceError::Conflict {
-                path: paths.stage.clone(),
-            })?;
-            owner.reference_identity = Some(identity);
+            owner.pending_reference = Some(create_pending_reference(&paths.anchor, paths)?);
             write_owner(&paths.owner, &owner)?;
+            finish_pending_reference(paths, &mut owner)?;
+            let identity =
+                owner
+                    .reference_identity
+                    .ok_or_else(|| SkillReferenceError::Conflict {
+                        path: paths.owner.clone(),
+                    })?;
             unpark_destination(paths, identity)?;
         }
     }
@@ -609,6 +759,7 @@ fn restore_previous(
     plan: &SkillReferencePlan,
     previous: &ManagedState,
 ) -> Result<(), SkillReferenceError> {
+    recover_pending_references(plan, paths)?;
     if previous.location == ManagedLocation::Destination {
         let source =
             previous
@@ -678,26 +829,14 @@ fn ensure_anchor(
     } else {
         require_missing(&paths.anchor)?;
     }
-    create_private_reference(source, &paths.anchor)?;
-    let anchor = inspect_reference(&paths.anchor)?;
-    let identity = match anchor {
-        ReferenceEntry::Reference {
-            resolved_fingerprint,
-            reachable: true,
-            identity,
-            ..
-        } if resolved_fingerprint == source_fingerprint => identity,
-        _ => {
-            return Err(SkillReferenceError::Conflict {
-                path: paths.anchor.clone(),
-            })
-        }
-    };
-    owner.source = source_fingerprint.to_owned();
-    owner.pending_source = None;
-    owner.anchor_identity = Some(identity);
-    owner.replacing_anchor = false;
+    owner.pending_anchor = Some(create_pending_reference(source, paths)?);
     write_owner(&paths.owner, owner)?;
+    finish_pending_anchor(paths, owner)?;
+    let identity = owner
+        .anchor_identity
+        .ok_or_else(|| SkillReferenceError::Conflict {
+            path: paths.owner.clone(),
+        })?;
     state.anchor_target = Some(source.to_owned());
     state.anchor_source = Some(source_fingerprint.to_owned());
     state.anchor_reachable = true;
@@ -705,26 +844,23 @@ fn ensure_anchor(
     Ok(())
 }
 
-fn bind_reference_identity(
+fn bound_reference_identity(
     paths: &ReferencePaths,
-    owner: &mut ReferenceOwner,
+    owner: &ReferenceOwner,
     state: &ManagedState,
 ) -> Result<ObjectIdentity, SkillReferenceError> {
-    let identity = state
+    let identity = owner
         .reference_identity
         .ok_or_else(|| SkillReferenceError::Conflict {
-            path: paths.stage.clone(),
+            path: paths.owner.clone(),
         })?;
-    if owner.reference_identity != Some(identity) {
-        if owner.reference_identity.is_some() {
-            return Err(SkillReferenceError::Unowned {
-                path: paths.stage.clone(),
-            });
-        }
-        owner.reference_identity = Some(identity);
-        write_owner(&paths.owner, owner)?;
+    if state.reference_identity == Some(identity) {
+        Ok(identity)
+    } else {
+        Err(SkillReferenceError::Unowned {
+            path: paths.stage.clone(),
+        })
     }
-    Ok(identity)
 }
 
 fn park_destination(
@@ -808,19 +944,26 @@ fn retire_anchor(
     }
 }
 
-fn create_private_reference(target: &Path, path: &Path) -> Result<(), SkillReferenceError> {
-    let parent = path.parent().ok_or_else(|| SkillReferenceError::Conflict {
-        path: path.to_owned(),
-    })?;
+fn create_pending_reference(
+    target: &Path,
+    paths: &ReferencePaths,
+) -> Result<PendingReference, SkillReferenceError> {
+    let parent = paths
+        .owner
+        .parent()
+        .ok_or_else(|| SkillReferenceError::Conflict {
+            path: paths.owner.clone(),
+        })?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let counter = OWNER_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(
+    let name = format!(
         ".cc-switch-reference.{}.{timestamp}.{counter}",
         std::process::id()
-    ));
+    );
+    let temporary = parent.join(&name);
     create_reference(target, &temporary)?;
     let (identity, declared_fingerprint) = match inspect_reference(&temporary)? {
         ReferenceEntry::Reference {
@@ -832,18 +975,11 @@ fn create_private_reference(target: &Path, path: &Path) -> Result<(), SkillRefer
             return Err(SkillReferenceError::Conflict { path: temporary });
         }
     };
-    move_noreplace(&temporary, path)?;
-    sync_move_parents(&temporary, path)?;
-    match inspect_reference(path)? {
-        ReferenceEntry::Reference {
-            identity: moved_identity,
-            declared_fingerprint: moved_target,
-            ..
-        } if moved_identity == identity && moved_target == declared_fingerprint => Ok(()),
-        _ => Err(SkillReferenceError::Recovery {
-            message: format!("a newly-created Skill reference changed while publishing: {path:?}"),
-        }),
-    }
+    Ok(PendingReference {
+        name,
+        identity,
+        target: declared_fingerprint,
+    })
 }
 
 fn require_missing(path: &Path) -> Result<(), SkillReferenceError> {
@@ -1123,7 +1259,7 @@ fn owner_stem(
     destination_fingerprint: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"cc-switch-skill-reference-v4\0");
+    hasher.update(b"cc-switch-skill-reference-v5\0");
     hasher.update(app.as_str().as_bytes());
     hasher.update(b"\0");
     hasher.update(skill_id.as_bytes());
@@ -1162,18 +1298,33 @@ fn read_owner(
         serde_json::from_slice(&bytes).map_err(|_| SkillReferenceError::InvalidOwner {
             path: path.to_owned(),
         })?;
-    let valid_identity_state = matches!(
-        (
-            owner.reference_identity,
-            owner.anchor_identity,
-            owner.replacing_anchor,
+    let valid_identity_state = match (&owner.pending_reference, &owner.pending_anchor) {
+        (None, None) => matches!(
+            (
+                owner.reference_identity,
+                owner.anchor_identity,
+                owner.replacing_anchor,
+            ),
+            (None, None, false)
+                | (None, None, true)
+                | (None, Some(_), false)
+                | (Some(_), None, true)
+                | (Some(_), Some(_), false)
         ),
-        (None, None, false)
-            | (None, None, true)
-            | (None, Some(_), false)
-            | (Some(_), None, true)
-            | (Some(_), Some(_), false)
-    );
+        (Some(pending), None) => {
+            owner.reference_identity.is_none()
+                && owner.anchor_identity.is_some()
+                && !owner.replacing_anchor
+                && valid_pending_reference(pending)
+        }
+        (None, Some(pending)) => {
+            owner.anchor_identity.is_none()
+                && owner.replacing_anchor
+                && owner.accepts_source(&pending.target)
+                && valid_pending_reference(pending)
+        }
+        (Some(_), Some(_)) => false,
+    };
     if bytes.len() as u64 > MAX_OWNER_BYTES
         || owner.version != OWNER_VERSION
         || owner.skill_id != plan.skill_id
@@ -1193,6 +1344,18 @@ fn read_owner(
         });
     }
     Ok(Some(owner))
+}
+
+fn valid_pending_reference(pending: &PendingReference) -> bool {
+    let mut components = Path::new(&pending.name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(name)), None)
+            if name.to_str() == Some(pending.name.as_str())
+    ) && pending.name.starts_with(".cc-switch-reference.")
+        && pending.name.len() <= 255
+        && !pending.name.chars().any(char::is_control)
+        && valid_digest(&pending.target)
 }
 
 fn owner_bytes(owner: &ReferenceOwner, path: &Path) -> Result<Vec<u8>, SkillReferenceError> {
@@ -1375,7 +1538,34 @@ fn move_noreplace(source: &Path, destination: &Path) -> Result<(), SkillReferenc
 
 #[cfg(windows)]
 fn move_noreplace(source: &Path, destination: &Path) -> Result<(), SkillReferenceError> {
-    fs::rename(source, destination).map_err(|source| SkillReferenceError::io(destination, source))
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let wide_path = |path: &Path| -> Result<Vec<u16>, SkillReferenceError> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(SkillReferenceError::io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path contains an embedded NUL",
+                ),
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    };
+    let source_wide = wide_path(source)?;
+    let destination_wide = wide_path(destination)?;
+    let result = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), 0) };
+    if result == 0 {
+        Err(SkillReferenceError::io(
+            destination,
+            std::io::Error::last_os_error(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(all(
@@ -1552,6 +1742,52 @@ mod tests {
         )
     }
 
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+        target_os = "redox",
+        windows,
+    ))]
+    #[test]
+    fn no_replace_move_preserves_an_existing_destination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "destination").unwrap();
+
+        assert!(move_noreplace(&source, &destination).is_err());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "destination");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_replace_move_preserves_an_existing_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target");
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::create_dir(&target).unwrap();
+        create_reference(&target, &source).unwrap();
+        fs::create_dir(&destination).unwrap();
+
+        assert!(move_noreplace(&source, &destination).is_err());
+        assert!(matches!(
+            inspect_reference(&source).unwrap(),
+            ReferenceEntry::Reference { .. }
+        ));
+        assert!(matches!(
+            inspect_reference(&destination).unwrap(),
+            ReferenceEntry::Other
+        ));
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn managed_references_are_idempotent_and_reversible() {
@@ -1637,6 +1873,59 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn an_unbound_anchor_checkpoint_is_never_adopted() {
+        let (_temporary, source, destination, state) = roots();
+        let enabled = plan(&source, &destination, &state, true);
+        let paths = prepare_paths(&enabled).unwrap();
+        let target = fs::canonicalize(&paths.source).unwrap();
+        let owner = ReferenceOwner::initial(
+            &enabled,
+            paths.destination_fingerprint.clone(),
+            path_fingerprint(&target),
+        );
+        publish_owner(&paths.owner, &owner).unwrap();
+        create_reference(&target, &paths.anchor).unwrap();
+
+        assert!(matches!(
+            apply_skill_reference(&plan(&source, &destination, &state, false)),
+            Err(SkillReferenceError::Unowned { .. })
+        ));
+        delete_reference_for_test(&paths.anchor);
+        create_reference(&target, &paths.anchor).unwrap();
+        assert!(matches!(
+            apply_skill_reference(&enabled),
+            Err(SkillReferenceError::Unowned { .. })
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn an_unbound_staged_checkpoint_is_never_adopted() {
+        let (_temporary, source, destination, state) = roots();
+        let enabled = plan(&source, &destination, &state, true);
+        apply_skill_reference(&enabled).unwrap().commit().unwrap();
+        let paths = prepare_paths(&enabled).unwrap();
+        park_for_test(&enabled, &paths);
+        let mut owner = read_owner(&paths.owner, &enabled, &paths.destination_fingerprint)
+            .unwrap()
+            .unwrap();
+        owner.reference_identity = None;
+        write_owner(&paths.owner, &owner).unwrap();
+
+        assert!(matches!(
+            apply_skill_reference(&plan(&source, &destination, &state, false)),
+            Err(SkillReferenceError::Unowned { .. })
+        ));
+        delete_reference_for_test(&paths.stage);
+        create_reference(&paths.anchor, &paths.stage).unwrap();
+        assert!(matches!(
+            apply_skill_reference(&enabled),
+            Err(SkillReferenceError::Unowned { .. })
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn ownership_is_bound_to_one_native_root() {
         let (temporary, source, destination_a, state) = roots();
         apply_skill_reference(&plan(&source, &destination_a, &state, true))
@@ -1689,11 +1978,8 @@ mod tests {
             source_fingerprint,
         );
         publish_owner(&paths.owner, &owner).unwrap();
-        create_private_reference(&target, &paths.anchor).unwrap();
-        owner.anchor_identity = match inspect_reference(&paths.anchor).unwrap() {
-            ReferenceEntry::Reference { identity, .. } => Some(identity),
-            _ => panic!("checkpoint anchor must be a reference"),
-        };
+        owner.replacing_anchor = true;
+        owner.pending_anchor = Some(create_pending_reference(&target, &paths).unwrap());
         write_owner(&paths.owner, &owner).unwrap();
 
         apply_skill_reference(&enabled).unwrap().commit().unwrap();
@@ -1703,6 +1989,61 @@ mod tests {
             .unwrap()
             .reference_identity
             .is_some());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_published_anchor_checkpoint_converges_after_interruption() {
+        let (_temporary, source, destination, state) = roots();
+        let enabled = plan(&source, &destination, &state, true);
+        let paths = prepare_paths(&enabled).unwrap();
+        let target = fs::canonicalize(&paths.source).unwrap();
+        let mut owner = ReferenceOwner::initial(
+            &enabled,
+            paths.destination_fingerprint.clone(),
+            path_fingerprint(&target),
+        );
+        owner.replacing_anchor = true;
+        owner.pending_anchor = Some(create_pending_reference(&target, &paths).unwrap());
+        publish_owner(&paths.owner, &owner).unwrap();
+        publish_pending_reference(
+            &paths,
+            owner.pending_anchor.as_ref().unwrap(),
+            &paths.anchor,
+        )
+        .unwrap();
+
+        apply_skill_reference(&enabled).unwrap().commit().unwrap();
+
+        let recovered = managed_state(&enabled, &paths).unwrap();
+        assert_eq!(recovered.location, ManagedLocation::Destination);
+        assert!(recovered.owner.unwrap().pending_anchor.is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_pending_staged_reference_converges_after_interruption() {
+        let (_temporary, source, destination, state) = roots();
+        let enabled = plan(&source, &destination, &state, true);
+        let paths = prepare_paths(&enabled).unwrap();
+        let target = fs::canonicalize(&paths.source).unwrap();
+        let mut owner = ReferenceOwner::initial(
+            &enabled,
+            paths.destination_fingerprint.clone(),
+            path_fingerprint(&target),
+        );
+        owner.replacing_anchor = true;
+        owner.pending_anchor = Some(create_pending_reference(&target, &paths).unwrap());
+        publish_owner(&paths.owner, &owner).unwrap();
+        finish_pending_anchor(&paths, &mut owner).unwrap();
+        owner.pending_reference = Some(create_pending_reference(&paths.anchor, &paths).unwrap());
+        write_owner(&paths.owner, &owner).unwrap();
+
+        apply_skill_reference(&enabled).unwrap().commit().unwrap();
+
+        let recovered = managed_state(&enabled, &paths).unwrap();
+        assert_eq!(recovered.location, ManagedLocation::Destination);
+        assert!(recovered.owner.unwrap().pending_reference.is_none());
     }
 
     #[cfg(any(unix, windows))]
