@@ -168,6 +168,12 @@ impl ReferenceOwner {
         self.source == source || self.pending_source.as_deref() == Some(source)
     }
 
+    fn pending_anchor_targets(&self, target: &str) -> bool {
+        self.pending_source
+            .as_deref()
+            .map_or(self.source == target, |pending| pending == target)
+    }
+
     fn transitioning_to(&self, source: &str) -> Self {
         if self.source == source {
             Self {
@@ -336,7 +342,7 @@ pub fn apply_skill_reference(
     let source = fs::canonicalize(&paths.source)
         .map_err(|source| SkillReferenceError::io(&paths.source, source))?;
     let target_source = path_fingerprint(&source);
-    recover_pending_references(plan, &paths)?;
+    recover_reference_state(plan, &paths)?;
     let previous = managed_state(plan, &paths)?;
 
     let applied = if plan.enabled {
@@ -550,13 +556,16 @@ fn require_direct_anchor(
     }
 }
 
-fn recover_pending_references(
+fn recover_reference_state(
     plan: &SkillReferencePlan,
     paths: &ReferencePaths,
 ) -> Result<(), SkillReferenceError> {
     let Some(mut owner) = read_owner(&paths.owner, plan, &paths.destination_fingerprint)? else {
         return Ok(());
     };
+    if owner.replacing_anchor && owner.anchor_identity.is_some() {
+        finish_anchor_retirement(paths, &mut owner)?;
+    }
     if owner.pending_anchor.is_some() {
         finish_pending_anchor(paths, &mut owner)?;
     }
@@ -578,7 +587,7 @@ fn finish_pending_anchor(
         })?;
     if !owner.replacing_anchor
         || owner.anchor_identity.is_some()
-        || !owner.accepts_source(&pending.target)
+        || !owner.pending_anchor_targets(&pending.target)
     {
         return Err(SkillReferenceError::InvalidOwner {
             path: paths.owner.clone(),
@@ -591,6 +600,68 @@ fn finish_pending_anchor(
     owner.pending_anchor = None;
     owner.replacing_anchor = false;
     write_owner(&paths.owner, owner)
+}
+
+fn finish_anchor_retirement(
+    paths: &ReferencePaths,
+    owner: &mut ReferenceOwner,
+) -> Result<(), SkillReferenceError> {
+    let identity = owner
+        .anchor_identity
+        .ok_or_else(|| SkillReferenceError::Conflict {
+            path: paths.owner.clone(),
+        })?;
+    if !owner.replacing_anchor || owner.pending_anchor.is_some() {
+        return Err(SkillReferenceError::InvalidOwner {
+            path: paths.owner.clone(),
+        });
+    }
+    let retired = paths.state_retired_anchor(identity);
+    let anchor = inspect_reference(&paths.anchor)?;
+    let parked = inspect_reference(&retired)?;
+    match (&anchor, &parked) {
+        (entry, ReferenceEntry::Missing) if anchor_matches_owner(entry, identity, owner) => {
+            move_noreplace(&paths.anchor, &retired)?;
+            sync_move_parents(&paths.anchor, &retired)?;
+        }
+        (ReferenceEntry::Missing, entry) if anchor_matches_owner(entry, identity, owner) => {}
+        (ReferenceEntry::Missing, ReferenceEntry::Missing) => {
+            return Err(SkillReferenceError::Conflict {
+                path: paths.anchor.clone(),
+            })
+        }
+        (ReferenceEntry::Missing, _) => return Err(SkillReferenceError::Unowned { path: retired }),
+        (_, ReferenceEntry::Missing) => {
+            return Err(SkillReferenceError::Unowned {
+                path: paths.anchor.clone(),
+            })
+        }
+        _ => {
+            return Err(SkillReferenceError::Conflict {
+                path: paths.anchor.clone(),
+            })
+        }
+    }
+    if !anchor_matches_owner(&inspect_reference(&retired)?, identity, owner) {
+        return Err(SkillReferenceError::Unowned { path: retired });
+    }
+    owner.anchor_identity = None;
+    write_owner(&paths.owner, owner)
+}
+
+fn anchor_matches_owner(
+    entry: &ReferenceEntry,
+    identity: ObjectIdentity,
+    owner: &ReferenceOwner,
+) -> bool {
+    matches!(
+        entry,
+        ReferenceEntry::Reference {
+            identity: actual,
+            resolved_fingerprint,
+            ..
+        } if *actual == identity && resolved_fingerprint == &owner.source
+    )
 }
 
 fn finish_pending_reference(
@@ -759,7 +830,7 @@ fn restore_previous(
     plan: &SkillReferencePlan,
     previous: &ManagedState,
 ) -> Result<(), SkillReferenceError> {
-    recover_pending_references(plan, paths)?;
+    recover_reference_state(plan, paths)?;
     if previous.location == ManagedLocation::Destination {
         let source =
             previous
@@ -817,15 +888,14 @@ fn ensure_anchor(
         state.location = ManagedLocation::Stage;
     }
 
-    owner.anchor_identity = None;
     owner.replacing_anchor = true;
     if owner.source != source_fingerprint {
         owner.pending_source = Some(source_fingerprint.to_owned());
     }
     write_owner(&paths.owner, owner)?;
 
-    if let Some(identity) = state.anchor_identity {
-        retire_anchor(paths, identity)?;
+    if owner.anchor_identity.is_some() {
+        finish_anchor_retirement(paths, owner)?;
     } else {
         require_missing(&paths.anchor)?;
     }
@@ -911,33 +981,6 @@ fn move_managed_reference(
                 }),
                 Err(error) => Err(SkillReferenceError::Recovery {
                     message: format!("a changed Skill reference could not be restored: {error}"),
-                }),
-            }
-        }
-    }
-}
-
-fn retire_anchor(
-    paths: &ReferencePaths,
-    expected_identity: ObjectIdentity,
-) -> Result<(), SkillReferenceError> {
-    let retired = paths.state_retired_anchor(expected_identity);
-    require_missing(&retired)?;
-    move_noreplace(&paths.anchor, &retired)?;
-    sync_move_parents(&paths.anchor, &retired)?;
-    match inspect_reference(&retired)? {
-        ReferenceEntry::Reference { identity, .. } if identity == expected_identity => Ok(()),
-        _ => {
-            let restore = move_noreplace(&retired, &paths.anchor)
-                .and_then(|()| sync_move_parents(&retired, &paths.anchor));
-            match restore {
-                Ok(()) => Err(SkillReferenceError::Unowned {
-                    path: paths.anchor.clone(),
-                }),
-                Err(error) => Err(SkillReferenceError::Recovery {
-                    message: format!(
-                        "an unowned private anchor was quarantined; restore failed: {error}"
-                    ),
                 }),
             }
         }
@@ -1308,8 +1351,10 @@ fn read_owner(
             (None, None, false)
                 | (None, None, true)
                 | (None, Some(_), false)
+                | (None, Some(_), true)
                 | (Some(_), None, true)
                 | (Some(_), Some(_), false)
+                | (Some(_), Some(_), true)
         ),
         (Some(pending), None) => {
             owner.reference_identity.is_none()
@@ -1320,7 +1365,7 @@ fn read_owner(
         (None, Some(pending)) => {
             owner.anchor_identity.is_none()
                 && owner.replacing_anchor
-                && owner.accepts_source(&pending.target)
+                && owner.pending_anchor_targets(&pending.target)
                 && valid_pending_reference(pending)
         }
         (Some(_), Some(_)) => false,
@@ -2048,6 +2093,71 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn an_anchor_retirement_checkpoint_converges_after_interruption() {
+        let (temporary, source, destination, state) = roots();
+        let enabled = plan(&source, &destination, &state, true);
+        apply_skill_reference(&enabled).unwrap().commit().unwrap();
+        let paths = prepare_paths(&enabled).unwrap();
+        let relocated = temporary.path().join("relocated");
+        fs::create_dir_all(relocated.join("demo")).unwrap();
+        fs::write(relocated.join("demo/SKILL.md"), "# Relocated\n").unwrap();
+        let relocated_plan = plan(&relocated, &destination, &state, true);
+        let relocated_source = fs::canonicalize(relocated.join("demo")).unwrap();
+        let relocated_fingerprint = path_fingerprint(&relocated_source);
+        let mut owner = managed_state(&enabled, &paths)
+            .unwrap()
+            .owner
+            .unwrap()
+            .transitioning_to(&relocated_fingerprint);
+        park_destination(&paths, owner.reference_identity.unwrap()).unwrap();
+        owner.replacing_anchor = true;
+        write_owner(&paths.owner, &owner).unwrap();
+
+        apply_skill_reference(&relocated_plan)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let recovered = managed_state(&relocated_plan, &paths).unwrap();
+        assert_eq!(recovered.location, ManagedLocation::Destination);
+        assert_eq!(
+            recovered.anchor_source.as_deref(),
+            Some(relocated_fingerprint.as_str())
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_replaced_retiring_anchor_is_never_adopted() {
+        let (temporary, source, destination, state) = roots();
+        let enabled = plan(&source, &destination, &state, true);
+        apply_skill_reference(&enabled).unwrap().commit().unwrap();
+        let paths = prepare_paths(&enabled).unwrap();
+        let relocated = temporary.path().join("relocated");
+        fs::create_dir_all(relocated.join("demo")).unwrap();
+        fs::write(relocated.join("demo/SKILL.md"), "# Relocated\n").unwrap();
+        let relocated_plan = plan(&relocated, &destination, &state, true);
+        let relocated_source = fs::canonicalize(relocated.join("demo")).unwrap();
+        let mut owner = managed_state(&enabled, &paths)
+            .unwrap()
+            .owner
+            .unwrap()
+            .transitioning_to(&path_fingerprint(&relocated_source));
+        park_destination(&paths, owner.reference_identity.unwrap()).unwrap();
+        owner.replacing_anchor = true;
+        write_owner(&paths.owner, &owner).unwrap();
+        let declared_target = reference_target(&paths.anchor).unwrap();
+        delete_reference_for_test(&paths.anchor);
+        create_reference(&declared_target, &paths.anchor).unwrap();
+
+        assert!(matches!(
+            apply_skill_reference(&relocated_plan),
+            Err(SkillReferenceError::Unowned { .. })
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn a_retired_anchor_checkpoint_converges_after_interruption() {
         let (temporary, source, destination, state) = roots();
         let enabled = plan(&source, &destination, &state, true);
@@ -2065,10 +2175,12 @@ mod tests {
             .unwrap()
             .transitioning_to(&relocated_fingerprint);
         park_destination(&paths, owner.reference_identity.unwrap()).unwrap();
-        let previous_anchor = owner.anchor_identity.take().unwrap();
+        let previous_anchor = owner.anchor_identity.unwrap();
         owner.replacing_anchor = true;
         write_owner(&paths.owner, &owner).unwrap();
-        retire_anchor(&paths, previous_anchor).unwrap();
+        let retired = paths.state_retired_anchor(previous_anchor);
+        move_noreplace(&paths.anchor, &retired).unwrap();
+        sync_move_parents(&paths.anchor, &retired).unwrap();
 
         apply_skill_reference(&relocated_plan)
             .unwrap()
