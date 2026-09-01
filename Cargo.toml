@@ -17,10 +17,12 @@ json5 = "0.4"
 json-five = "0.3.1"
 serde_yaml = "0.9"
 sha2 = "0.10"
+unicode-casefold = "0.2"
 unicode-normalization = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 junction = { version = "2.0", default-features = false }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "visionos", target_os = "watchos", target_os = "redox"))'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }

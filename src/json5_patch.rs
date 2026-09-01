@@ -20,13 +20,10 @@ pub(crate) fn replace_object_path_value(
     Ok(document.to_string())
 }
 
-pub(crate) fn object_path_has_comments(source: &str, path: &[&str]) -> Result<bool, String> {
-    if path.is_empty() {
-        return Err("JSON5 object path is empty".to_owned());
-    }
-    let document: JSONText =
+pub(crate) fn document_has_comments(source: &str) -> Result<bool, String> {
+    let _: JSONText =
         parse_json5(source).map_err(|_| "round-trip JSON5 could not be parsed".to_owned())?;
-    Ok(find_path(&document.value, path)?.is_some_and(value_has_comments))
+    Ok(contains_comment(source))
 }
 
 pub(crate) fn validate_unique_object_paths(source: &str, paths: &[&[&str]]) -> Result<(), String> {
@@ -272,40 +269,6 @@ fn contains_comment(source: &str) -> bool {
     false
 }
 
-fn value_has_comments(value: &JSONValue) -> bool {
-    match value {
-        JSONValue::JSONObject {
-            key_value_pairs,
-            context,
-        } => {
-            context
-                .as_ref()
-                .is_some_and(|context| contains_comment(&context.wsc.0))
-                || key_value_pairs.iter().any(|pair| {
-                    pair.context.as_ref().is_some_and(|context| {
-                        contains_comment(&context.wsc.0)
-                            || contains_comment(&context.wsc.1)
-                            || contains_comment(&context.wsc.2)
-                            || context.wsc.3.as_deref().is_some_and(contains_comment)
-                    }) || value_has_comments(&pair.value)
-                })
-        }
-        JSONValue::JSONArray { values, context } => {
-            context
-                .as_ref()
-                .is_some_and(|context| contains_comment(&context.wsc.0))
-                || values.iter().any(|value| {
-                    value.context.as_ref().is_some_and(|context| {
-                        contains_comment(&context.wsc.0)
-                            || context.wsc.1.as_deref().is_some_and(contains_comment)
-                    }) || value_has_comments(&value.value)
-                })
-        }
-        JSONValue::Unary { value, .. } => value_has_comments(value),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -341,12 +304,13 @@ mod tests {
     }
 
     #[test]
-    fn comments_inside_the_replaced_value_are_detected() {
-        let source = "{ skills: { disabled: ['old', // keep\n] } }";
-        assert!(object_path_has_comments(source, &["skills", "disabled"]).unwrap());
-        assert!(
-            !object_path_has_comments("{ // keep\n skills: {} }", &["skills", "disabled"]).unwrap()
-        );
+    fn document_comments_are_detected() {
+        assert!(document_has_comments("{ skills: { disabled: ['old', // keep\n] } }").unwrap());
+        assert!(document_has_comments("{ // keep\n skills: {} }").unwrap());
+        assert!(document_has_comments("{skills:{enabled:true /* keep */,disabled:[]}}").unwrap());
+        assert!(document_has_comments("/* before */ {skills:{disabled:[]}}").unwrap());
+        assert!(document_has_comments("{skills:{disabled:[]}} // after\n").unwrap());
+        assert!(!document_has_comments("{ note: 'literal // value' }").unwrap());
     }
 
     #[test]

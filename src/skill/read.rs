@@ -8,6 +8,7 @@ use std::{
 
 use serde::Serialize;
 use thiserror::Error;
+use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
@@ -33,7 +34,8 @@ const MAX_HERMES_PLATFORM_BYTES: usize = 128;
 /// owns the common observation and state policy once those paths are supplied.
 /// Observation accepts roots that do not exist yet. Before executing a write,
 /// the host must create the selected native root and Core state root as real
-/// directories while holding the shared live-config lock.
+/// directories while holding the shared live-config lock. On Unix, the state
+/// root must be accessible only to its owner.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SkillAppRuntime {
     app: AppType,
@@ -301,8 +303,12 @@ pub(super) fn roots_overlap(left: &Path, right: &Path) -> bool {
 #[cfg(any(windows, target_os = "macos"))]
 fn comparable_path(path: &Path) -> Vec<String> {
     path.components()
-        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .map(|component| comparison_key(&component.as_os_str().to_string_lossy()))
         .collect()
+}
+
+fn comparison_key(value: &str) -> String {
+    value.nfc().case_fold().nfc().collect()
 }
 
 pub(super) fn resolve_root(path: &Path) -> Result<PathBuf, SkillRuntimeError> {
@@ -498,6 +504,7 @@ pub(super) fn validate_catalog_identity(
     }
     let mut ids = HashSet::new();
     let mut directories = HashSet::new();
+    let mut canonical_directories = HashSet::new();
     let has_name_controls = runtime.apps.iter().any(|app| {
         builtin_app_registry()
             .for_app(&app.app)
@@ -518,15 +525,23 @@ pub(super) fn validate_catalog_identity(
                 id: entry.id().to_owned(),
             });
         }
-        let key = entry
-            .directory()
-            .nfc()
-            .flat_map(char::to_lowercase)
-            .collect::<String>();
+        let key = comparison_key(entry.directory());
         if !directories.insert(key) {
             return Err(SkillReadError::DuplicateDirectory {
                 directory: entry.directory().to_owned(),
             });
+        }
+        let source = runtime.source_root.join(entry.directory());
+        match fs::canonicalize(source) {
+            Ok(source) => {
+                if !canonical_directories.insert(source) {
+                    return Err(SkillReadError::DuplicateDirectory {
+                        directory: entry.directory().to_owned(),
+                    });
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
         }
         if has_name_controls {
             let key = if case_insensitive_names {
@@ -1531,12 +1546,14 @@ mod tests {
             )
             .expect("entry")
         };
-        let catalog = [entry("one", "é"), entry("two", "e\u{301}")];
-
-        assert!(matches!(
-            inspect_installed_skills(&catalog, &runtime),
-            Err(SkillReadError::DuplicateDirectory { .. })
-        ));
+        for aliases in [["é", "e\u{301}"], ["Σ", "ς"]] {
+            let catalog = [entry("one", aliases[0]), entry("two", aliases[1])];
+            assert!(matches!(
+                inspect_installed_skills(&catalog, &runtime),
+                Err(SkillReadError::DuplicateDirectory { .. })
+            ));
+        }
+        assert_eq!(comparison_key("Σ"), comparison_key("ς"));
     }
 
     #[test]

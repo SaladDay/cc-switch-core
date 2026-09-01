@@ -382,16 +382,6 @@ fn project_gemini(
 ) -> Result<Option<String>, SkillConfigWriteError> {
     validate_gemini_consumed_fields(target, contents).map_err(SkillConfigWriteError::from_read)?;
     let original = optional_utf8(target, contents)?;
-    if let Some(original) = original.filter(|original| !original.is_empty()) {
-        if json5_patch::object_path_has_comments(original, &["skills", "disabled"])
-            .map_err(|message| write_invalid(target, &message))?
-        {
-            return Err(write_invalid(
-                target,
-                "'skills.disabled' contains comments that cannot be preserved safely",
-            ));
-        }
-    }
     let mut root = parse_json(target, contents).map_err(SkillConfigWriteError::from_read)?;
     let skills = root
         .get("skills")
@@ -426,6 +416,16 @@ fn project_gemini(
     if contains != enabled {
         return Ok(None);
     }
+    if let Some(original) = original.filter(|original| !original.is_empty()) {
+        if json5_patch::document_has_comments(original)
+            .map_err(|message| write_invalid(target, &message))?
+        {
+            return Err(write_invalid(
+                target,
+                "comments cannot be preserved safely in this JSON5 document",
+            ));
+        }
+    }
 
     let next = changed_names(disabled, name, enabled, |left, right| {
         left.to_lowercase() == right.to_lowercase()
@@ -451,6 +451,8 @@ fn project_gemini(
         .map_err(|message| write_invalid(target, &message))?,
         None => pretty_json(&root).map_err(|message| write_invalid(target, &message))?,
     };
+    json5::from_str::<Value>(&projected)
+        .map_err(|_| write_invalid(target, "projected document is not valid JSON5"))?;
     bounded_projection(target, projected)
 }
 
@@ -868,7 +870,7 @@ mod tests {
 
     #[test]
     fn gemini_projection_changes_only_the_disabled_value() {
-        let input = b"{\n  // keep\n  theme: 'dark',\n  skills: { disabled: ['Old'] },\n}\n";
+        let input = b"{\n  theme: 'dark',\n  skills: { disabled: ['Old'] },\n}\n";
         let output = project_native_control(
             SkillConfigTarget::GeminiSettings,
             Some(input),
@@ -880,7 +882,6 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(output.contains("// keep"));
         assert!(output.contains("theme: 'dark'"));
         assert_eq!(
             inspect(
@@ -889,6 +890,44 @@ mod tests {
                 "old"
             ),
             Ok(NativeSkillControl::Enabled)
+        );
+    }
+
+    #[test]
+    fn gemini_projection_rejects_commented_json5() {
+        assert!(project_native_control(
+            SkillConfigTarget::GeminiSettings,
+            Some(b"{// keep\nskills:{disabled:['demo']}}"),
+            None,
+            "demo",
+            "demo",
+            true,
+        )
+        .is_err());
+        assert!(project_native_control(
+            SkillConfigTarget::GeminiSettings,
+            Some(b"{skills:{enabled:true /* keep */,disabled:[]}}"),
+            None,
+            "demo",
+            "demo",
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gemini_noop_accepts_commented_json5() {
+        assert_eq!(
+            project_native_control(
+                SkillConfigTarget::GeminiSettings,
+                Some(b"{// untouched\nskills:{disabled:['demo']}}"),
+                None,
+                "demo",
+                "demo",
+                false,
+            )
+            .unwrap(),
+            None
         );
     }
 

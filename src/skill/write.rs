@@ -10,6 +10,7 @@ use crate::{
 };
 
 use super::{
+    catalog::valid_skill_id,
     config::{project_native_control, SkillConfigWriteError},
     inspect_installed_skills,
     read::validate_catalog_identity,
@@ -189,7 +190,7 @@ impl<R> SkillLiveReceipt<R> {
         self.reference.is_none() && self.configuration.is_none()
     }
 
-    /// Finishes hidden reference cleanup after the database commit succeeds.
+    /// Rechecks the live reference after the database commit succeeds.
     pub fn commit(self) -> Result<(), SkillReferenceError> {
         match self.reference {
             Some(receipt) => receipt.commit(),
@@ -460,6 +461,9 @@ pub fn prepare_skill_switch(
     app: &AppType,
     target_enabled: bool,
 ) -> Result<SkillSwitchPlan, SkillPrepareError> {
+    if !valid_skill_id(skill_id) {
+        return Err(SkillPrepareError::InvalidSkillId);
+    }
     prepare(catalog, skill_id, runtime, app, Some(target_enabled))
 }
 
@@ -475,6 +479,9 @@ pub fn prepare_skill_reconciliation(
     runtime: &SkillRuntime,
     app: &AppType,
 ) -> Result<SkillSwitchPlan, SkillPrepareError> {
+    if !valid_skill_id(skill_id) {
+        return Err(SkillPrepareError::InvalidSkillId);
+    }
     prepare(catalog, skill_id, runtime, app, None)
 }
 
@@ -617,6 +624,8 @@ fn prepare(
 pub enum SkillPrepareError {
     #[error(transparent)]
     Read(#[from] SkillReadError),
+    #[error("Skill id is invalid")]
+    InvalidSkillId,
     #[error("Skill is missing from the catalog: {skill_id}")]
     MissingSkill { skill_id: String },
     #[error("application '{app}' is missing from the Skill runtime")]
@@ -732,6 +741,11 @@ mod tests {
         let state = source.parent().expect("source has a parent").join("state");
         fs::create_dir_all(native).unwrap();
         fs::create_dir_all(&state).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         SkillRuntime::try_new(
             source,
             unified,
@@ -934,6 +948,28 @@ mod tests {
                 SkillReadError::CatalogTooLarge { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn public_switches_reject_unbounded_or_control_character_ids() {
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let unified = temporary.path().join("unified");
+        let native = temporary.path().join("native");
+        write_skill(&source);
+        let runtime = runtime(&source, &unified, &native, AppType::Claude, None);
+        let catalog = [entry(false)];
+
+        for invalid in ["bad\nlog", &"x".repeat(1025)] {
+            assert!(matches!(
+                prepare_skill_switch(&catalog, invalid, &runtime, &AppType::Claude, true),
+                Err(SkillPrepareError::InvalidSkillId)
+            ));
+            assert!(matches!(
+                prepare_skill_reconciliation(&catalog, invalid, &runtime, &AppType::Claude),
+                Err(SkillPrepareError::InvalidSkillId)
+            ));
+        }
     }
 
     #[test]

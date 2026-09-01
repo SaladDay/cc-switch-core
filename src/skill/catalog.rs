@@ -140,6 +140,10 @@ fn validate_text(
     Ok(())
 }
 
+pub(super) fn valid_skill_id(value: &str) -> bool {
+    validate_text("id", value, MAX_SKILL_ID_BYTES).is_ok()
+}
+
 fn validate_directory(directory: &str) -> Result<(), SkillCatalogEntryError> {
     let mut components = Path::new(directory).components();
     let valid_component = matches!(
