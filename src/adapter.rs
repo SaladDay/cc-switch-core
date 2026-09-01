@@ -7,7 +7,7 @@ use crate::{
     LogicalTarget, McpAppContract, McpConfigError, McpConfigTarget, McpImport, McpServerProjection,
     NativeAction, NativeImportError, NativeImportStep, NativePlanError, NativePlanRequest,
     OperationPlan, OperationPlanError, ProviderSnapshot, SimpleProviderError,
-    SimpleProviderFormDescriptor, SimpleProviderValues, SkillAppContract,
+    SimpleProviderFormDescriptor, SimpleProviderValues,
 };
 
 mod sealed {
@@ -38,11 +38,6 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
     /// Returns this application's MCP behavior, when supported.
     fn mcp_contract(&self) -> Option<&'static McpAppContract> {
         self.descriptor().mcp_contract()
-    }
-
-    /// Returns this application's installed-Skill behavior, when supported.
-    fn skill_contract(&self) -> Option<&'static SkillAppContract> {
-        self.descriptor().skill_contract()
     }
 
     /// Extracts valid unified MCP servers from an observed live document.

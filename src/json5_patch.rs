@@ -28,6 +28,70 @@ pub(crate) fn replace_object_path_value(
     Ok(text.to_string())
 }
 
+pub(crate) fn object_path_has_comments(source: &str, path: &[&str]) -> Result<bool, String> {
+    if path.is_empty() {
+        return Err("JSON5 object path is empty".to_owned());
+    }
+    let text: JSONText = parse_round_trip_json5(source)
+        .map_err(|_| "round-trip JSON5 could not be parsed".to_owned())?;
+    Ok(find_path(&text.value, path)?
+        .map(ToString::to_string)
+        .is_some_and(|value| contains_comment(&value)))
+}
+
+fn find_path<'a>(node: &'a JSONValue, path: &[&str]) -> Result<Option<&'a JSONValue>, String> {
+    let JSONValue::JSONObject {
+        key_value_pairs, ..
+    } = node
+    else {
+        return Err(format!("'{}' parent must be an object", path[0]));
+    };
+    let mut matches = key_value_pairs
+        .iter()
+        .filter(|pair| key_name(&pair.key) == Some(path[0]));
+    let Some(pair) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(format!("contains duplicate '{}' fields", path[0]));
+    }
+    if path.len() == 1 {
+        Ok(Some(&pair.value))
+    } else {
+        find_path(&pair.value, &path[1..])
+    }
+}
+
+fn contains_comment(source: &str) -> bool {
+    let mut characters = source.chars().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    while let Some(character) = characters.next() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        if character == '/'
+            && characters
+                .peek()
+                .is_some_and(|next| matches!(next, '/' | '*'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn replace_path(node: &mut JSONValue, path: &[&str], value: &Value) -> Result<(), String> {
     let JSONValue::JSONObject {
         key_value_pairs,
@@ -228,5 +292,17 @@ mod tests {
         let parsed: Value = json5::from_str(&output).unwrap();
         assert_eq!(parsed["skills"]["disabled"], json!(["docs"]));
         assert_eq!(parsed["theme"], "dark");
+    }
+
+    #[test]
+    fn comments_are_detected_only_inside_the_selected_value() {
+        let source = "{\n  // keep\n  skills: { disabled: ['old', // policy\n  ] },\n}\n";
+        assert!(object_path_has_comments(source, &["skills", "disabled"]).unwrap());
+        assert!(!object_path_has_comments(
+            "{ // keep\n skills: { disabled: ['old'] } }",
+            &["skills", "disabled"]
+        )
+        .unwrap());
+        assert!(!object_path_has_comments(source, &["missing"]).unwrap());
     }
 }

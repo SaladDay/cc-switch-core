@@ -292,7 +292,13 @@ impl SkillDeploymentReceipt {
     /// Finalizes an applied change after the host commits its catalog transaction.
     pub fn commit(self) -> Result<(), SkillConfigError> {
         self.verify()?;
-        if let DeploymentChange::Removed { temporary_root, .. } = self.change {
+        if let DeploymentChange::Removed {
+            temporary_root,
+            backup,
+            ..
+        } = self.change
+        {
+            remove_deployment(&backup)?;
             remove_directory(&temporary_root)?;
         }
         Ok(())
@@ -462,6 +468,7 @@ pub fn inspect_skill_config_state(
     validate_skill_name(name)?;
     let disabled = match target {
         SkillConfigTarget::GeminiSettings => {
+            ensure_json_skill_control_writable(target, contents)?;
             let root = parse_skill_json(target, contents)?;
             if !json_skills_enabled(target, &root)? {
                 return Ok(SkillConfigState::GloballyDisabled);
@@ -571,6 +578,7 @@ fn project_json_skill_enabled(
     name: &str,
     enabled: bool,
 ) -> Result<Option<String>, SkillConfigError> {
+    ensure_json_skill_control_writable(target, contents)?;
     let mut root = parse_skill_json(target, contents)?;
     let skills_enabled = json_skills_enabled(target, &root)?;
     if enabled && !skills_enabled {
@@ -621,6 +629,27 @@ fn project_json_skill_enabled(
         rendered
     };
     validate_projected_size(target, output)
+}
+
+fn ensure_json_skill_control_writable(
+    target: SkillConfigTarget,
+    contents: Option<&[u8]>,
+) -> Result<(), SkillConfigError> {
+    let Some(contents) = contents.filter(|contents| !contents.is_empty()) else {
+        return Ok(());
+    };
+    let original = std::str::from_utf8(contents)
+        .map_err(|_| invalid_skill_config(target, "document is not UTF-8"))?;
+    let has_comments =
+        crate::json5_patch::object_path_has_comments(original, &["skills", "disabled"])
+            .map_err(|message| invalid_skill_config(target, &message))?;
+    if has_comments {
+        return Err(invalid_skill_config(
+            target,
+            "'skills.disabled' contains comments that cannot be preserved safely",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_skill_json(
@@ -855,20 +884,6 @@ fn project_yaml_skill_enabled(
         return Ok(None);
     }
 
-    if let Some(original) = contents
-        .filter(|contents| !contents.is_empty())
-        .map(std::str::from_utf8)
-        .transpose()
-        .map_err(|_| invalid_skill_config(target, "document is not UTF-8"))?
-    {
-        if crate::yaml_patch::top_level_section_has_comments(original, "skills") {
-            return Err(invalid_skill_config(
-                target,
-                "the 'skills' section contains comments that cannot be preserved safely",
-            ));
-        }
-    }
-
     let root_mapping = root
         .as_mapping_mut()
         .expect("validated Skill YAML has a mapping root");
@@ -930,7 +945,21 @@ fn parse_skill_yaml(
     if contents.len() > MAX_OPERATION_CONTENT_BYTES {
         return Err(invalid_skill_config(target, "document is too large"));
     }
-    let root = serde_yaml::from_slice::<serde_yaml::Value>(contents)
+    let text = std::str::from_utf8(contents)
+        .map_err(|_| invalid_skill_config(target, "document is not UTF-8"))?;
+    if crate::yaml_patch::top_level_section_has_comments(text, "skills") {
+        return Err(invalid_skill_config(
+            target,
+            "the 'skills' section contains comments that cannot be preserved safely",
+        ));
+    }
+    if crate::yaml_patch::top_level_section_has_references(text, "skills") {
+        return Err(invalid_skill_config(
+            target,
+            "the 'skills' section contains YAML anchors, aliases, or merge keys that cannot be preserved safely",
+        ));
+    }
+    let root = serde_yaml::from_str::<serde_yaml::Value>(text)
         .map_err(|_| invalid_skill_config(target, "document is not valid YAML"))?;
     if !root.is_mapping() {
         return Err(invalid_skill_config(target, "root must be a mapping"));
@@ -1650,10 +1679,28 @@ fn recover_interrupted_deployment(
         if !metadata.file_type().is_dir() {
             continue;
         }
-        let Some(marker) = read_operation_marker(&temporary_root).ok().flatten() else {
-            continue;
+        let tagged_for_directory = temporary_name_matches_directory(&name, directory);
+        let marker = match read_operation_marker(&temporary_root) {
+            Ok(Some(marker)) => marker,
+            Ok(None) if tagged_for_directory => {
+                recover_unidentified_operation(&temporary_root, directory, "missing or invalid")?;
+                continue;
+            }
+            Err(error) if tagged_for_directory => {
+                recover_unidentified_operation(&temporary_root, directory, &error.to_string())?;
+                continue;
+            }
+            Ok(None) | Err(_) => continue,
         };
         if marker.directory != directory {
+            if tagged_for_directory {
+                return Err(SkillConfigError::Recovery {
+                    message: format!(
+                        "Skill operation marker at {:?} names a different directory",
+                        temporary_root
+                    ),
+                });
+            }
             continue;
         }
         if marker.version != TEMP_MARKER_VERSION {
@@ -1679,6 +1726,24 @@ fn recover_interrupted_deployment(
         }
     }
     Ok(())
+}
+
+fn recover_unidentified_operation(
+    temporary_root: &Path,
+    directory: &str,
+    marker_issue: &str,
+) -> Result<(), SkillConfigError> {
+    let deployment = temporary_root.join("deployment");
+    match fs::symlink_metadata(&deployment) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_directory(temporary_root)
+        }
+        Ok(_) | Err(_) => Err(SkillConfigError::Recovery {
+            message: format!(
+                "cannot identify interrupted Skill operation for '{directory}' at {temporary_root:?}: {marker_issue}"
+            ),
+        }),
+    }
 }
 
 fn read_operation_marker(
@@ -1725,29 +1790,28 @@ fn recover_interrupted_disable(
 ) -> Result<(), SkillConfigError> {
     let backup = temporary_root.join("deployment");
     let (destination_state, _) = inspect_paths(&paths.source, &paths.destination, directory)?;
+    if destination_state == SkillDeploymentState::Missing {
+        return remove_directory(temporary_root);
+    }
     let original_parent = paths
         .destination
         .parent()
         .expect("a deployment has a destination root");
     let (backup_state, _) =
         inspect_paths_with_link_parent(&paths.source, &backup, directory, original_parent)?;
-    match (destination_state, backup_state) {
-        (SkillDeploymentState::Missing, _)
-        | (
-            SkillDeploymentState::Linked | SkillDeploymentState::Copied,
-            SkillDeploymentState::Missing,
-        ) => {
-            if destination_state != SkillDeploymentState::Missing {
-                remove_deployment(&paths.destination)?;
-            }
+    match backup_state {
+        SkillDeploymentState::Missing => {
+            remove_deployment(&paths.destination)?;
             remove_directory(temporary_root)
         }
-        _ => Err(SkillConfigError::Recovery {
-            message: format!(
-                "interrupted Skill disable has both destination and backup at {:?}",
-                paths.destination
-            ),
-        }),
+        SkillDeploymentState::Linked | SkillDeploymentState::Copied => {
+            Err(SkillConfigError::Recovery {
+                message: format!(
+                    "interrupted Skill disable has both destination and backup at {:?}",
+                    paths.destination
+                ),
+            })
+        }
     }
 }
 
@@ -1761,10 +1825,11 @@ fn create_temporary_directory(
         .unwrap_or_default()
         .as_nanos();
     let mut last_error = None;
+    let directory_tag = operation_directory_tag(directory);
     for _ in 0..16 {
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(
-            "{TEMP_DIRECTORY_PREFIX}{}.{timestamp}.{counter}",
+            "{TEMP_DIRECTORY_PREFIX}{directory_tag}.{}.{timestamp}.{counter}",
             std::process::id()
         ));
         match fs::create_dir(&path) {
@@ -1791,6 +1856,26 @@ fn create_temporary_directory(
     }
     let (path, source) = last_error.expect("temporary directory loop must run");
     Err(SkillConfigError::io(path, source))
+}
+
+fn temporary_name_matches_directory(name: &std::ffi::OsStr, directory: &str) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.starts_with(&format!(
+            "{TEMP_DIRECTORY_PREFIX}{}.",
+            operation_directory_tag(directory)
+        ))
+    })
+}
+
+fn operation_directory_tag(directory: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(directory.as_bytes());
+    let mut tag = String::with_capacity(16);
+    for byte in &digest[..8] {
+        tag.push(char::from(HEX[usize::from(byte >> 4)]));
+        tag.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    tag
 }
 
 fn write_operation_marker(
@@ -2048,6 +2133,30 @@ mod tests {
     }
 
     #[test]
+    fn gemini_disabled_list_comments_are_read_only() {
+        let original = br#"{
+          skills: {
+            disabled: ['old', // policy note
+            ],
+          },
+        }"#;
+
+        assert!(matches!(
+            inspect_skill_config_state(SkillConfigTarget::GeminiSettings, Some(original), "docs"),
+            Err(SkillConfigError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            project_skill_config_enabled(
+                SkillConfigTarget::GeminiSettings,
+                Some(original),
+                "docs",
+                false
+            ),
+            Err(SkillConfigError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
     fn gemini_global_disable_is_effective_and_cannot_be_overridden() {
         let original = br#"{"skills":{"enabled":false,"disabled":[]}}"#;
         assert_eq!(
@@ -2185,6 +2294,29 @@ mod tests {
             "skills:\n  label: 'value # kept'\n",
             "skills"
         ));
+    }
+
+    #[test]
+    fn hermes_skill_yaml_references_are_read_only() {
+        for original in [
+            b"defaults: &defaults\n  disabled: [docs]\nskills:\n  <<: *defaults\n".as_slice(),
+            b"defaults: &defaults\n  token: keep\nskills:\n  config: *defaults\n  disabled: []\n"
+                .as_slice(),
+        ] {
+            assert!(matches!(
+                inspect_skill_config_state(SkillConfigTarget::HermesConfig, Some(original), "docs"),
+                Err(SkillConfigError::InvalidConfig { .. })
+            ));
+            assert!(matches!(
+                project_skill_config_enabled(
+                    SkillConfigTarget::HermesConfig,
+                    Some(original),
+                    "docs",
+                    false
+                ),
+                Err(SkillConfigError::InvalidConfig { .. })
+            ));
+        }
     }
 
     #[test]
@@ -2430,6 +2562,54 @@ mod tests {
 
         assert!(!destination.join("docs").exists());
         assert!(!temporary_root.exists());
+    }
+
+    #[test]
+    fn interrupted_disable_finishes_after_partial_backup_cleanup() {
+        let (_temporary, source, destination) = roots();
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let receipt =
+            apply_skill_deployment(&source, &destination, "docs", false, SkillSyncMethod::Copy)
+                .unwrap();
+        let temporary_root = match &receipt.change {
+            DeploymentChange::Removed { temporary_root, .. } => temporary_root.clone(),
+            _ => panic!("disable must retain a temporary backup"),
+        };
+        fs::remove_file(temporary_root.join("deployment/SKILL.md")).unwrap();
+        drop(receipt);
+
+        apply_skill_deployment(&source, &destination, "docs", false, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert!(!destination.join("docs").exists());
+        assert!(!temporary_root.exists());
+    }
+
+    #[test]
+    fn invalid_tagged_marker_blocks_only_its_skill() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(source.join("other")).unwrap();
+        fs::write(source.join("other/SKILL.md"), "# Other\n").unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Enable).unwrap();
+        fs::create_dir(temporary_root.join("deployment")).unwrap();
+        fs::write(temporary_root.join(TEMP_MARKER_FILE), b"{").unwrap();
+
+        assert!(matches!(
+            apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy),
+            Err(SkillConfigError::Recovery { .. })
+        ));
+        apply_skill_deployment(&source, &destination, "other", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert!(destination.join("other/SKILL.md").is_file());
     }
 
     #[test]

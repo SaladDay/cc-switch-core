@@ -10,6 +10,7 @@ The `0.1` API contains:
 - source-neutral, lossless provider snapshots;
 - redacted provider entries for additive application configs;
 - MCP application contracts, validation, import, and loss-aware projection;
+- installed-Skill contracts, conservative native controls, and reversible deployment;
 - deterministic JSON and atomic file-writing primitives;
 - host-neutral compare-and-swap execution with guarded rollback;
 - pure live projections and validation for all nine supported applications.
@@ -23,5 +24,9 @@ structural plan validation, compare-and-swap sequencing, and guarded rollback.
 Ordinary filesystems cannot exclude non-cooperating writers between comparison
 and replacement, so each host must document that platform limit. The crate's
 separate `fs` module remains the small shared file-writing primitive layer.
+
+The Skill layer accepts host-resolved roots and changes one already-installed
+Skill at a time. Catalog discovery, installation, updates, backups, and UI stay
+in the host product.
 
 The API may change before `1.0.0`.

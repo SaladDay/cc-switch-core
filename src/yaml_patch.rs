@@ -45,6 +45,64 @@ pub(crate) fn top_level_section_has_comments(raw: &str, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn top_level_section_has_references(raw: &str, key: &str) -> bool {
+    section_range(raw, key)
+        .map(|(start, end)| raw[start..end].lines().any(line_has_reference))
+        .unwrap_or(false)
+}
+
+fn line_has_reference(line: &str) -> bool {
+    let code = unquoted_yaml_code(line);
+    if code.trim_start().starts_with("<<:") {
+        return true;
+    }
+    let characters = code.chars().collect::<Vec<_>>();
+    characters.iter().enumerate().any(|(index, character)| {
+        if !matches!(character, '&' | '*') {
+            return false;
+        }
+        let starts_token = index == 0
+            || characters[index - 1].is_whitespace()
+            || matches!(characters[index - 1], ':' | ',' | '[' | '{' | '-' | '?');
+        let has_name = characters
+            .get(index + 1)
+            .is_some_and(|next| !next.is_whitespace() && !matches!(next, ']' | '}' | ','));
+        starts_token && has_name
+    })
+}
+
+fn unquoted_yaml_code(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut characters = line.chars().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    while let Some(character) = characters.next() {
+        if let Some(active_quote) = quote {
+            output.push(' ');
+            if escaped {
+                escaped = false;
+            } else if active_quote == '"' && character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                if active_quote == '\'' && characters.peek() == Some(&'\'') {
+                    output.push(' ');
+                    characters.next();
+                } else {
+                    quote = None;
+                }
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            output.push(' ');
+        } else if character == '#' {
+            break;
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
 fn line_has_comment(line: &str) -> bool {
     let mut single_quoted = false;
     let mut double_quoted = false;
@@ -101,4 +159,25 @@ fn top_level_key(line: &str) -> bool {
             let rest = &line[colon + 1..];
             rest.is_empty() || rest.starts_with([' ', '\t', '\r'])
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_section_references_ignore_quoted_markers() {
+        assert!(top_level_section_has_references(
+            "skills:\n  config: *defaults\nother: true\n",
+            "skills"
+        ));
+        assert!(top_level_section_has_references(
+            "skills:\n  <<: { disabled: [Docs] }\n",
+            "skills"
+        ));
+        assert!(!top_level_section_has_references(
+            "skills:\n  note: 'literal * value'\nother: &outside value\n",
+            "skills"
+        ));
+    }
 }
