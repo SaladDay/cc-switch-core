@@ -28,7 +28,7 @@ pub(super) enum NativeSkillControls {
 }
 
 impl NativeSkillControls {
-    pub(super) fn control_for(&self, name: &str) -> NativeSkillControl {
+    pub(super) fn control_for(&self, name: &str, directory: &str) -> NativeSkillControl {
         match self {
             Self::Gemini {
                 globally_enabled,
@@ -56,7 +56,7 @@ impl NativeSkillControls {
                 disabled,
                 platform_disabled,
             } => {
-                if name == "hermes-agent" {
+                if directory == "hermes-agent" {
                     NativeSkillControl::Required
                 } else if platform_disabled.iter().any(|candidate| candidate == name) {
                     NativeSkillControl::ExternallyDisabled
@@ -222,22 +222,26 @@ fn parse_hermes(
         .as_mapping()
         .ok_or_else(|| invalid(target, "'skills' must be a mapping"))?;
 
-    let platform_key = serde_yaml::Value::String("platform_disabled".to_owned());
-    let platform_disabled =
-        if let Some(platforms) = skills.get(&platform_key).filter(|value| !value.is_null()) {
-            let platforms = platforms
-                .as_mapping()
-                .ok_or_else(|| invalid(target, "'skills.platform_disabled' must be a mapping"))?;
-            match platform
-                .and_then(|platform| platforms.get(serde_yaml::Value::String(platform.to_owned())))
-            {
-                None | Some(serde_yaml::Value::Null) => Vec::new(),
-                Some(value) => yaml_name_list(target, value, "'skills.platform_disabled.*'")?,
+    let platform_disabled = match platform {
+        None => Vec::new(),
+        Some(platform) => {
+            let platform_key = serde_yaml::Value::String("platform_disabled".to_owned());
+            match skills.get(&platform_key).filter(|value| !value.is_null()) {
+                None => Vec::new(),
+                Some(platforms) => {
+                    let platforms = platforms.as_mapping().ok_or_else(|| {
+                        invalid(target, "'skills.platform_disabled' must be a mapping")
+                    })?;
+                    match platforms.get(serde_yaml::Value::String(platform.to_owned())) {
+                        None | Some(serde_yaml::Value::Null) => Vec::new(),
+                        Some(value) => {
+                            yaml_name_list(target, value, "'skills.platform_disabled.*'")?
+                        }
+                    }
+                }
             }
-        } else {
-            Vec::new()
-        };
-
+        }
+    };
     let disabled_key = serde_yaml::Value::String("disabled".to_owned());
     let disabled = match skills.get(&disabled_key) {
         None | Some(serde_yaml::Value::Null) => Vec::new(),
@@ -323,7 +327,8 @@ mod tests {
         contents: Option<&[u8]>,
         name: &str,
     ) -> Result<NativeSkillControl, SkillConfigReadError> {
-        parse_native_controls(target, contents, None).map(|controls| controls.control_for(name))
+        parse_native_controls(target, contents, None)
+            .map(|controls| controls.control_for(name, name))
     }
 
     fn inspect_for_platform(
@@ -333,7 +338,7 @@ mod tests {
         platform: &str,
     ) -> Result<NativeSkillControl, SkillConfigReadError> {
         parse_native_controls(target, contents, Some(platform))
-            .map(|controls| controls.control_for(name))
+            .map(|controls| controls.control_for(name, name))
     }
 
     #[test]
@@ -410,6 +415,28 @@ mod tests {
                 "telegram",
             ),
             Ok(NativeSkillControl::Required)
+        );
+        let controls = parse_native_controls(
+            SkillConfigTarget::HermesConfig,
+            Some(platform_controls),
+            Some("telegram"),
+        )
+        .expect("Hermes controls");
+        assert_eq!(
+            controls.control_for("Hermes Agent", "hermes-agent"),
+            NativeSkillControl::Required
+        );
+    }
+
+    #[test]
+    fn hermes_ignores_platform_controls_without_an_active_platform() {
+        assert_eq!(
+            inspect(
+                SkillConfigTarget::HermesConfig,
+                Some(b"skills:\n  platform_disabled: []\n"),
+                "demo",
+            ),
+            Ok(NativeSkillControl::Enabled)
         );
     }
 

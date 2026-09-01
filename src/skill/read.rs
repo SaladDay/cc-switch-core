@@ -22,6 +22,9 @@ use super::{
 
 const MAX_SKILL_TREE_ENTRIES: usize = 10_000;
 const MAX_SKILL_TREE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SKILL_TREE_DEPTH: usize = 64;
+const MAX_SKILL_CATALOG_ENTRIES: usize = 10_000;
+const MAX_SKILL_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_HERMES_PLATFORM_BYTES: usize = 128;
 
 /// Host-resolved runtime inputs for one application.
@@ -254,7 +257,23 @@ fn validate_distinct_roots(
 }
 
 fn roots_overlap(left: &Path, right: &Path) -> bool {
-    left == right || left.starts_with(right) || right.starts_with(left)
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let left = comparable_path(left);
+        let right = comparable_path(right);
+        left == right || left.starts_with(&right) || right.starts_with(&left)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        left == right || left.starts_with(right) || right.starts_with(left)
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn comparable_path(path: &Path) -> Vec<String> {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect()
 }
 
 fn resolve_root(path: &Path) -> Result<PathBuf, SkillRuntimeError> {
@@ -411,10 +430,19 @@ pub enum SkillControlReason {
 }
 
 /// Observes installed Skills without changing the catalog or filesystem.
+///
+/// Root relationships are revalidated for every snapshot. A later write must
+/// still repeat its own validation while holding the shared host lock.
 pub fn inspect_installed_skills(
     catalog: &[SkillCatalogEntry],
     runtime: &SkillRuntime,
 ) -> Result<Vec<InstalledSkillSnapshot>, SkillReadError> {
+    if catalog.len() > MAX_SKILL_CATALOG_ENTRIES {
+        return Err(SkillReadError::CatalogTooLarge {
+            limit: MAX_SKILL_CATALOG_ENTRIES,
+        });
+    }
+    validate_distinct_roots(&runtime.source_root, &runtime.unified_root, &runtime.apps)?;
     validate_catalog_identity(catalog)?;
     let apps = runtime.apps().map(PreparedApp::new).collect::<Vec<_>>();
     Ok(catalog
@@ -567,7 +595,9 @@ fn inspect_app(
     );
     let selected = match contract.selection_store() {
         SkillSelectionStore::CatalogColumn(_) => catalog_selected,
-        SkillSelectionStore::NativeDirectory => native.presence(),
+        SkillSelectionStore::NativeDirectory => {
+            observe_native_directory_selection(&runtime.native_root, entry.directory())
+        }
     };
     if native.is_unreadable() {
         return state_unavailable(runtime, selected, SkillControlReason::ObservationFailed);
@@ -591,7 +621,7 @@ fn inspect_app(
     let present = native.is_selected() || direct.is_selected();
     let control = match prepared.controls.as_ref() {
         None => None,
-        Some(Ok(controls)) => Some(controls.control_for(entry.name())),
+        Some(Ok(controls)) => Some(controls.control_for(entry.name(), entry.directory())),
         Some(Err(())) => {
             return state_unavailable(runtime, selected, SkillControlReason::InvalidConfiguration)
         }
@@ -662,13 +692,34 @@ fn inspect_source(path: &Path) -> SourceObservation {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return SourceObservation::Invalid;
     }
-    match fs::symlink_metadata(path.join("SKILL.md")) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
+    let manifest_path = path.join("SKILL.md");
+    // Catalog metadata is host-supplied, and legacy manifests may omit YAML
+    // frontmatter. Core validates the file boundary, not optional metadata.
+    let manifest_metadata = match fs::symlink_metadata(&manifest_path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
         Ok(_) => return SourceObservation::Invalid,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return SourceObservation::Invalid
         }
         Err(_) => return SourceObservation::Unreadable,
+    };
+    if manifest_metadata.len() > MAX_SKILL_MANIFEST_BYTES {
+        return SourceObservation::Invalid;
+    }
+    let mut manifest = match File::open(&manifest_path) {
+        Ok(file) => file.take(MAX_SKILL_MANIFEST_BYTES + 1),
+        Err(_) => return SourceObservation::Unreadable,
+    };
+    let mut contents = Vec::with_capacity(
+        usize::try_from(manifest_metadata.len())
+            .unwrap_or(0)
+            .min(MAX_SKILL_MANIFEST_BYTES as usize),
+    );
+    if manifest.read_to_end(&mut contents).is_err() {
+        return SourceObservation::Unreadable;
+    }
+    if contents.len() as u64 > MAX_SKILL_MANIFEST_BYTES || std::str::from_utf8(&contents).is_err() {
+        return SourceObservation::Invalid;
     }
     match fs::canonicalize(path) {
         Ok(canonical) => SourceObservation::Ready(ReadySource {
@@ -714,14 +765,6 @@ impl PathRelation {
 
     fn is_unreadable(self) -> bool {
         self == Self::Unreadable
-    }
-
-    fn presence(self) -> Option<bool> {
-        match self {
-            Self::Missing | Self::Blocked => Some(false),
-            Self::Selected | Self::External => Some(true),
-            Self::Unreadable => None,
-        }
     }
 }
 
@@ -807,16 +850,20 @@ fn tree_digest(root: &Path) -> Result<[u8; 32], ()> {
     let mut budget = TreeBudget::default();
     let mut hasher = Sha256::new();
     hasher.update(b"cc-switch-skill-read-v1\0");
-    hash_directory(root, root, &mut budget, &mut hasher)?;
+    hash_directory(root, root, 0, &mut budget, &mut hasher)?;
     Ok(hasher.finalize().into())
 }
 
 fn hash_directory(
     root: &Path,
     directory: &Path,
+    depth: usize,
     budget: &mut TreeBudget,
     hasher: &mut Sha256,
 ) -> Result<(), ()> {
+    if depth > MAX_SKILL_TREE_DEPTH {
+        return Err(());
+    }
     let mut entries = read_directory_entries(directory, budget)?;
     entries.sort_by_key(DirEntry::file_name);
     for entry in entries {
@@ -828,7 +875,7 @@ fn hash_directory(
             hasher.update(b"d\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
-            hash_directory(root, &path, budget, hasher)?;
+            hash_directory(root, &path, depth.saturating_add(1), budget, hasher)?;
         } else if metadata.file_type().is_file() {
             hasher.update(b"f\0");
             hasher.update(relative.as_bytes());
@@ -933,6 +980,10 @@ pub enum SkillRuntimeError {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SkillReadError {
+    #[error("Skill catalog exceeds the {limit}-entry limit")]
+    CatalogTooLarge { limit: usize },
+    #[error(transparent)]
+    Runtime(#[from] SkillRuntimeError),
     #[error("duplicate Skill id: {id:?}")]
     DuplicateId { id: String },
     #[error("duplicate Skill directory: {directory:?}")]
@@ -1041,6 +1092,25 @@ mod tests {
         assert_eq!(pi.selected(), Some(true));
         assert_eq!(pi.enabled(), None);
         assert!(!pi.writable());
+        assert_eq!(pi.reason(), Some(SkillControlReason::NativeConflict));
+    }
+
+    #[test]
+    fn pi_selection_uses_native_presence_even_when_the_entry_is_invalid() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let native = temp.path().join("native");
+        let unified = temp.path().join("unified");
+        write_skill(&source, "demo", "source");
+        fs::create_dir_all(native.join("demo")).expect("native directory");
+        let runtime = SkillRuntime::try_new(&source, &unified, [app_runtime(&native, AppType::Pi)])
+            .expect("runtime");
+
+        let snapshots =
+            inspect_installed_skills(&[catalog_entry("demo", false)], &runtime).expect("snapshots");
+        let pi = state(&snapshots[0], &AppType::Pi);
+        assert_eq!(pi.selected(), Some(true));
+        assert_eq!(pi.enabled(), None);
         assert_eq!(pi.reason(), Some(SkillControlReason::NativeConflict));
     }
 
@@ -1159,8 +1229,16 @@ mod tests {
             .expect("Hermes platform");
         let runtime = SkillRuntime::try_new(&source, &unified, [hermes]).expect("runtime");
 
-        let snapshots = inspect_installed_skills(&[catalog_entry("hermes-agent", false)], &runtime)
-            .expect("snapshots");
+        let selections = crate::skill_catalog_columns().map(|column| (column, false));
+        let required = SkillCatalogEntry::try_new(
+            "nous/hermes:hermes-agent",
+            "Hermes Agent",
+            None,
+            "hermes-agent",
+            selections,
+        )
+        .expect("required Skill");
+        let snapshots = inspect_installed_skills(&[required], &runtime).expect("snapshots");
         let hermes = state(&snapshots[0], &AppType::Hermes);
         assert_eq!(hermes.enabled(), Some(false));
         assert!(!hermes.writable());
@@ -1196,6 +1274,20 @@ mod tests {
 
         assert!(matches!(
             SkillRuntime::try_new(&source, &unified, [claude]),
+            Err(SkillRuntimeError::OverlappingRoots { .. })
+        ));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn runtime_rejects_case_only_missing_root_aliases() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("Skills");
+        let unified = temp.path().join("skills");
+        let native = temp.path().join("native");
+
+        assert!(matches!(
+            SkillRuntime::try_new(&source, &unified, [app_runtime(&native, AppType::Pi)]),
             Err(SkillRuntimeError::OverlappingRoots { .. })
         ));
     }
@@ -1243,6 +1335,103 @@ mod tests {
         assert_eq!(claude.enabled(), None);
         assert!(!claude.writable());
         assert_eq!(claude.reason(), Some(SkillControlReason::InvalidSource));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_revalidate_root_aliases_after_runtime_construction() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let unified = temp.path().join("unified");
+        let native = temp.path().join("native");
+        write_skill(&source, "demo", "source");
+        let runtime =
+            SkillRuntime::try_new(&source, &unified, [app_runtime(&native, AppType::Claude)])
+                .expect("runtime");
+        symlink(&source, &unified).expect("late unified alias");
+
+        assert!(matches!(
+            inspect_installed_skills(&[catalog_entry("demo", true)], &runtime),
+            Err(SkillReadError::Runtime(
+                SkillRuntimeError::OverlappingRoots { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn source_manifests_are_bounded_utf8_files() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let unified = temp.path().join("unified");
+        let native = temp.path().join("native");
+        write_skill(&source, "binary", "source");
+        write_skill(&source, "oversized", "source");
+        fs::write(source.join("binary/SKILL.md"), [0xff]).expect("binary manifest");
+        fs::write(
+            source.join("oversized/SKILL.md"),
+            vec![b'x'; MAX_SKILL_MANIFEST_BYTES as usize + 1],
+        )
+        .expect("oversized manifest");
+        let runtime =
+            SkillRuntime::try_new(&source, &unified, [app_runtime(&native, AppType::Claude)])
+                .expect("runtime");
+        let catalog = [
+            catalog_entry("binary", true),
+            catalog_entry("oversized", true),
+        ];
+
+        let snapshots = inspect_installed_skills(&catalog, &runtime).expect("snapshots");
+        for snapshot in &snapshots {
+            assert_eq!(
+                state(snapshot, &AppType::Claude).reason(),
+                Some(SkillControlReason::InvalidSource)
+            );
+        }
+    }
+
+    #[test]
+    fn matching_copy_comparison_has_a_depth_limit() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let unified = temp.path().join("unified");
+        let native = temp.path().join("native");
+        for root in [&source, &native] {
+            write_skill(root, "demo", "source");
+            let mut deep = root.join("demo");
+            for _ in 0..=MAX_SKILL_TREE_DEPTH {
+                deep.push("d");
+            }
+            fs::create_dir_all(&deep).expect("deep tree");
+            fs::write(deep.join("leaf"), "content").expect("deep file");
+        }
+        let runtime =
+            SkillRuntime::try_new(&source, &unified, [app_runtime(&native, AppType::Claude)])
+                .expect("runtime");
+
+        let snapshots =
+            inspect_installed_skills(&[catalog_entry("demo", true)], &runtime).expect("snapshots");
+        let claude = state(&snapshots[0], &AppType::Claude);
+        assert_eq!(claude.enabled(), None);
+        assert_eq!(claude.reason(), Some(SkillControlReason::ObservationFailed));
+    }
+
+    #[test]
+    fn snapshots_bound_the_catalog_size() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = SkillRuntime::try_new(
+            temp.path().join("source"),
+            temp.path().join("unified"),
+            [app_runtime(&temp.path().join("native"), AppType::Claude)],
+        )
+        .expect("runtime");
+        let catalog = vec![catalog_entry("demo", false); MAX_SKILL_CATALOG_ENTRIES + 1];
+
+        assert!(matches!(
+            inspect_installed_skills(&catalog, &runtime),
+            Err(SkillReadError::CatalogTooLarge { .. })
+        ));
     }
 
     #[test]

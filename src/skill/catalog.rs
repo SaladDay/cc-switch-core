@@ -7,6 +7,7 @@ use crate::{builtin_app_registry, AppType, SkillCatalogColumn};
 const MAX_SKILL_ID_BYTES: usize = 1024;
 const MAX_SKILL_NAME_BYTES: usize = 256;
 const MAX_SKILL_DIRECTORY_BYTES: usize = 255;
+const MAX_SKILL_DESCRIPTION_BYTES: usize = 16 * 1024;
 
 /// One installed Skill loaded from the shared `skills` table.
 ///
@@ -34,6 +35,14 @@ impl SkillCatalogEntry {
         validate_text("id", &id, MAX_SKILL_ID_BYTES)?;
         let name = name.into();
         validate_text("name", &name, MAX_SKILL_NAME_BYTES)?;
+        if description
+            .as_ref()
+            .is_some_and(|description| description.len() > MAX_SKILL_DESCRIPTION_BYTES)
+        {
+            return Err(SkillCatalogEntryError::DescriptionTooLarge {
+                limit: MAX_SKILL_DESCRIPTION_BYTES,
+            });
+        }
         let directory = directory.into();
         validate_directory(&directory)?;
 
@@ -167,6 +176,8 @@ pub enum SkillCatalogEntryError {
     DuplicateColumn { column: &'static str },
     #[error("missing Skill catalog column: {column}")]
     MissingColumn { column: &'static str },
+    #[error("Skill description exceeds the {limit}-byte limit")]
+    DescriptionTooLarge { limit: usize },
 }
 
 #[cfg(test)]
@@ -224,6 +235,20 @@ mod tests {
         assert!(matches!(
             SkillCatalogEntry::try_new("id", "name", None, "demo", duplicate),
             Err(SkillCatalogEntryError::DuplicateColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn catalog_entries_bound_descriptions() {
+        assert!(matches!(
+            SkillCatalogEntry::try_new(
+                "id",
+                "name",
+                Some("x".repeat(MAX_SKILL_DESCRIPTION_BYTES + 1)),
+                "demo",
+                selections(),
+            ),
+            Err(SkillCatalogEntryError::DescriptionTooLarge { .. })
         ));
     }
 
