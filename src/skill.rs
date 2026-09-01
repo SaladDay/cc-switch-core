@@ -313,10 +313,9 @@ impl SkillDeploymentReceipt {
                 destination,
                 temporary_root,
                 backup,
-                expectation,
+                expectation: _,
             } => {
                 require_expectation(&destination, &DeploymentExpectation::Missing)?;
-                require_expectation(&backup, &expectation)?;
                 fs::rename(&backup, &destination)
                     .map_err(|source| SkillConfigError::io(&destination, source))?;
                 remove_directory(&temporary_root)
@@ -379,6 +378,18 @@ fn is_windows_reserved_name(directory: &str) -> bool {
 pub fn skill_tree_digest(path: &Path) -> Result<String, SkillConfigError> {
     validate_skill_source(path)?;
     tree_digest(path)
+}
+
+/// Resolves an absolute Skill path without requiring its final components to exist.
+/// Hosts can compare these identities before allowing multiple applications to
+/// share or nest native Skill roots.
+pub fn skill_path_identity(path: &Path) -> Result<PathBuf, SkillConfigError> {
+    if !path.is_absolute() {
+        return Err(SkillConfigError::RelativeRoot {
+            path: path.to_owned(),
+        });
+    }
+    resolve_candidate(path)
 }
 
 /// Inspects a native destination without changing it.
@@ -600,10 +611,13 @@ fn project_json_skill_enabled(
     let output = if let Some(contents) = contents.filter(|contents| !contents.is_empty()) {
         let original = std::str::from_utf8(contents)
             .map_err(|_| invalid_skill_config(target, "document is not UTF-8"))?;
-        crate::json_patch::replace_top_level_value(
+        crate::json5_patch::replace_object_path_value(
             original,
-            "skills",
-            root.get("skills").expect("projected JSON contains skills"),
+            &["skills", "disabled"],
+            root.get("skills")
+                .and_then(Value::as_object)
+                .and_then(|skills| skills.get("disabled"))
+                .expect("projected JSON contains skills.disabled"),
         )
         .map_err(|message| invalid_skill_config(target, &message))?
     } else {
@@ -625,8 +639,10 @@ fn parse_skill_json(
     if contents.len() > MAX_OPERATION_CONTENT_BYTES {
         return Err(invalid_skill_config(target, "document is too large"));
     }
-    let root = serde_json::from_slice::<Value>(contents)
-        .map_err(|_| invalid_skill_config(target, "document is not strict JSON"))?;
+    let text = std::str::from_utf8(contents)
+        .map_err(|_| invalid_skill_config(target, "document is not UTF-8"))?;
+    let root = json5::from_str::<Value>(text)
+        .map_err(|_| invalid_skill_config(target, "document is not valid JSON settings"))?;
     if !root.is_object() {
         return Err(invalid_skill_config(target, "root must be an object"));
     }
@@ -843,6 +859,20 @@ fn project_yaml_skill_enabled(
     let explicitly_disabled = disabled.iter().any(|entry| entry == name);
     if (enabled && !explicitly_disabled) || (!enabled && explicitly_disabled) {
         return Ok(None);
+    }
+
+    if let Some(original) = contents
+        .filter(|contents| !contents.is_empty())
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|_| invalid_skill_config(target, "document is not UTF-8"))?
+    {
+        if crate::yaml_patch::top_level_section_has_comments(original, "skills") {
+            return Err(invalid_skill_config(
+                target,
+                "the 'skills' section contains comments that cannot be preserved safely",
+            ));
+        }
     }
 
     let root_mapping = root
@@ -1072,6 +1102,18 @@ fn inspect_paths(
     destination: &Path,
     directory: &str,
 ) -> Result<(SkillDeploymentState, DeploymentExpectation), SkillConfigError> {
+    let link_parent = destination
+        .parent()
+        .expect("a deployment has a destination root");
+    inspect_paths_with_link_parent(source, destination, directory, link_parent)
+}
+
+fn inspect_paths_with_link_parent(
+    source: &Path,
+    destination: &Path,
+    directory: &str,
+    link_parent: &Path,
+) -> Result<(SkillDeploymentState, DeploymentExpectation), SkillConfigError> {
     let metadata = match fs::symlink_metadata(destination) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1091,10 +1133,7 @@ fn inspect_paths(
         let resolved = if target.is_absolute() {
             target.clone()
         } else {
-            destination
-                .parent()
-                .expect("a deployment has a destination root")
-                .join(&target)
+            link_parent.join(&target)
         };
         if canonicalize_optional(&resolved)?.as_ref() == Some(&expected) {
             return Ok((
@@ -1108,12 +1147,11 @@ fn inspect_paths(
     }
 
     if metadata.file_type().is_dir() {
-        let source_digest = tree_digest(source)?;
-        if managed_copy_matches(destination, directory, &source_digest)? {
+        if let Some(digest) = managed_copy_digest_if_owned(destination, directory)? {
             return Ok((
                 SkillDeploymentState::Copied,
                 DeploymentExpectation::Copied {
-                    digest: source_digest,
+                    digest,
                     directory: directory.to_owned(),
                 },
             ));
@@ -1366,18 +1404,25 @@ fn tree_digest_with_managed_marker(
 fn managed_copy_matches(
     destination: &Path,
     directory: &str,
-    source_digest: &str,
+    expected_digest: &str,
 ) -> Result<bool, SkillConfigError> {
+    Ok(managed_copy_digest_if_owned(destination, directory)?.as_deref() == Some(expected_digest))
+}
+
+fn managed_copy_digest_if_owned(
+    destination: &Path,
+    directory: &str,
+) -> Result<Option<String>, SkillConfigError> {
     let Some(marker) = read_managed_copy_marker(destination)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    if marker.version != MANAGED_COPY_MARKER_VERSION
-        || marker.directory != directory
-        || marker.source_digest != source_digest
-    {
-        return Ok(false);
+    if marker.version != MANAGED_COPY_MARKER_VERSION || marker.directory != directory {
+        return Ok(None);
     }
-    Ok(managed_copy_digest(destination)? == source_digest)
+    if managed_copy_digest(destination)? != marker.source_digest {
+        return Ok(None);
+    }
+    Ok(Some(marker.source_digest))
 }
 
 fn read_managed_copy_marker(
@@ -1595,7 +1640,9 @@ fn recover_interrupted_deployment(
     };
     let mut interrupted = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|source| SkillConfigError::io(parent, source))?;
+        let Ok(entry) = entry else {
+            continue;
+        };
         let name = entry.file_name();
         if !name
             .to_str()
@@ -1609,7 +1656,7 @@ fn recover_interrupted_deployment(
         if !metadata.file_type().is_dir() {
             continue;
         }
-        let Some(marker) = read_operation_marker(&temporary_root)? else {
+        let Some(marker) = read_operation_marker(&temporary_root).ok().flatten() else {
             continue;
         };
         if marker.directory != directory {
@@ -1684,7 +1731,12 @@ fn recover_interrupted_disable(
 ) -> Result<(), SkillConfigError> {
     let backup = temporary_root.join("deployment");
     let (destination_state, _) = inspect_paths(&paths.source, &paths.destination, directory)?;
-    let (backup_state, _) = inspect_paths(&paths.source, &backup, directory)?;
+    let original_parent = paths
+        .destination
+        .parent()
+        .expect("a deployment has a destination root");
+    let (backup_state, _) =
+        inspect_paths_with_link_parent(&paths.source, &backup, directory, original_parent)?;
     match (destination_state, backup_state) {
         (SkillDeploymentState::Missing, _)
         | (
@@ -1966,6 +2018,42 @@ mod tests {
     }
 
     #[test]
+    fn gemini_disabled_names_preserve_json_comments() {
+        let original = br#"{
+          // keep this user note
+          theme: 'dark',
+          skills: {
+            // keep this paths note
+            paths: ['~/team'],
+            disabled: ['old'],
+          },
+        }"#;
+        let disabled = project_skill_config_enabled(
+            SkillConfigTarget::GeminiSettings,
+            Some(original),
+            "docs",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(disabled.contains("// keep this user note"));
+        assert!(disabled.contains("// keep this paths note"));
+        let parsed: Value = json5::from_str(&disabled).unwrap();
+        assert_eq!(parsed["theme"], "dark");
+        assert_eq!(parsed["skills"]["paths"], serde_json::json!(["~/team"]));
+        assert_eq!(
+            inspect_skill_config_state(
+                SkillConfigTarget::GeminiSettings,
+                Some(disabled.as_bytes()),
+                "docs"
+            )
+            .unwrap(),
+            SkillConfigState::Disabled
+        );
+    }
+
+    #[test]
     fn gemini_global_disable_is_effective_and_cannot_be_overridden() {
         let original = br#"{"skills":{"enabled":false,"disabled":[]}}"#;
         assert_eq!(
@@ -2087,6 +2175,25 @@ mod tests {
     }
 
     #[test]
+    fn hermes_skill_comments_are_never_silently_rewritten() {
+        let original = b"model: local\nskills:\n  # keep this note\n  disabled: [old]\n";
+
+        assert!(matches!(
+            project_skill_config_enabled(
+                SkillConfigTarget::HermesConfig,
+                Some(original),
+                "docs",
+                false
+            ),
+            Err(SkillConfigError::InvalidConfig { .. })
+        ));
+        assert!(!crate::yaml_patch::top_level_section_has_comments(
+            "skills:\n  label: 'value # kept'\n",
+            "skills"
+        ));
+    }
+
+    #[test]
     fn malformed_skill_control_sections_are_never_rewritten() {
         for (target, contents) in [
             (
@@ -2182,6 +2289,26 @@ mod tests {
             .commit()
             .unwrap();
         assert!(source.join("docs/SKILL.md").exists());
+        assert!(!destination.join("docs").exists());
+    }
+
+    #[test]
+    fn managed_copy_ownership_survives_a_shared_source_update() {
+        let (_temporary, source, destination) = roots();
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+        fs::write(source.join("docs/SKILL.md"), "# Updated\n").unwrap();
+
+        assert_eq!(
+            inspect_skill_deployment(&source, &destination, "docs").unwrap(),
+            SkillDeploymentState::Copied
+        );
+        apply_skill_deployment(&source, &destination, "docs", false, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
         assert!(!destination.join("docs").exists());
     }
 
@@ -2360,6 +2487,29 @@ mod tests {
     }
 
     #[test]
+    fn rollback_restores_the_object_that_was_moved_even_if_it_changed() {
+        let (_temporary, source, destination) = roots();
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let receipt =
+            apply_skill_deployment(&source, &destination, "docs", false, SkillSyncMethod::Copy)
+                .unwrap();
+        let backup = match &receipt.change {
+            DeploymentChange::Removed { backup, .. } => backup,
+            _ => panic!("disable must move the deployment"),
+        };
+        fs::write(backup.join("SKILL.md"), "changed while pending").unwrap();
+
+        receipt.rollback().unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("docs/SKILL.md")).unwrap(),
+            "changed while pending"
+        );
+    }
+
+    #[test]
     fn conflicting_destination_is_preserved() {
         let (_temporary, source, destination) = roots();
         fs::create_dir_all(destination.join("docs")).unwrap();
@@ -2427,6 +2577,51 @@ mod tests {
         assert_eq!(
             fs::read_link(destination.join("docs")).unwrap(),
             PathBuf::from("../source/docs")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_disable_recovers_a_relative_link_from_its_original_parent() {
+        use std::os::unix::fs::symlink;
+
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        symlink("../source/docs", destination.join("docs")).unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Disable)
+                .unwrap();
+        fs::rename(destination.join("docs"), temporary_root.join("deployment")).unwrap();
+
+        apply_skill_deployment(
+            &source,
+            &destination,
+            "docs",
+            false,
+            SkillSyncMethod::Symlink,
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
+
+        assert!(!destination.join("docs").exists());
+        assert!(!temporary_root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_resolves_existing_directory_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let alias = temporary.path().join("alias");
+        fs::create_dir(&root).unwrap();
+        symlink(&root, &alias).unwrap();
+
+        assert_eq!(
+            skill_path_identity(&root.join("skills")).unwrap(),
+            skill_path_identity(&alias.join("skills")).unwrap()
         );
     }
 }

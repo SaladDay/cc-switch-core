@@ -39,6 +39,34 @@ pub(crate) fn has_duplicate_top_level_key(raw: &str, key: &str) -> bool {
         > 1
 }
 
+pub(crate) fn top_level_section_has_comments(raw: &str, key: &str) -> bool {
+    section_range(raw, key)
+        .map(|(start, end)| raw[start..end].lines().any(line_has_comment))
+        .unwrap_or(false)
+}
+
+fn line_has_comment(line: &str) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if double_quoted && character == '\\' {
+            escaped = true;
+        } else if !double_quoted && character == '\'' {
+            single_quoted = !single_quoted;
+        } else if !single_quoted && character == '"' {
+            double_quoted = !double_quoted;
+        } else if !single_quoted && !double_quoted && character == '#' {
+            return true;
+        }
+    }
+    false
+}
+
 fn uses_flow_root(raw: &str) -> bool {
     raw.lines()
         .map(str::trim)

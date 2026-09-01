@@ -9,10 +9,6 @@ use std::{
     io::{self, Write},
 };
 
-use json_five::rt::parser::{
-    from_str as parse_round_trip_json5, JSONKeyValuePair, JSONObjectContext, JSONText, JSONValue,
-    KeyValuePairContext,
-};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
@@ -996,130 +992,8 @@ fn replace_json5_root_section(
     value: &Value,
     target: LogicalTarget,
 ) -> Result<String, NativePlanError> {
-    let mut text: JSONText = parse_round_trip_json5(source)
-        .map_err(|_| invalid_document(target, "round-trip JSON5 could not be parsed"))?;
-    let JSONValue::JSONObject {
-        key_value_pairs,
-        context,
-    } = &mut text.value
-    else {
-        return Err(invalid_document(target, "root must be an object"));
-    };
-    if key_value_pairs.is_empty()
-        && context
-            .as_ref()
-            .is_none_or(|context| context.wsc.0.is_empty())
-    {
-        *context = Some(JSONObjectContext {
-            wsc: ("\n  ".to_owned(),),
-        });
-    }
-    let leading = context
-        .as_ref()
-        .map(|context| context.wsc.0.clone())
-        .unwrap_or_default();
-    let separator = if leading.contains('\n') {
-        format!("\n{}", trailing_indent(&leading))
-    } else {
-        String::new()
-    };
-    let value = json_to_round_trip_value(value, &trailing_indent(&leading), target)?;
-    if let Some(existing) = key_value_pairs
-        .iter_mut()
-        .find(|pair| json5_key_name(&pair.key) == Some(key))
-    {
-        existing.value = value;
-        return Ok(text.to_string());
-    }
-    let closing = if let Some(last) = key_value_pairs.last_mut() {
-        let context = last.context.get_or_insert_with(|| KeyValuePairContext {
-            wsc: (String::new(), " ".to_owned(), String::new(), None),
-        });
-        if let Some(after_comma) = context.wsc.3.clone() {
-            context.wsc.3 = Some(separator);
-            after_comma
-        } else {
-            let closing = std::mem::take(&mut context.wsc.2);
-            context.wsc.3 = Some(separator);
-            closing
-        }
-    } else {
-        closing_whitespace(&leading)
-    };
-    key_value_pairs.push(JSONKeyValuePair {
-        key: json5_key(key),
-        value,
-        context: Some(KeyValuePairContext {
-            wsc: (String::new(), " ".to_owned(), closing, None),
-        }),
-    });
-    Ok(text.to_string())
-}
-
-fn json_to_round_trip_value(
-    value: &Value,
-    parent_indent: &str,
-    target: LogicalTarget,
-) -> Result<JSONValue, NativePlanError> {
-    let source = serde_json::to_string_pretty(value)
-        .map_err(|_| invalid_document(target, "models could not be serialized"))?;
-    let adjusted = if parent_indent.is_empty() || !source.contains('\n') {
-        source
-    } else {
-        let mut lines = source.lines();
-        let mut adjusted = lines.next().unwrap_or_default().to_owned();
-        for line in lines {
-            adjusted.push('\n');
-            adjusted.push_str(parent_indent);
-            adjusted.push_str(line);
-        }
-        adjusted
-    };
-    parse_round_trip_json5(&adjusted)
-        .map(|text| text.value)
-        .map_err(|_| invalid_document(target, "models could not be projected"))
-}
-
-fn trailing_indent(value: &str) -> String {
-    value
-        .rsplit_once('\n')
-        .map(|(_, indent)| indent.to_owned())
-        .unwrap_or_default()
-}
-
-fn closing_whitespace(value: &str) -> String {
-    let Some((prefix, indent)) = value.rsplit_once('\n') else {
-        return String::new();
-    };
-    let indent = indent
-        .strip_suffix('\t')
-        .or_else(|| indent.strip_suffix("  "))
-        .or_else(|| indent.strip_suffix(' '))
-        .unwrap_or(indent);
-    format!("{prefix}\n{indent}")
-}
-
-fn json5_key(key: &str) -> JSONValue {
-    let mut chars = key.chars();
-    let identifier = chars
-        .next()
-        .is_some_and(|first| matches!(first, 'a'..='z' | 'A'..='Z' | '_' | '$'))
-        && chars
-            .all(|character| matches!(character, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '$'));
-    if identifier {
-        JSONValue::Identifier(key.to_owned())
-    } else {
-        JSONValue::DoubleQuotedString(key.to_owned())
-    }
-}
-
-fn json5_key_name(key: &JSONValue) -> Option<&str> {
-    match key {
-        JSONValue::Identifier(value)
-        | JSONValue::DoubleQuotedString(value)
-        | JSONValue::SingleQuotedString(value) => Some(value),
-        _ => None,
-    }
+    crate::json5_patch::replace_top_level_value(source, key, value)
+        .map_err(|message| invalid_document(target, message))
 }
 
 fn json_target(app: &AppType) -> Result<LogicalTarget, NativePlanError> {
