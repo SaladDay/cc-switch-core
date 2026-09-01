@@ -51,27 +51,6 @@ impl SkillCatalogColumn {
     }
 }
 
-/// Where one application's requested per-Skill selection is stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SkillSelectionStore {
-    /// The shared `skills` table stores the requested state in this column.
-    CatalogColumn(SkillCatalogColumn),
-    /// Presence in the application's native Skill directory stores selection.
-    ///
-    /// Unified discovery may still make the Skill visible independently.
-    NativeDirectory,
-}
-
-impl SkillSelectionStore {
-    /// Returns the shared catalog column, when selection is catalog-backed.
-    pub const fn catalog_column(self) -> Option<SkillCatalogColumn> {
-        match self {
-            Self::CatalogColumn(column) => Some(column),
-            Self::NativeDirectory => None,
-        }
-    }
-}
-
 /// How an application discovers installed Skills.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SkillDiscovery {
@@ -114,7 +93,7 @@ impl SkillConfigTarget {
 /// effective state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SkillAppContract {
-    selection_store: SkillSelectionStore,
+    catalog_column: SkillCatalogColumn,
     discovery: SkillDiscovery,
     config_target: Option<SkillConfigTarget>,
 }
@@ -126,23 +105,15 @@ impl SkillAppContract {
         config_target: Option<SkillConfigTarget>,
     ) -> Self {
         Self {
-            selection_store: SkillSelectionStore::CatalogColumn(SkillCatalogColumn::new(column)),
+            catalog_column: SkillCatalogColumn::new(column),
             discovery,
             config_target,
         }
     }
 
-    pub(crate) const fn native_directory(discovery: SkillDiscovery) -> Self {
-        Self {
-            selection_store: SkillSelectionStore::NativeDirectory,
-            discovery,
-            config_target: None,
-        }
-    }
-
-    /// Returns where this application's requested selection is stored.
-    pub const fn selection_store(self) -> SkillSelectionStore {
-        self.selection_store
+    /// Returns the shared-catalog column that owns requested state.
+    pub const fn catalog_column(self) -> SkillCatalogColumn {
+        self.catalog_column
     }
 
     /// Returns how this application discovers installed Skills.
@@ -161,14 +132,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_directory_selection_cannot_declare_a_config_target() {
-        let contract = SkillAppContract::native_directory(SkillDiscovery::NativeAndUnified);
+    fn every_contract_has_a_catalog_selection() {
+        let contract =
+            SkillAppContract::catalog("enabled_test", SkillDiscovery::NativeAndUnified, None);
 
-        assert_eq!(
-            contract.selection_store(),
-            SkillSelectionStore::NativeDirectory
-        );
-        assert_eq!(contract.config_target(), None);
+        assert_eq!(contract.catalog_column().as_str(), "enabled_test");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::{
     apply_skill_reference, builtin_app_registry, execute_operation_plan, AppType,
     ContentExpectation, OperationExecutionError, OperationHost, OperationPlan, OperationPlanError,
     OperationReceipt, OperationRollbackError, PlannedWrite, SkillCatalogColumn,
-    SkillReferenceError, SkillReferenceReceipt, SkillSelectionStore, OPERATION_CONTRACT_MAJOR,
+    SkillReferenceError, SkillReferenceReceipt, OPERATION_CONTRACT_MAJOR,
 };
 
 use super::{
@@ -48,8 +48,6 @@ impl SkillCatalogGuard {
     }
 
     /// Returns the catalog selection that must still be current.
-    ///
-    /// Pi returns `None` because its native directory is the selection store.
     pub fn expected_selection(&self) -> Option<(SkillCatalogColumn, bool)> {
         self.expected_selection
     }
@@ -470,9 +468,7 @@ pub fn prepare_skill_switch(
 /// `catalog` has the same completeness requirement as
 /// [`prepare_skill_switch`].
 ///
-/// Catalog-backed applications converge to their database value. Pi stores
-/// selection in its native directory, so reconciliation follows the visible
-/// native state and only cleans or completes Core-owned artifacts.
+/// Every application converges to its committed shared-catalog value.
 pub fn prepare_skill_reconciliation(
     catalog: &[SkillCatalogEntry],
     skill_id: &str,
@@ -545,7 +541,7 @@ fn prepare(
             app.clone(),
             runtime.source_root(),
             app_runtime.native_root(),
-            runtime.state_root(),
+            app_runtime.state_root(),
             entry.directory(),
             target_enabled,
         )
@@ -583,15 +579,16 @@ fn prepare(
         }
     };
 
-    let catalog_change = match contract.selection_store() {
-        SkillSelectionStore::NativeDirectory => None,
-        SkillSelectionStore::CatalogColumn(_) if selected == target_enabled => None,
-        SkillSelectionStore::CatalogColumn(column) => Some(SkillCatalogChange {
+    let column = contract.catalog_column();
+    let catalog_change = if selected == target_enabled {
+        None
+    } else {
+        Some(SkillCatalogChange {
             skill_id: entry.id().to_owned(),
             column,
             expected: selected,
             replacement: target_enabled,
-        }),
+        })
     };
 
     Ok(SkillSwitchPlan {
@@ -606,10 +603,7 @@ fn prepare(
             skill_id: entry.id().to_owned(),
             expected_name: entry.name().to_owned(),
             expected_directory: entry.directory().to_owned(),
-            expected_selection: contract
-                .selection_store()
-                .catalog_column()
-                .map(|column| (column, selected)),
+            expected_selection: Some((column, selected)),
         },
         reference,
         configuration,
@@ -741,8 +735,7 @@ mod tests {
         SkillRuntime::try_new(
             source,
             unified,
-            state,
-            [SkillAppRuntime::try_new(app, native, config).unwrap()],
+            [SkillAppRuntime::try_new(app, native, state, config).unwrap()],
         )
         .unwrap()
     }
@@ -944,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_switches_do_not_invent_a_catalog_column() {
+    fn pi_switches_use_the_declared_catalog_column() {
         let temporary = tempdir().unwrap();
         let source = temporary.path().join("source");
         let unified = temporary.path().join("unified");
@@ -961,9 +954,17 @@ mod tests {
         )
         .unwrap();
 
-        assert!(plan.catalog_change().is_none());
+        let change = plan.catalog_change().expect("Pi catalog change");
+        assert_eq!(change.column().as_str(), "enabled_pi");
+        assert!(!change.expected());
+        assert!(change.replacement());
         assert_eq!(plan.catalog_guard().skill_id(), "owner/repo:demo");
-        assert_eq!(plan.catalog_guard().expected_selection(), None);
+        assert_eq!(
+            plan.catalog_guard()
+                .expected_selection()
+                .map(|(column, selected)| (column.as_str(), selected)),
+            Some(("enabled_pi", false))
+        );
         assert!(plan.reference().is_some());
     }
 

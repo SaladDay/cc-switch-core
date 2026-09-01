@@ -273,10 +273,8 @@ pub(crate) fn top_level_section_has_comments(raw: &str, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn top_level_section_has_references(raw: &str, key: &str) -> bool {
-    section_range(raw, key)
-        .map(|(start, end)| raw[start..end].lines().any(line_has_reference))
-        .unwrap_or(false)
+pub(crate) fn document_has_references(raw: &str) -> bool {
+    raw.lines().any(line_has_reference)
 }
 
 fn line_has_reference(line: &str) -> bool {
@@ -431,14 +429,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn section_references_ignore_quoted_markers() {
-        assert!(top_level_section_has_references(
-            "skills:\n  config: *defaults\nother: true\n",
-            "skills"
+    fn document_references_include_root_level_merges() {
+        assert!(document_has_references(
+            "defaults: &defaults\n  disabled: [demo]\nskills:\n  <<: *defaults\n"
         ));
-        assert!(!top_level_section_has_references(
-            "skills:\n  note: 'literal * value'\nother: &outside value\n",
-            "skills"
+        assert!(!document_has_references(
+            "note: 'literal *value and &value'\nskills:\n  disabled: []\n"
         ));
     }
 

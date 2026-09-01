@@ -114,7 +114,16 @@ fn unique_index(indices: Vec<usize>, key: &str) -> Result<Option<usize>, String>
 
 fn decoded_key(key: &JSONValue) -> Result<String, String> {
     match key {
-        JSONValue::Identifier(value) => Ok(value.clone()),
+        JSONValue::Identifier(value) => {
+            let wrapper = format!("{{{value}:null}}");
+            let decoded = json5::from_str::<Map<String, Value>>(&wrapper)
+                .map_err(|_| "JSON5 identifier key could not be decoded".to_owned())?;
+            decoded
+                .into_iter()
+                .next()
+                .map(|(key, _)| key)
+                .ok_or_else(|| "JSON5 identifier key could not be decoded".to_owned())
+        }
         JSONValue::DoubleQuotedString(_) | JSONValue::SingleQuotedString(_) => {
             json5::from_str::<String>(&key.to_string())
                 .map_err(|_| "JSON5 object key could not be decoded".to_owned())
@@ -342,11 +351,15 @@ mod tests {
 
     #[test]
     fn consumed_paths_must_be_unique() {
-        let source = "{ skills: { enabled: false, enabled: true, disabled: [] } }";
-        assert!(validate_unique_object_paths(
-            source,
-            &[&["skills", "enabled"], &["skills", "disabled"],],
-        )
-        .is_err());
+        for source in [
+            "{ skills: { enabled: false, enabled: true, disabled: [] } }",
+            r"{ skills: { disabled: [] }, sk\u0069lls: { disabled: [] } }",
+        ] {
+            assert!(validate_unique_object_paths(
+                source,
+                &[&["skills", "enabled"], &["skills", "disabled"],],
+            )
+            .is_err());
+        }
     }
 }

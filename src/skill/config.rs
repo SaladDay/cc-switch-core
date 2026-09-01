@@ -222,6 +222,22 @@ fn parse_hermes(
     contents: Option<&[u8]>,
     platform: Option<&str>,
 ) -> Result<NativeSkillControls, SkillConfigReadError> {
+    if let Some(contents) = contents.filter(|contents| !contents.is_empty()) {
+        let raw =
+            std::str::from_utf8(contents).map_err(|_| invalid(target, "document is not UTF-8"))?;
+        if yaml_patch::has_duplicate_top_level_key(raw, "skills") {
+            return Err(invalid(
+                target,
+                "contains duplicate or ambiguous 'skills' fields",
+            ));
+        }
+        if yaml_patch::document_has_references(raw) {
+            return Err(invalid(
+                target,
+                "YAML anchors, aliases, and merge keys are not safe to interpret",
+            ));
+        }
+    }
     let root = parse_yaml(target, contents)?;
     let skills_key = serde_yaml::Value::String("skills".to_owned());
     let Some(skills) = root.as_mapping().and_then(|root| root.get(&skills_key)) else {
@@ -572,10 +588,10 @@ fn project_hermes(
             "the 'skills' section contains comments that cannot be preserved safely",
         ));
     }
-    if yaml_patch::top_level_section_has_references(original, "skills") {
+    if yaml_patch::document_has_references(original) {
         return Err(write_invalid(
             target,
-            "the 'skills' section contains YAML anchors, aliases, or merge keys that cannot be preserved safely",
+            "YAML anchors, aliases, or merge keys cannot be interpreted safely",
         ));
     }
 
@@ -821,6 +837,33 @@ mod tests {
         .is_err());
         assert!(inspect(SkillConfigTarget::GrokConfig, Some(b"skills = 1"), "demo").is_err());
         assert!(inspect(SkillConfigTarget::HermesConfig, Some(b"skills: []"), "demo").is_err());
+        let merged = b"defaults: &defaults\n  disabled: [demo]\nskills:\n  <<: *defaults\n";
+        assert!(inspect(SkillConfigTarget::HermesConfig, Some(merged), "demo").is_err());
+        assert!(project_native_control(
+            SkillConfigTarget::HermesConfig,
+            Some(merged),
+            None,
+            "demo",
+            "demo",
+            true,
+        )
+        .is_err());
+        let duplicate_disabled = b"skills:\n  disabled: [demo]\n  disabled: []\n";
+        assert!(inspect(
+            SkillConfigTarget::HermesConfig,
+            Some(duplicate_disabled),
+            "demo"
+        )
+        .is_err());
+        assert!(project_native_control(
+            SkillConfigTarget::HermesConfig,
+            Some(duplicate_disabled),
+            None,
+            "demo",
+            "demo",
+            true,
+        )
+        .is_err());
     }
 
     #[test]

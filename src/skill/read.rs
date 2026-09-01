@@ -8,10 +8,11 @@ use std::{
 
 use serde::Serialize;
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{
     builtin_app_registry, AppType, ObservedDocument, SkillConfigTarget, SkillDiscovery,
-    SkillSelectionStore, MAX_OPERATION_CONTENT_BYTES,
+    MAX_OPERATION_CONTENT_BYTES,
 };
 
 use super::{
@@ -37,6 +38,7 @@ const MAX_HERMES_PLATFORM_BYTES: usize = 128;
 pub struct SkillAppRuntime {
     app: AppType,
     native_root: PathBuf,
+    state_root: PathBuf,
     config: Option<ObservedDocument>,
     hermes_platform: Option<String>,
 }
@@ -45,11 +47,16 @@ impl SkillAppRuntime {
     pub fn try_new(
         app: AppType,
         native_root: impl Into<PathBuf>,
+        state_root: impl Into<PathBuf>,
         config: Option<ObservedDocument>,
     ) -> Result<Self, SkillRuntimeError> {
         let native_root = native_root.into();
         if !native_root.is_absolute() {
             return Err(SkillRuntimeError::RelativeRoot { path: native_root });
+        }
+        let state_root = state_root.into();
+        if !state_root.is_absolute() {
+            return Err(SkillRuntimeError::RelativeRoot { path: state_root });
         }
         let contract = builtin_app_registry()
             .for_app(&app)
@@ -97,6 +104,7 @@ impl SkillAppRuntime {
         Ok(Self {
             app,
             native_root,
+            state_root,
             config,
             hermes_platform: None,
         })
@@ -135,6 +143,12 @@ impl SkillAppRuntime {
         &self.native_root
     }
 
+    /// Returns the host-resolved private state directory on the native root's
+    /// filesystem. Core owns only entries inside this directory.
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
     /// Returns the active Hermes gateway platform, when the host supplied it.
     pub fn hermes_platform(&self) -> Option<&str> {
         self.hermes_platform.as_deref()
@@ -151,6 +165,7 @@ impl fmt::Debug for SkillAppRuntime {
             .debug_struct("SkillAppRuntime")
             .field("app", &self.app)
             .field("native_root", &self.native_root)
+            .field("state_root", &self.state_root)
             .field("config", &self.config)
             .field("hermes_platform", &self.hermes_platform)
             .finish()
@@ -166,7 +181,6 @@ impl fmt::Debug for SkillAppRuntime {
 pub struct SkillRuntime {
     source_root: PathBuf,
     unified_root: PathBuf,
-    state_root: PathBuf,
     apps: Vec<SkillAppRuntime>,
 }
 
@@ -174,7 +188,6 @@ impl SkillRuntime {
     pub fn try_new(
         source_root: impl Into<PathBuf>,
         unified_root: impl Into<PathBuf>,
-        state_root: impl Into<PathBuf>,
         apps: impl IntoIterator<Item = SkillAppRuntime>,
     ) -> Result<Self, SkillRuntimeError> {
         let source_root = source_root.into();
@@ -185,11 +198,6 @@ impl SkillRuntime {
         if !unified_root.is_absolute() {
             return Err(SkillRuntimeError::RelativeRoot { path: unified_root });
         }
-        let state_root = state_root.into();
-        if !state_root.is_absolute() {
-            return Err(SkillRuntimeError::RelativeRoot { path: state_root });
-        }
-
         let mut supplied = HashMap::new();
         for runtime in apps {
             let app = runtime.app.clone();
@@ -210,12 +218,11 @@ impl SkillRuntime {
             supplied.is_empty(),
             "Skill runtimes use built-in applications"
         );
-        validate_distinct_roots(&source_root, &unified_root, &state_root, &apps)?;
+        validate_distinct_roots(&source_root, &unified_root, &apps)?;
 
         Ok(Self {
             source_root,
             unified_root,
-            state_root,
             apps,
         })
     }
@@ -226,11 +233,6 @@ impl SkillRuntime {
 
     pub fn unified_root(&self) -> &Path {
         &self.unified_root
-    }
-
-    /// Returns the host-resolved directory containing Core ownership records.
-    pub fn state_root(&self) -> &Path {
-        &self.state_root
     }
 
     pub fn apps(
@@ -247,7 +249,6 @@ impl SkillRuntime {
 fn validate_distinct_roots(
     source_root: &Path,
     unified_root: &Path,
-    state_root: &Path,
     apps: &[SkillAppRuntime],
 ) -> Result<(), SkillRuntimeError> {
     let source = resolve_root(source_root)?;
@@ -259,36 +260,27 @@ fn validate_distinct_roots(
             right: unified_root.to_owned(),
         });
     }
-    let state = resolve_root(state_root)?;
-    for (path, resolved) in [(source_root, &source), (unified_root, &unified)] {
-        if roots_overlap(&state, resolved) {
-            return Err(SkillRuntimeError::OverlappingRoots {
-                left: state_root.to_owned(),
-                right: path.to_owned(),
-            });
-        }
-    }
-
-    let mut resolved_apps: Vec<(&Path, PathBuf)> = Vec::with_capacity(apps.len());
+    let mut resolved_apps: Vec<(&Path, PathBuf)> = Vec::with_capacity(apps.len() * 2);
     for app in apps {
-        let resolved = resolve_root(&app.native_root)?;
-        for (other_path, other) in std::iter::once((source_root, &source))
-            .chain(std::iter::once((unified_root, &unified)))
-            .chain(std::iter::once((state_root, &state)))
-            .chain(
-                resolved_apps
-                    .iter()
-                    .map(|(path, resolved)| (*path, resolved)),
-            )
-        {
-            if roots_overlap(&resolved, other) {
-                return Err(SkillRuntimeError::OverlappingRoots {
-                    left: app.native_root.clone(),
-                    right: other_path.to_owned(),
-                });
+        for path in [&app.native_root, &app.state_root] {
+            let resolved = resolve_root(path)?;
+            for (other_path, other) in std::iter::once((source_root, &source))
+                .chain(std::iter::once((unified_root, &unified)))
+                .chain(
+                    resolved_apps
+                        .iter()
+                        .map(|(path, resolved)| (*path, resolved)),
+                )
+            {
+                if roots_overlap(&resolved, other) {
+                    return Err(SkillRuntimeError::OverlappingRoots {
+                        left: path.to_owned(),
+                        right: other_path.to_owned(),
+                    });
+                }
             }
+            resolved_apps.push((path, resolved));
         }
-        resolved_apps.push((&app.native_root, resolved));
     }
     Ok(())
 }
@@ -371,7 +363,6 @@ impl fmt::Debug for SkillRuntime {
             .debug_struct("SkillRuntime")
             .field("source_root", &self.source_root)
             .field("unified_root", &self.unified_root)
-            .field("state_root", &self.state_root)
             .field("apps", &self.apps)
             .finish()
     }
@@ -430,8 +421,7 @@ impl SkillAppState {
         &self.app
     }
 
-    /// Returns the persisted request, or `None` when native selection could not
-    /// be observed.
+    /// Returns the persisted shared-catalog request.
     pub fn selected(&self) -> Option<bool> {
         self.selected
     }
@@ -487,12 +477,7 @@ pub fn inspect_installed_skills(
     catalog: &[SkillCatalogEntry],
     runtime: &SkillRuntime,
 ) -> Result<Vec<InstalledSkillSnapshot>, SkillReadError> {
-    validate_distinct_roots(
-        &runtime.source_root,
-        &runtime.unified_root,
-        &runtime.state_root,
-        &runtime.apps,
-    )?;
+    validate_distinct_roots(&runtime.source_root, &runtime.unified_root, &runtime.apps)?;
     validate_catalog_identity(catalog, runtime)?;
     let apps = runtime.apps().map(PreparedApp::new).collect::<Vec<_>>();
     let mut budget = SnapshotBudget::default();
@@ -533,7 +518,11 @@ pub(super) fn validate_catalog_identity(
                 id: entry.id().to_owned(),
             });
         }
-        let key = entry.directory().to_lowercase();
+        let key = entry
+            .directory()
+            .nfc()
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
         if !directories.insert(key) {
             return Err(SkillReadError::DuplicateDirectory {
                 directory: entry.directory().to_owned(),
@@ -603,7 +592,7 @@ fn inspect_entry(
                 PathRelation::Missing
             };
             apps.iter()
-                .map(|app| inspect_app(entry, app, runtime, &source, &unified))
+                .map(|app| inspect_app(entry, app, &source, &unified))
                 .collect()
         }
         SourceObservation::Missing => apps
@@ -634,16 +623,7 @@ fn unavailable_state(
     runtime: &SkillAppRuntime,
     reason: SkillControlReason,
 ) -> SkillAppState {
-    let contract = builtin_app_registry()
-        .for_app(&runtime.app)
-        .skill_contract()
-        .expect("Skill runtime construction requires a contract");
-    let selected = match contract.selection_store() {
-        SkillSelectionStore::CatalogColumn(_) => entry.selected_for(&runtime.app),
-        SkillSelectionStore::NativeDirectory => {
-            observe_native_directory_selection(&runtime.native_root, entry.directory())
-        }
-    };
+    let selected = entry.selected_for(&runtime.app);
     SkillAppState {
         app: runtime.app.clone(),
         selected,
@@ -658,7 +638,6 @@ fn unavailable_state(
 fn inspect_app(
     entry: &SkillCatalogEntry,
     prepared: &PreparedApp<'_>,
-    all_runtime: &SkillRuntime,
     source: &ReadySource,
     unified: &PathRelation,
 ) -> SkillAppState {
@@ -667,14 +646,8 @@ fn inspect_app(
     let contract = descriptor
         .skill_contract()
         .expect("Skill runtime construction requires a contract");
-    let catalog_selected = entry.selected_for(&runtime.app);
-    let native = inspect_native_relation(entry, runtime, &all_runtime.state_root, &source.path);
-    let selected = match contract.selection_store() {
-        SkillSelectionStore::CatalogColumn(_) => catalog_selected,
-        SkillSelectionStore::NativeDirectory => {
-            observe_native_directory_selection(&runtime.native_root, entry.directory())
-        }
-    };
+    let selected = entry.selected_for(&runtime.app);
+    let native = inspect_native_relation(entry, runtime, &source.path);
     if native.is_unreadable() {
         return state_unavailable(runtime, selected, SkillControlReason::ObservationFailed);
     }
@@ -831,20 +804,6 @@ fn inspect_source(path: &Path, budget: &mut SnapshotBudget) -> SourceObservation
     }
 }
 
-fn observe_native_directory_selection(root: &Path, directory: &str) -> Option<bool> {
-    let path = root.join(directory);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => match fs::metadata(path) {
-            Ok(target) => Some(target.is_dir()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
-            Err(_) => None,
-        },
-        Ok(metadata) => Some(metadata.is_dir()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
-        Err(_) => None,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathRelation {
     Missing,
@@ -890,11 +849,10 @@ fn inspect_direct_relation(source: &ReadySource, root: &Path, directory: &str) -
 fn inspect_native_relation(
     entry: &SkillCatalogEntry,
     runtime: &SkillAppRuntime,
-    state_root: &Path,
     source: &Path,
 ) -> PathRelation {
     match inspect_skill_reference(
-        state_root,
+        &runtime.state_root,
         &runtime.app,
         entry.id(),
         entry.directory(),
@@ -1035,7 +993,7 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::*;
-    use crate::{SkillCatalogColumn, SkillSelectionStore};
+    use crate::SkillCatalogColumn;
 
     fn catalog_entry(directory: &str, selected: bool) -> SkillCatalogEntry {
         let selections = crate::skill_catalog_columns().map(|column| (column, selected));
@@ -1061,7 +1019,12 @@ mod tests {
             .skill_contract()
             .and_then(|contract| contract.config_target())
             .map(|target| ObservedDocument::missing(target.logical_target()));
-        SkillAppRuntime::try_new(app, root, config).expect("app runtime")
+        let state = root.parent().unwrap_or(root).join(format!(
+            ".{}-{}-skill-state",
+            root.file_name().unwrap_or_default().to_string_lossy(),
+            app.as_str()
+        ));
+        SkillAppRuntime::try_new(app, root, state, config).expect("app runtime")
     }
 
     fn skill_runtime(
@@ -1070,7 +1033,8 @@ mod tests {
         unified: impl Into<PathBuf>,
         apps: impl IntoIterator<Item = SkillAppRuntime>,
     ) -> Result<SkillRuntime, SkillRuntimeError> {
-        SkillRuntime::try_new(source, unified, temp.path().join("state"), apps)
+        let _ = temp;
+        SkillRuntime::try_new(source, unified, apps)
     }
 
     fn state<'a>(snapshot: &'a InstalledSkillSnapshot, app: &AppType) -> &'a SkillAppState {
@@ -1149,14 +1113,14 @@ mod tests {
         let snapshots =
             inspect_installed_skills(&[catalog_entry("demo", false)], &runtime).expect("snapshots");
         let pi = state(&snapshots[0], &AppType::Pi);
-        assert_eq!(pi.selected(), Some(true));
+        assert_eq!(pi.selected(), Some(false));
         assert_eq!(pi.enabled(), None);
         assert!(!pi.writable());
         assert_eq!(pi.reason(), Some(SkillControlReason::NativeConflict));
     }
 
     #[test]
-    fn pi_selection_uses_native_presence_even_when_the_entry_is_invalid() {
+    fn pi_selection_remains_catalog_backed_when_the_native_entry_is_invalid() {
         let temp = tempdir().expect("tempdir");
         let source = temp.path().join("source");
         let native = temp.path().join("native");
@@ -1174,7 +1138,7 @@ mod tests {
         let snapshots =
             inspect_installed_skills(&[catalog_entry("demo", false)], &runtime).expect("snapshots");
         let pi = state(&snapshots[0], &AppType::Pi);
-        assert_eq!(pi.selected(), Some(true));
+        assert_eq!(pi.selected(), Some(false));
         assert_eq!(pi.enabled(), None);
         assert_eq!(pi.reason(), Some(SkillControlReason::NativeConflict));
     }
@@ -1221,8 +1185,13 @@ mod tests {
             SkillConfigTarget::GeminiSettings.logical_target(),
             br#"{ skills: { disabled: ["demo"] } }"#.to_vec(),
         );
-        let gemini = SkillAppRuntime::try_new(AppType::Gemini, &native, Some(config))
-            .expect("Gemini runtime");
+        let gemini = SkillAppRuntime::try_new(
+            AppType::Gemini,
+            &native,
+            temp.path().join("gemini-state"),
+            Some(config),
+        )
+        .expect("Gemini runtime");
         let runtime = skill_runtime(&temp, &unified, &unified, [gemini]).expect("runtime");
 
         let snapshots =
@@ -1258,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_selection_is_observed_when_the_source_is_missing() {
+    fn pi_catalog_selection_is_kept_when_the_source_is_missing() {
         let temp = tempdir().expect("tempdir");
         let source = temp.path().join("missing-source");
         let native = temp.path().join("native");
@@ -1277,7 +1246,7 @@ mod tests {
         ];
 
         let snapshots = inspect_installed_skills(&catalog, &runtime).expect("snapshots");
-        assert_eq!(state(&snapshots[0], &AppType::Pi).selected(), Some(true));
+        assert_eq!(state(&snapshots[0], &AppType::Pi).selected(), Some(false));
         assert_eq!(state(&snapshots[1], &AppType::Pi).selected(), Some(false));
         for snapshot in &snapshots {
             let pi = state(snapshot, &AppType::Pi);
@@ -1298,10 +1267,15 @@ mod tests {
             SkillConfigTarget::HermesConfig.logical_target(),
             b"skills:\n  platform_disabled:\n    telegram: [hermes-agent]\n".to_vec(),
         );
-        let hermes = SkillAppRuntime::try_new(AppType::Hermes, &native, Some(config))
-            .expect("Hermes runtime")
-            .try_with_hermes_platform("telegram")
-            .expect("Hermes platform");
+        let hermes = SkillAppRuntime::try_new(
+            AppType::Hermes,
+            &native,
+            temp.path().join("hermes-state"),
+            Some(config),
+        )
+        .expect("Hermes runtime")
+        .try_with_hermes_platform("telegram")
+        .expect("Hermes platform");
         let runtime = skill_runtime(&temp, &source, &unified, [hermes]).expect("runtime");
 
         let selections = crate::skill_catalog_columns().map(|column| (column, false));
@@ -1325,12 +1299,22 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let wrong = ObservedDocument::missing(crate::LogicalTarget::GrokConfig);
         assert!(matches!(
-            SkillAppRuntime::try_new(AppType::Gemini, temp.path(), Some(wrong)),
+            SkillAppRuntime::try_new(
+                AppType::Gemini,
+                temp.path(),
+                temp.path().join("state"),
+                Some(wrong),
+            ),
             Err(SkillRuntimeError::WrongConfig { .. })
         ));
         let unobserved = ObservedDocument::unobserved(crate::LogicalTarget::GeminiSettings);
         assert!(matches!(
-            SkillAppRuntime::try_new(AppType::Gemini, temp.path(), Some(unobserved)),
+            SkillAppRuntime::try_new(
+                AppType::Gemini,
+                temp.path(),
+                temp.path().join("state"),
+                Some(unobserved),
+            ),
             Err(SkillRuntimeError::UnobservedConfig { .. })
         ));
         let claude = app_runtime(temp.path(), AppType::Claude);
@@ -1528,6 +1512,34 @@ mod tests {
     }
 
     #[test]
+    fn catalog_rejects_unicode_equivalent_directories() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = skill_runtime(
+            &temp,
+            temp.path().join("source"),
+            temp.path().join("unified"),
+            [app_runtime(&temp.path().join("native"), AppType::Claude)],
+        )
+        .expect("runtime");
+        let entry = |id: &str, directory: &str| {
+            SkillCatalogEntry::try_new(
+                id,
+                id,
+                None,
+                directory,
+                crate::skill_catalog_columns().map(|column| (column, false)),
+            )
+            .expect("entry")
+        };
+        let catalog = [entry("one", "é"), entry("two", "e\u{301}")];
+
+        assert!(matches!(
+            inspect_installed_skills(&catalog, &runtime),
+            Err(SkillReadError::DuplicateDirectory { .. })
+        ));
+    }
+
+    #[test]
     fn snapshots_bound_manifest_work() {
         let temp = tempdir().expect("tempdir");
         write_skill(temp.path(), "demo", "manifest");
@@ -1581,24 +1593,26 @@ mod tests {
             crate::LogicalTarget::GeminiSettings,
             format!("{{ secret: '{secret}' }}"),
         );
-        let runtime =
-            SkillAppRuntime::try_new(AppType::Gemini, temp.path(), Some(config)).expect("runtime");
+        let runtime = SkillAppRuntime::try_new(
+            AppType::Gemini,
+            temp.path(),
+            temp.path().join("state"),
+            Some(config),
+        )
+        .expect("runtime");
         assert!(!format!("{runtime:?}").contains(secret));
     }
 
     #[test]
-    fn native_directory_contract_is_not_catalog_backed() {
+    fn pi_selection_comes_from_the_catalog() {
         let contract = builtin_app_registry()
             .for_app(&AppType::Pi)
             .skill_contract()
             .expect("Pi Skill contract");
-        assert_eq!(
-            contract.selection_store(),
-            SkillSelectionStore::NativeDirectory
-        );
+        assert_eq!(contract.catalog_column().as_str(), "enabled_pi");
         assert_eq!(
             catalog_entry("demo", false).selected_for(&AppType::Pi),
-            None
+            Some(false)
         );
     }
 
@@ -1608,6 +1622,6 @@ mod tests {
             .selections()
             .map(|(column, _)| column)
             .collect::<Vec<SkillCatalogColumn>>();
-        assert_eq!(columns.len(), 6);
+        assert_eq!(columns.len(), 7);
     }
 }

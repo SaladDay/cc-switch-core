@@ -348,7 +348,11 @@ static PI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_PROMPTS_SKILLS,
     &[],
 )
-.with_skills(SkillAppContract::native_directory(NativeAndUnified));
+.with_skills(SkillAppContract::catalog(
+    "enabled_pi",
+    NativeAndUnified,
+    None,
+));
 
 static BUILTIN_APP_DESCRIPTORS: [&AppDescriptor; 9] = [
     &CLAUDE_DESCRIPTOR,
@@ -561,8 +565,7 @@ mod tests {
 
     #[test]
     fn skill_contract_matrix_is_stable() {
-        use crate::SkillSelectionStore::{CatalogColumn, NativeDirectory};
-        let catalog = |column| CatalogColumn(crate::SkillCatalogColumn::new(column));
+        let catalog = crate::SkillCatalogColumn::new;
 
         let actual = builtin_app_registry()
             .descriptors()
@@ -570,7 +573,7 @@ mod tests {
                 descriptor.skill_contract().map(|contract| {
                     (
                         descriptor.id(),
-                        contract.selection_store(),
+                        contract.catalog_column(),
                         contract.discovery(),
                         contract.config_target(),
                     )
@@ -607,7 +610,7 @@ mod tests {
                     NativeOnly,
                     Some(HermesConfig),
                 ),
-                ("pi", NativeDirectory, NativeAndUnified, None),
+                ("pi", catalog("enabled_pi"), NativeAndUnified, None),
             ]
         );
     }
@@ -618,7 +621,7 @@ mod tests {
         for descriptor in builtin_app_registry().descriptors() {
             let Some(column) = descriptor
                 .skill_contract()
-                .and_then(|contract| contract.selection_store().catalog_column())
+                .map(SkillAppContract::catalog_column)
             else {
                 continue;
             };
@@ -640,16 +643,13 @@ mod tests {
     }
 
     #[test]
-    fn pi_keeps_native_selection_separate_from_unified_discovery() {
+    fn pi_selection_is_catalog_backed_and_discovery_is_independent() {
         let contract = builtin_app_registry()
             .for_app(&AppType::Pi)
             .skill_contract()
             .expect("Pi supports Skills");
 
-        assert_eq!(
-            contract.selection_store(),
-            crate::SkillSelectionStore::NativeDirectory
-        );
+        assert_eq!(contract.catalog_column().as_str(), "enabled_pi");
         assert!(contract.discovery().reads_unified_store());
     }
 

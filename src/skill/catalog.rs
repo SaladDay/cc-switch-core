@@ -93,14 +93,11 @@ impl SkillCatalogEntry {
     }
 
     /// Returns the requested catalog selection for an application.
-    ///
-    /// `None` means that the application stores selection outside the catalog.
     pub fn selected_for(&self, app: &AppType) -> Option<bool> {
         let column = builtin_app_registry()
             .for_app(app)
             .skill_contract()?
-            .selection_store()
-            .catalog_column()?;
+            .catalog_column();
         self.selections
             .iter()
             .find_map(|(candidate, selected)| (*candidate == column).then_some(*selected))
@@ -123,9 +120,8 @@ pub fn skill_catalog_columns() -> impl Iterator<Item = SkillCatalogColumn> + Clo
         .descriptors()
         .filter_map(|descriptor| {
             descriptor
-                .skill_contract()?
-                .selection_store()
-                .catalog_column()
+                .skill_contract()
+                .map(|contract| contract.catalog_column())
         })
 }
 
@@ -236,10 +232,11 @@ mod tests {
                 ("enabled_grokbuild", false),
                 ("enabled_opencode", true),
                 ("enabled_hermes", false),
+                ("enabled_pi", true),
             ]
         );
         assert_eq!(entry.selected_for(&AppType::Claude), Some(true));
-        assert_eq!(entry.selected_for(&AppType::Pi), None);
+        assert_eq!(entry.selected_for(&AppType::Pi), Some(true));
     }
 
     #[test]

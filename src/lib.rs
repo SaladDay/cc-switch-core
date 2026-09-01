@@ -81,6 +81,6 @@ pub use skill::{
     SkillCatalogGuard, SkillConfigTarget, SkillControlReason, SkillDiscovery,
     SkillLiveExecutionError, SkillLiveFailure, SkillLiveReceipt, SkillLiveRollbackError,
     SkillLiveRollbackFailure, SkillPrepareError, SkillReadError, SkillReferenceError,
-    SkillReferencePlan, SkillReferenceReceipt, SkillRuntime, SkillRuntimeError,
-    SkillSelectionStore, SkillSwitchPlan, SkillWriteOrder,
+    SkillReferencePlan, SkillReferenceReceipt, SkillRuntime, SkillRuntimeError, SkillSwitchPlan,
+    SkillWriteOrder,
 };
