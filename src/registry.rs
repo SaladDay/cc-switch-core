@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn skill_contract_matrix_is_stable() {
-        use crate::SkillActivationStore::{CatalogColumn, NativeDirectory};
+        use crate::SkillSelectionStore::{CatalogColumn, NativeDirectory};
 
         let actual = builtin_app_registry()
             .descriptors()
@@ -569,7 +569,7 @@ mod tests {
                 descriptor.skill_contract().map(|contract| {
                     (
                         descriptor.id(),
-                        contract.activation(),
+                        contract.selection_store(),
                         contract.discovery(),
                         contract.config_target(),
                     )
@@ -622,7 +622,7 @@ mod tests {
         for descriptor in builtin_app_registry().descriptors() {
             let Some(column) = descriptor
                 .skill_contract()
-                .and_then(|contract| contract.activation().catalog_column())
+                .and_then(|contract| contract.selection_store().catalog_column())
             else {
                 continue;
             };
@@ -635,6 +635,20 @@ mod tests {
             );
             assert!(columns.insert(column), "duplicate column {column}");
         }
+    }
+
+    #[test]
+    fn pi_keeps_native_selection_separate_from_unified_discovery() {
+        let contract = builtin_app_registry()
+            .for_app(&AppType::Pi)
+            .skill_contract()
+            .expect("Pi supports Skills");
+
+        assert_eq!(
+            contract.selection_store(),
+            crate::SkillSelectionStore::NativeDirectory
+        );
+        assert!(contract.discovery().reads_unified_store());
     }
 
     #[test]

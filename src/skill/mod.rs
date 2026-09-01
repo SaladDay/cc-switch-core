@@ -1,22 +1,25 @@
 //! Application-level Skill contracts.
 //!
-//! The contract describes where an application's activation state lives and
-//! how the application discovers installed Skills. Filesystem observation and
-//! writes are added by higher layers; this module performs no I/O.
+//! The contract describes where an application's requested Skill selection
+//! lives and how the application discovers installed Skills. Selection and
+//! discovery are independent inputs to effective state. Filesystem observation
+//! and writes are added by higher layers; this module performs no I/O.
 
 use crate::LogicalTarget;
 
-/// Where one application's per-Skill activation state is stored.
+/// Where one application's requested per-Skill selection is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SkillActivationStore {
+pub enum SkillSelectionStore {
     /// The shared `skills` table stores the requested state in this column.
     CatalogColumn(&'static str),
-    /// Presence in the application's native Skill directory is the state.
+    /// Presence in the application's native Skill directory stores selection.
+    ///
+    /// Unified discovery may still make the Skill visible independently.
     NativeDirectory,
 }
 
-impl SkillActivationStore {
-    /// Returns the shared catalog column, when activation is catalog-backed.
+impl SkillSelectionStore {
+    /// Returns the shared catalog column, when selection is catalog-backed.
     pub const fn catalog_column(self) -> Option<&'static str> {
         match self {
             Self::CatalogColumn(column) => Some(column),
@@ -61,9 +64,13 @@ impl SkillConfigTarget {
 }
 
 /// Product-neutral Skill behavior declared by an application descriptor.
+///
+/// Selection records the requested app-specific state. Discovery describes
+/// where the app can actually see Skills; a service layer resolves both into
+/// effective state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SkillAppContract {
-    activation: SkillActivationStore,
+    selection_store: SkillSelectionStore,
     discovery: SkillDiscovery,
     config_target: Option<SkillConfigTarget>,
 }
@@ -75,7 +82,7 @@ impl SkillAppContract {
         config_target: Option<SkillConfigTarget>,
     ) -> Self {
         Self {
-            activation: SkillActivationStore::CatalogColumn(column),
+            selection_store: SkillSelectionStore::CatalogColumn(column),
             discovery,
             config_target,
         }
@@ -83,15 +90,15 @@ impl SkillAppContract {
 
     pub(crate) const fn native_directory(discovery: SkillDiscovery) -> Self {
         Self {
-            activation: SkillActivationStore::NativeDirectory,
+            selection_store: SkillSelectionStore::NativeDirectory,
             discovery,
             config_target: None,
         }
     }
 
-    /// Returns where this application's activation state is stored.
-    pub const fn activation(self) -> SkillActivationStore {
-        self.activation
+    /// Returns where this application's requested selection is stored.
+    pub const fn selection_store(self) -> SkillSelectionStore {
+        self.selection_store
     }
 
     /// Returns how this application discovers installed Skills.
@@ -110,10 +117,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_directory_activation_cannot_declare_a_config_target() {
+    fn native_directory_selection_cannot_declare_a_config_target() {
         let contract = SkillAppContract::native_directory(SkillDiscovery::NativeAndUnified);
 
-        assert_eq!(contract.activation(), SkillActivationStore::NativeDirectory);
+        assert_eq!(
+            contract.selection_store(),
+            SkillSelectionStore::NativeDirectory
+        );
         assert_eq!(contract.config_target(), None);
     }
 
