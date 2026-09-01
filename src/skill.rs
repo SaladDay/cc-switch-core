@@ -2087,15 +2087,22 @@ fn recover_interrupted_enable(
     enabled: bool,
 ) -> Result<(), SkillConfigError> {
     let (destination_state, _) = inspect_paths(&paths.source, &paths.destination, directory)?;
-    if enabled && destination_state == SkillDeploymentState::Missing {
-        let staged = temporary_root.join("deployment");
-        match inspect_paths(&paths.source, &staged, directory) {
-            Ok((SkillDeploymentState::Linked | SkillDeploymentState::Copied, _)) => {
+    let staged = temporary_root.join("deployment");
+    match inspect_paths(&paths.source, &staged, directory) {
+        Ok((SkillDeploymentState::Linked | SkillDeploymentState::Copied, _)) => {
+            if enabled && destination_state == SkillDeploymentState::Missing {
                 rename_path(&staged, &paths.destination)?;
             }
-            Ok((SkillDeploymentState::Missing, _)) | Err(SkillConfigError::Conflict { .. }) => {}
-            Err(error) => return Err(error),
         }
+        Ok((SkillDeploymentState::Missing, _)) => {}
+        Err(SkillConfigError::Conflict { .. }) => {
+            return Err(SkillConfigError::Recovery {
+                message: format!(
+                    "interrupted Skill enable has unverified staged content at {staged:?}"
+                ),
+            });
+        }
+        Err(error) => return Err(error),
     }
     remove_directory(temporary_root)
 }
@@ -2108,26 +2115,28 @@ fn recover_interrupted_disable(
 ) -> Result<(), SkillConfigError> {
     let backup = temporary_root.join("deployment");
     let (destination_state, _) = inspect_paths(&paths.source, &paths.destination, directory)?;
-    if destination_state == SkillDeploymentState::Missing {
-        if enabled {
-            let original_parent = paths
-                .destination
-                .parent()
-                .expect("a deployment has a destination root");
-            let (backup_state, _) =
-                inspect_paths_with_link_parent(&paths.source, &backup, directory, original_parent)?;
-            if backup_state != SkillDeploymentState::Missing {
-                rename_path(&backup, &paths.destination)?;
-            }
-        }
-        return remove_directory(temporary_root);
-    }
     let original_parent = paths
         .destination
         .parent()
         .expect("a deployment has a destination root");
     let (backup_state, _) =
-        inspect_paths_with_link_parent(&paths.source, &backup, directory, original_parent)?;
+        match inspect_paths_with_link_parent(&paths.source, &backup, directory, original_parent) {
+            Ok(state) => state,
+            Err(SkillConfigError::Conflict { .. }) => {
+                return Err(SkillConfigError::Recovery {
+                    message: format!(
+                        "interrupted Skill disable has an unverified backup at {backup:?}"
+                    ),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+    if destination_state == SkillDeploymentState::Missing {
+        if enabled && backup_state != SkillDeploymentState::Missing {
+            rename_path(&backup, &paths.destination)?;
+        }
+        return remove_directory(temporary_root);
+    }
     match backup_state {
         SkillDeploymentState::Missing => remove_directory(temporary_root),
         SkillDeploymentState::Linked | SkillDeploymentState::Copied => {
@@ -3032,6 +3041,29 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_enable_preserves_unverified_staged_content() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Enable).unwrap();
+        fs::create_dir(temporary_root.join("deployment")).unwrap();
+        fs::write(
+            temporary_root.join("deployment/SKILL.md"),
+            "changed while interrupted",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy),
+            Err(SkillConfigError::Recovery { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(temporary_root.join("deployment/SKILL.md")).unwrap(),
+            "changed while interrupted"
+        );
+    }
+
+    #[test]
     fn unrelated_future_marker_does_not_block_another_skill() {
         let (_temporary, source, destination) = roots();
         fs::create_dir_all(&destination).unwrap();
@@ -3104,7 +3136,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_disable_finishes_after_partial_backup_cleanup() {
+    fn interrupted_disable_preserves_a_changed_partial_backup() {
         let (_temporary, source, destination) = roots();
         apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
             .unwrap()
@@ -3120,13 +3152,13 @@ mod tests {
         fs::remove_file(temporary_root.join("deployment/SKILL.md")).unwrap();
         drop(receipt);
 
-        apply_skill_deployment(&source, &destination, "docs", false, SkillSyncMethod::Copy)
-            .unwrap()
-            .commit()
-            .unwrap();
+        assert!(matches!(
+            apply_skill_deployment(&source, &destination, "docs", false, SkillSyncMethod::Copy),
+            Err(SkillConfigError::Recovery { .. })
+        ));
 
         assert!(!destination.join("docs").exists());
-        assert!(!temporary_root.exists());
+        assert!(temporary_root.exists());
     }
 
     #[test]
