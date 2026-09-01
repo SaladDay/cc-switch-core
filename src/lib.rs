@@ -72,5 +72,8 @@ pub use simple_provider::{
     SimpleProviderPreset, SimpleProviderProtocol, SimpleProviderValues,
 };
 pub use skill::{
-    SkillAppContract, SkillCatalogColumn, SkillConfigTarget, SkillDiscovery, SkillSelectionStore,
+    inspect_installed_skills, skill_catalog_columns, InstalledSkillSnapshot, SkillAppContract,
+    SkillAppRuntime, SkillAppState, SkillCatalogColumn, SkillCatalogEntry, SkillCatalogEntryError,
+    SkillConfigTarget, SkillControlReason, SkillDiscovery, SkillReadError, SkillRuntime,
+    SkillRuntimeError, SkillSelectionStore,
 };

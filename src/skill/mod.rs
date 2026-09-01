@@ -2,10 +2,21 @@
 //!
 //! The contract describes where an application's requested Skill selection
 //! lives and how the application discovers installed Skills. Selection and
-//! discovery are independent inputs to effective state. Filesystem observation
-//! and writes are added by higher layers; this module performs no I/O.
+//! discovery are independent inputs to effective state. The read layer may
+//! observe host-resolved paths; all database and filesystem writes remain in
+//! later layers.
+
+mod catalog;
+mod config;
+mod read;
 
 use crate::LogicalTarget;
+
+pub use catalog::{skill_catalog_columns, SkillCatalogEntry, SkillCatalogEntryError};
+pub use read::{
+    inspect_installed_skills, InstalledSkillSnapshot, SkillAppRuntime, SkillAppState,
+    SkillControlReason, SkillReadError, SkillRuntime, SkillRuntimeError,
+};
 
 /// A schema-backed `skills` selection column declared by Core.
 ///
@@ -42,9 +53,9 @@ pub enum SkillSelectionStore {
 
 impl SkillSelectionStore {
     /// Returns the shared catalog column, when selection is catalog-backed.
-    pub const fn catalog_column(self) -> Option<&'static str> {
+    pub const fn catalog_column(self) -> Option<SkillCatalogColumn> {
         match self {
-            Self::CatalogColumn(column) => Some(column.as_str()),
+            Self::CatalogColumn(column) => Some(column),
             Self::NativeDirectory => None,
         }
     }

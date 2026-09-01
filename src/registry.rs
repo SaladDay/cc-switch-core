@@ -623,13 +623,19 @@ mod tests {
                 continue;
             };
             assert!(
-                column.starts_with("enabled_")
+                column.as_str().starts_with("enabled_")
                     && column
+                        .as_str()
                         .bytes()
                         .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
-                "{column}"
+                "{}",
+                column.as_str()
             );
-            assert!(columns.insert(column), "duplicate column {column}");
+            assert!(
+                columns.insert(column),
+                "duplicate column {}",
+                column.as_str()
+            );
         }
     }
 
