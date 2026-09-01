@@ -652,11 +652,16 @@ pub fn inspect_skill_config_state(
             yaml_disabled_names(target, &root)?
         }
     };
-    Ok(if disabled.iter().any(|entry| entry == name) {
-        SkillConfigState::Disabled
-    } else {
-        SkillConfigState::Enabled
-    })
+    Ok(
+        if disabled
+            .iter()
+            .any(|entry| native_skill_names_equal(target, entry, name))
+        {
+            SkillConfigState::Disabled
+        } else {
+            SkillConfigState::Enabled
+        },
+    )
 }
 
 /// Changes only the supported native disabled list and preserves unrelated data.
@@ -698,6 +703,13 @@ fn validate_skill_name(name: &str) -> Result<(), SkillConfigError> {
 pub fn skill_name_key(name: &str) -> Result<String, SkillConfigError> {
     validate_skill_name(name)?;
     Ok(name.nfkc().case_fold().nfkc().collect())
+}
+
+fn native_skill_names_equal(target: SkillConfigTarget, left: &str, right: &str) -> bool {
+    match target {
+        SkillConfigTarget::GeminiSettings => left.to_lowercase() == right.to_lowercase(),
+        SkillConfigTarget::GrokConfig | SkillConfigTarget::HermesConfig => left == right,
+    }
 }
 
 fn json_skills_object(
@@ -751,7 +763,9 @@ fn project_json_skill_enabled(
         return Err(SkillConfigError::GloballyDisabled { target });
     }
     let disabled = json_disabled_names(target, &root)?;
-    let explicitly_disabled = disabled.iter().any(|entry| entry == name);
+    let explicitly_disabled = disabled
+        .iter()
+        .any(|entry| native_skill_names_equal(target, entry, name));
     if (enabled && !explicitly_disabled) || (!enabled && explicitly_disabled) {
         return Ok(None);
     }
@@ -766,7 +780,7 @@ fn project_json_skill_enabled(
         .expect("validated skills entry is an object");
     let mut next = disabled
         .into_iter()
-        .filter(|entry| !enabled || entry != name)
+        .filter(|entry| !enabled || !native_skill_names_equal(target, entry, name))
         .collect::<Vec<_>>();
     if !enabled {
         next.push(name.to_owned());
@@ -2384,6 +2398,35 @@ mod tests {
             SkillConfigState::Enabled
         );
         assert!(enabled.contains("\"old\""));
+    }
+
+    #[test]
+    fn gemini_disabled_names_follow_native_case_insensitive_matching() {
+        let original = br#"{"skills":{"disabled":["docs","DOCS","other"]}}"#;
+        assert_eq!(
+            inspect_skill_config_state(SkillConfigTarget::GeminiSettings, Some(original), "Docs")
+                .unwrap(),
+            SkillConfigState::Disabled
+        );
+        assert!(project_skill_config_enabled(
+            SkillConfigTarget::GeminiSettings,
+            Some(original),
+            "Docs",
+            false,
+        )
+        .unwrap()
+        .is_none());
+
+        let enabled = project_skill_config_enabled(
+            SkillConfigTarget::GeminiSettings,
+            Some(original),
+            "Docs",
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&enabled).unwrap();
+        assert_eq!(parsed["skills"]["disabled"], serde_json::json!(["other"]));
     }
 
     #[test]
