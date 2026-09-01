@@ -179,10 +179,19 @@ fn atomic_write_with_unix_mode(
     drop(file);
 
     replace_file(&temporary, path)?;
-    sync_directory(parent).map_err(|source| FileError::Durability {
-        path: parent.to_owned(),
-        source,
-    })
+    #[cfg(not(windows))]
+    {
+        sync_directory(parent).map_err(|source| FileError::Durability {
+            path: parent.to_owned(),
+            source,
+        })
+    }
+    #[cfg(windows)]
+    {
+        // replace_file uses MOVEFILE_WRITE_THROUGH. FlushFileBuffers is not
+        // defined for directory handles and fails on some local and SMB filesystems.
+        Ok(())
+    }
 }
 
 /// Removes a file and makes the directory entry durable before returning.
@@ -272,53 +281,9 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
 
 #[cfg(windows)]
 fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
+    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
 
-    fn wide_path(path: &Path) -> Result<Vec<u16>, std::io::Error> {
-        let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        if value.contains(&0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Windows paths cannot contain NUL",
-            ));
-        }
-        if path.is_absolute()
-            && !value.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
-            && !value.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
-        {
-            if value.starts_with(&[b'\\' as u16, b'\\' as u16]) {
-                let mut extended = "\\\\?\\UNC\\".encode_utf16().collect::<Vec<_>>();
-                extended.extend_from_slice(&value[2..]);
-                value = extended;
-            } else {
-                let mut extended = "\\\\?\\".encode_utf16().collect::<Vec<_>>();
-                extended.extend(value);
-                value = extended;
-            }
-        }
-        value.push(0);
-        Ok(value)
-    }
-
-    let result = wide_path(temporary).and_then(|temporary_wide| {
-        let destination_wide = wide_path(destination)?;
-        // Both pointers remain valid and NUL-terminated for the duration of the call.
-        let moved = unsafe {
-            MoveFileExW(
-                temporary_wide.as_ptr(),
-                destination_wide.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if moved == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    });
+    let result = move_path_windows(temporary, destination, MOVEFILE_REPLACE_EXISTING);
     if let Err(source) = result {
         let _ = fs::remove_file(temporary);
         return Err(FileError::AtomicReplace {
@@ -330,21 +295,71 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
     Ok(())
 }
 
+#[cfg(windows)]
+pub(crate) fn move_path_write_through(source: &Path, destination: &Path) -> std::io::Result<()> {
+    move_path_windows(source, destination, 0)
+}
+
+#[cfg(windows)]
+fn move_path_windows(source: &Path, destination: &Path, flags: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let source = wide_windows_path(source)?;
+    let destination = wide_windows_path(destination)?;
+    // Both pointers remain valid and NUL-terminated for the duration of the call.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            flags | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn wide_windows_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if value.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows paths cannot contain NUL",
+        ));
+    }
+    if path.is_absolute()
+        && !value.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+        && !value.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
+    {
+        if value.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+            let mut extended = "\\\\?\\UNC\\".encode_utf16().collect::<Vec<_>>();
+            extended.extend_from_slice(&value[2..]);
+            value = extended;
+        } else {
+            let mut extended = "\\\\?\\".encode_utf16().collect::<Vec<_>>();
+            extended.extend(value);
+            value = extended;
+        }
+    }
+    value.push(0);
+    Ok(value)
+}
+
 #[cfg(unix)]
 pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
     fs::File::open(path)?.sync_all()
 }
 
 #[cfg(windows)]
-pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?
-        .sync_all()
+pub(crate) fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    // Windows does not define FlushFileBuffers for directory handles. File
+    // replacements and Skill renames use MOVEFILE_WRITE_THROUGH instead.
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]

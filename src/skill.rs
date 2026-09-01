@@ -1630,6 +1630,9 @@ fn observed_receipt(
 }
 
 fn cleanup_temporary(path: &Path, error: SkillConfigError) -> SkillConfigError {
+    if matches!(&error, SkillConfigError::Recovery { .. }) {
+        return error;
+    }
     match remove_directory(path) {
         Ok(()) => error,
         Err(cleanup) => SkillConfigError::Recovery {
@@ -2225,16 +2228,29 @@ fn sync_directory(path: &Path) -> Result<(), SkillConfigError> {
 }
 
 fn rename_path(source: &Path, destination: &Path) -> Result<(), SkillConfigError> {
+    #[cfg(windows)]
+    crate::fs::move_path_write_through(source, destination)
+        .map_err(|error| SkillConfigError::io(destination, error))?;
+    #[cfg(not(windows))]
     fs::rename(source, destination).map_err(|error| SkillConfigError::io(destination, error))?;
+
+    #[cfg(not(windows))]
     if let Some(parent) = source.parent() {
-        sync_directory(parent)?;
+        sync_directory(parent).map_err(|error| post_visible_error("rename", error))?;
     }
+    #[cfg(not(windows))]
     if destination.parent() != source.parent() {
         if let Some(parent) = destination.parent() {
-            sync_directory(parent)?;
+            sync_directory(parent).map_err(|error| post_visible_error("rename", error))?;
         }
     }
     Ok(())
+}
+
+fn post_visible_error(operation: &str, error: SkillConfigError) -> SkillConfigError {
+    SkillConfigError::Recovery {
+        message: format!("{operation} completed but could not be made durable: {error}"),
+    }
 }
 
 #[cfg(unix)]
@@ -2267,7 +2283,7 @@ fn remove_deployment(path: &Path) -> Result<(), SkillConfigError> {
         });
     }
     if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
+        sync_directory(parent).map_err(|error| post_visible_error("removal", error))?;
     }
     Ok(())
 }
@@ -2285,7 +2301,7 @@ fn remove_directory_symlink(path: &Path) -> Result<(), SkillConfigError> {
 fn remove_directory(path: &Path) -> Result<(), SkillConfigError> {
     fs::remove_dir_all(path).map_err(|source| SkillConfigError::io(path, source))?;
     if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
+        sync_directory(parent).map_err(|error| post_visible_error("directory removal", error))?;
     }
     Ok(())
 }
@@ -2303,6 +2319,48 @@ mod tests {
         fs::create_dir_all(source.join("docs")).unwrap();
         fs::write(source.join("docs/SKILL.md"), "# Docs\n").unwrap();
         (temporary, source, destination)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_rename_sync_failure_preserves_the_moved_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempdir().unwrap();
+        let parent = temporary.path().join("skills");
+        let source = parent.join("source");
+        let destination = parent.join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "# Skill\n").unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o300)).unwrap();
+
+        let result = rename_path(&source, &destination);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(result, Err(SkillConfigError::Recovery { .. })));
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("SKILL.md")).unwrap(),
+            "# Skill\n"
+        );
+    }
+
+    #[test]
+    fn uncertain_recovery_data_is_not_cleaned_up() {
+        let temporary = tempdir().unwrap();
+        let state = temporary.path().join("operation");
+        fs::create_dir(&state).unwrap();
+        fs::write(state.join("deployment"), "preserve").unwrap();
+
+        let error = cleanup_temporary(
+            &state,
+            SkillConfigError::Recovery {
+                message: "state may be visible".to_owned(),
+            },
+        );
+
+        assert!(matches!(error, SkillConfigError::Recovery { .. }));
+        assert_eq!(fs::read(state.join("deployment")).unwrap(), b"preserve");
     }
 
     #[test]
