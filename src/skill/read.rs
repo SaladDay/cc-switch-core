@@ -1,13 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    fs::{self, DirEntry, File},
+    fs::{self, File},
     io::Read,
     path::{Component, Path, PathBuf},
 };
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -17,12 +16,14 @@ use crate::{
 
 use super::{
     config::{parse_native_controls, NativeSkillControl, NativeSkillControls},
+    deploy::{inspect_managed_copy, ManagedCopyObservation, MANAGED_MARKER},
+    tree::{digest_tree, ScanBudget},
     SkillCatalogEntry,
 };
 
-const MAX_SKILL_TREE_ENTRIES: usize = 10_000;
-const MAX_SKILL_TREE_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_SKILL_TREE_DEPTH: usize = 64;
+#[cfg(test)]
+use super::tree::MAX_TREE_DEPTH;
+
 const MAX_SKILL_CATALOG_ENTRIES: usize = 10_000;
 const MAX_SKILL_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_SKILL_SNAPSHOT_ENTRIES: usize = 100_000;
@@ -139,6 +140,10 @@ impl SkillAppRuntime {
     pub fn hermes_platform(&self) -> Option<&str> {
         self.hermes_platform.as_deref()
     }
+
+    pub(super) fn config_document(&self) -> Option<&ObservedDocument> {
+        self.config.as_ref()
+    }
 }
 
 impl fmt::Debug for SkillAppRuntime {
@@ -218,6 +223,10 @@ impl SkillRuntime {
     ) -> impl ExactSizeIterator<Item = &SkillAppRuntime> + DoubleEndedIterator + Clone {
         self.apps.iter()
     }
+
+    pub(super) fn app_runtime(&self, app: &AppType) -> Option<&SkillAppRuntime> {
+        self.apps.iter().find(|runtime| runtime.app() == app)
+    }
 }
 
 fn validate_distinct_roots(
@@ -258,7 +267,7 @@ fn validate_distinct_roots(
     Ok(())
 }
 
-fn roots_overlap(left: &Path, right: &Path) -> bool {
+pub(super) fn roots_overlap(left: &Path, right: &Path) -> bool {
     #[cfg(any(windows, target_os = "macos"))]
     {
         let left = comparable_path(left);
@@ -278,7 +287,7 @@ fn comparable_path(path: &Path) -> Vec<String> {
         .collect()
 }
 
-fn resolve_root(path: &Path) -> Result<PathBuf, SkillRuntimeError> {
+pub(super) fn resolve_root(path: &Path) -> Result<PathBuf, SkillRuntimeError> {
     let mut last_missing = None;
     for ancestor in path.ancestors() {
         match fs::canonicalize(ancestor) {
@@ -384,6 +393,8 @@ pub struct SkillAppState {
     selected: Option<bool>,
     enabled: Option<bool>,
     writable: bool,
+    can_enable: bool,
+    can_disable: bool,
     reason: Option<SkillControlReason>,
 }
 
@@ -404,9 +415,19 @@ impl SkillAppState {
         self.enabled
     }
 
-    /// Returns whether the opposite effective state can be requested safely.
+    /// Returns whether both target states can be requested safely.
     pub fn writable(&self) -> bool {
         self.writable
+    }
+
+    /// Returns whether Core can safely prepare an enable request.
+    pub fn can_enable(&self) -> bool {
+        self.can_enable
+    }
+
+    /// Returns whether Core can safely prepare a disable request.
+    pub fn can_disable(&self) -> bool {
+        self.can_disable
     }
 
     pub fn reason(&self) -> Option<SkillControlReason> {
@@ -445,18 +466,35 @@ pub fn inspect_installed_skills(
         });
     }
     validate_distinct_roots(&runtime.source_root, &runtime.unified_root, &runtime.apps)?;
-    validate_catalog_identity(catalog)?;
+    validate_catalog_identity(catalog, runtime)?;
     let apps = runtime.apps().map(PreparedApp::new).collect::<Vec<_>>();
-    let mut budget = SnapshotBudget::default();
+    let mut budget = ScanBudget::new(MAX_SKILL_SNAPSHOT_ENTRIES, MAX_SKILL_SNAPSHOT_BYTES);
     Ok(catalog
         .iter()
         .map(|entry| inspect_entry(entry, runtime, &apps, &mut budget))
         .collect())
 }
 
-fn validate_catalog_identity(catalog: &[SkillCatalogEntry]) -> Result<(), SkillReadError> {
+pub(super) fn validate_catalog_identity(
+    catalog: &[SkillCatalogEntry],
+    runtime: &SkillRuntime,
+) -> Result<(), SkillReadError> {
     let mut ids = HashSet::new();
     let mut directories = HashSet::new();
+    let has_name_controls = runtime.apps.iter().any(|app| {
+        builtin_app_registry()
+            .for_app(&app.app)
+            .skill_contract()
+            .is_some_and(|contract| contract.config_target().is_some())
+    });
+    let case_insensitive_names = runtime.apps.iter().any(|app| {
+        builtin_app_registry()
+            .for_app(&app.app)
+            .skill_contract()
+            .and_then(|contract| contract.config_target())
+            == Some(SkillConfigTarget::GeminiSettings)
+    });
+    let mut control_names = HashSet::new();
     for entry in catalog {
         if !ids.insert(entry.id()) {
             return Err(SkillReadError::DuplicateId {
@@ -468,6 +506,18 @@ fn validate_catalog_identity(catalog: &[SkillCatalogEntry]) -> Result<(), SkillR
             return Err(SkillReadError::DuplicateDirectory {
                 directory: entry.directory().to_owned(),
             });
+        }
+        if has_name_controls {
+            let key = if case_insensitive_names {
+                entry.name().to_lowercase()
+            } else {
+                entry.name().to_owned()
+            };
+            if !control_names.insert(key) {
+                return Err(SkillReadError::DuplicateControlName {
+                    name: entry.name().to_owned(),
+                });
+            }
         }
     }
     Ok(())
@@ -501,7 +551,7 @@ fn inspect_entry(
     entry: &SkillCatalogEntry,
     runtime: &SkillRuntime,
     apps: &[PreparedApp<'_>],
-    budget: &mut SnapshotBudget,
+    budget: &mut ScanBudget,
 ) -> InstalledSkillSnapshot {
     let source_path = runtime.source_root.join(entry.directory());
     let source = inspect_source(&source_path, budget);
@@ -519,6 +569,7 @@ fn inspect_entry(
                 inspect_relation(
                     &mut source,
                     &runtime.unified_root,
+                    entry.id(),
                     entry.directory(),
                     false,
                     true,
@@ -574,6 +625,8 @@ fn unavailable_state(
         selected,
         enabled: None,
         writable: false,
+        can_enable: false,
+        can_disable: false,
         reason: Some(reason),
     }
 }
@@ -583,7 +636,7 @@ fn inspect_app(
     prepared: &PreparedApp<'_>,
     source: &mut ReadySource,
     unified: &PathRelation,
-    budget: &mut SnapshotBudget,
+    budget: &mut ScanBudget,
 ) -> SkillAppState {
     let runtime = prepared.runtime;
     let descriptor = builtin_app_registry().for_app(&runtime.app);
@@ -595,6 +648,7 @@ fn inspect_app(
     let native = inspect_relation(
         source,
         &runtime.native_root,
+        entry.id(),
         entry.directory(),
         allow_matching_copy,
         false,
@@ -651,12 +705,23 @@ fn inspect_app(
         None if direct.is_selected() => Some(SkillControlReason::DirectUnifiedDiscovery),
         _ => None,
     };
+    let (can_enable, can_disable) = match reason {
+        None => (true, true),
+        Some(SkillControlReason::Required) => (true, false),
+        Some(SkillControlReason::GloballyDisabled | SkillControlReason::ExternallyDisabled) => {
+            (false, true)
+        }
+        Some(SkillControlReason::DirectUnifiedDiscovery) => (true, false),
+        Some(_) => (false, false),
+    };
 
     SkillAppState {
         app: runtime.app.clone(),
         selected,
         enabled: Some(enabled),
-        writable: reason.is_none(),
+        writable: can_enable && can_disable,
+        can_enable,
+        can_disable,
         reason,
     }
 }
@@ -671,6 +736,8 @@ fn state_unavailable(
         selected,
         enabled: None,
         writable: false,
+        can_enable: false,
+        can_disable: false,
         reason: Some(reason),
     }
 }
@@ -688,7 +755,7 @@ struct ReadySource {
     digest: Option<[u8; 32]>,
 }
 
-fn inspect_source(path: &Path, budget: &mut SnapshotBudget) -> SourceObservation {
+fn inspect_source(path: &Path, budget: &mut ScanBudget) -> SourceObservation {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -710,8 +777,13 @@ fn inspect_source(path: &Path, budget: &mut SnapshotBudget) -> SourceObservation
         }
         Err(_) => return SourceObservation::Unreadable,
     };
-    if budget.charge_entries(2).is_err() {
+    if budget.charge_entries(3).is_err() {
         return SourceObservation::Unreadable;
+    }
+    match fs::symlink_metadata(path.join(MANAGED_MARKER)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return SourceObservation::Invalid,
+        Err(_) => return SourceObservation::Unreadable,
     }
     if manifest_metadata.len() > MAX_SKILL_MANIFEST_BYTES {
         return SourceObservation::Invalid;
@@ -791,10 +863,11 @@ impl PathRelation {
 fn inspect_relation(
     source: &mut ReadySource,
     root: &Path,
+    skill_id: &str,
     directory: &str,
     allow_matching_copy: bool,
     allow_direct_source: bool,
-    budget: &mut SnapshotBudget,
+    budget: &mut ScanBudget,
 ) -> PathRelation {
     let destination = root.join(directory);
     let metadata = match fs::symlink_metadata(&destination) {
@@ -825,10 +898,16 @@ fn inspect_relation(
         Ok(_) => {}
         Err(_) => return PathRelation::Unreadable,
     }
+    match inspect_managed_copy(&destination, skill_id, directory, budget) {
+        ManagedCopyObservation::Selected => return PathRelation::Selected,
+        ManagedCopyObservation::Conflict => return PathRelation::Blocked,
+        ManagedCopyObservation::Unreadable => return PathRelation::Unreadable,
+        ManagedCopyObservation::Absent => {}
+    }
     if allow_matching_copy {
         let source_digest = match source.digest {
             Some(digest) => digest,
-            None => match tree_digest(&source.path, budget) {
+            None => match digest_tree(&source.path, None, budget) {
                 Ok(digest) => {
                     source.digest = Some(digest);
                     digest
@@ -836,7 +915,7 @@ fn inspect_relation(
                 Err(_) => return PathRelation::Unreadable,
             },
         };
-        match tree_digest(&destination, budget) {
+        match digest_tree(&destination, None, budget) {
             Ok(destination_digest) if destination_digest == source_digest => {
                 return PathRelation::Selected
             }
@@ -859,145 +938,6 @@ fn visibility_of_directory(path: &Path) -> PathRelation {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => PathRelation::Blocked,
         Err(_) => PathRelation::Unreadable,
     }
-}
-
-#[derive(Default)]
-struct TreeBudget {
-    entries: usize,
-    bytes: u64,
-}
-
-#[derive(Default)]
-struct SnapshotBudget {
-    entries: usize,
-    bytes: u64,
-}
-
-impl SnapshotBudget {
-    fn charge_entries(&mut self, count: usize) -> Result<(), ()> {
-        let Some(next) = self.entries.checked_add(count) else {
-            self.entries = MAX_SKILL_SNAPSHOT_ENTRIES;
-            return Err(());
-        };
-        if next > MAX_SKILL_SNAPSHOT_ENTRIES {
-            self.entries = MAX_SKILL_SNAPSHOT_ENTRIES;
-            return Err(());
-        }
-        self.entries = next;
-        Ok(())
-    }
-
-    fn charge_bytes(&mut self, count: u64) -> Result<(), ()> {
-        let Some(next) = self.bytes.checked_add(count) else {
-            self.exhaust_bytes();
-            return Err(());
-        };
-        if next > MAX_SKILL_SNAPSHOT_BYTES {
-            self.exhaust_bytes();
-            return Err(());
-        }
-        self.bytes = next;
-        Ok(())
-    }
-
-    fn remaining_bytes(&self) -> u64 {
-        MAX_SKILL_SNAPSHOT_BYTES.saturating_sub(self.bytes)
-    }
-
-    fn exhaust_bytes(&mut self) {
-        self.bytes = MAX_SKILL_SNAPSHOT_BYTES;
-    }
-}
-
-fn tree_digest(root: &Path, snapshot: &mut SnapshotBudget) -> Result<[u8; 32], ()> {
-    let mut tree = TreeBudget::default();
-    let mut hasher = Sha256::new();
-    hasher.update(b"cc-switch-skill-read-v1\0");
-    hash_directory(root, root, 0, &mut tree, snapshot, &mut hasher)?;
-    Ok(hasher.finalize().into())
-}
-
-fn hash_directory(
-    root: &Path,
-    directory: &Path,
-    depth: usize,
-    tree: &mut TreeBudget,
-    snapshot: &mut SnapshotBudget,
-    hasher: &mut Sha256,
-) -> Result<(), ()> {
-    if depth > MAX_SKILL_TREE_DEPTH {
-        return Err(());
-    }
-    let mut entries = read_directory_entries(directory, tree, snapshot)?;
-    entries.sort_by_key(DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let relative = path.strip_prefix(root).map_err(|_| ())?;
-        let relative = relative.to_str().ok_or(())?.replace('\\', "/");
-        let metadata = fs::symlink_metadata(&path).map_err(|_| ())?;
-        if metadata.file_type().is_dir() {
-            hasher.update(b"d\0");
-            hasher.update(relative.as_bytes());
-            hasher.update(b"\0");
-            hash_directory(root, &path, depth.saturating_add(1), tree, snapshot, hasher)?;
-        } else if metadata.file_type().is_file() {
-            hasher.update(b"f\0");
-            hasher.update(relative.as_bytes());
-            hasher.update(b"\0");
-            hash_file(&path, &metadata, tree, snapshot, hasher)?;
-        } else {
-            return Err(());
-        }
-    }
-    Ok(())
-}
-
-fn read_directory_entries(
-    directory: &Path,
-    tree: &mut TreeBudget,
-    snapshot: &mut SnapshotBudget,
-) -> Result<Vec<DirEntry>, ()> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(directory).map_err(|_| ())? {
-        tree.entries = tree.entries.saturating_add(1);
-        if tree.entries > MAX_SKILL_TREE_ENTRIES || snapshot.charge_entries(1).is_err() {
-            return Err(());
-        }
-        entries.push(entry.map_err(|_| ())?);
-    }
-    Ok(entries)
-}
-
-fn hash_file(
-    path: &Path,
-    before: &fs::Metadata,
-    tree: &mut TreeBudget,
-    snapshot: &mut SnapshotBudget,
-    hasher: &mut Sha256,
-) -> Result<(), ()> {
-    let mut file = File::open(path).map_err(|_| ())?;
-    hasher.update(before.len().to_le_bytes());
-    let mut read_bytes = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer).map_err(|_| ())?;
-        if count == 0 {
-            break;
-        }
-        let count_u64 = u64::try_from(count).map_err(|_| ())?;
-        tree.bytes = tree.bytes.saturating_add(count_u64);
-        if tree.bytes > MAX_SKILL_TREE_BYTES || snapshot.charge_bytes(count_u64).is_err() {
-            return Err(());
-        }
-        read_bytes = read_bytes.saturating_add(count_u64);
-        hasher.update(&buffer[..count]);
-    }
-    let after = fs::symlink_metadata(path).map_err(|_| ())?;
-    if !after.file_type().is_file() || before.len() != read_bytes || after.len() != read_bytes {
-        return Err(());
-    }
-    hasher.update(b"\0");
-    Ok(())
 }
 
 /// Invalid host-resolved runtime inputs.
@@ -1057,6 +997,8 @@ pub enum SkillReadError {
     DuplicateId { id: String },
     #[error("duplicate Skill directory: {directory:?}")]
     DuplicateDirectory { directory: String },
+    #[error("duplicate native Skill control name: {name:?}")]
+    DuplicateControlName { name: String },
 }
 
 #[cfg(test)]
@@ -1206,6 +1148,8 @@ mod tests {
             let app_state = state(&snapshots[0], &app);
             assert_eq!(app_state.enabled(), Some(true));
             assert!(!app_state.writable());
+            assert!(app_state.can_enable());
+            assert!(!app_state.can_disable());
             assert_eq!(
                 app_state.reason(),
                 Some(SkillControlReason::DirectUnifiedDiscovery)
@@ -1237,6 +1181,62 @@ mod tests {
     }
 
     #[test]
+    fn global_native_disable_allows_only_a_disable_request() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let native = temp.path().join("native");
+        let unified = temp.path().join("unified");
+        write_skill(&source, "demo", "source");
+        write_skill(&native, "demo", "source");
+        let config = ObservedDocument::present(
+            SkillConfigTarget::GeminiSettings.logical_target(),
+            br#"{ skills: { enabled: false } }"#.to_vec(),
+        );
+        let gemini = SkillAppRuntime::try_new(AppType::Gemini, &native, Some(config))
+            .expect("Gemini runtime");
+        let runtime = SkillRuntime::try_new(&source, &unified, [gemini]).expect("runtime");
+
+        let snapshots =
+            inspect_installed_skills(&[catalog_entry("demo", true)], &runtime).expect("snapshots");
+        let gemini = state(&snapshots[0], &AppType::Gemini);
+        assert_eq!(gemini.enabled(), Some(false));
+        assert!(!gemini.writable());
+        assert!(!gemini.can_enable());
+        assert!(gemini.can_disable());
+        assert_eq!(gemini.reason(), Some(SkillControlReason::GloballyDisabled));
+    }
+
+    #[test]
+    fn name_based_native_controls_reject_ambiguous_catalog_entries() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let native = temp.path().join("native");
+        let unified = temp.path().join("unified");
+        let runtime =
+            SkillRuntime::try_new(&source, &unified, [app_runtime(&native, AppType::Gemini)])
+                .expect("runtime");
+        let make_entry = |id: &str, name: &str, directory: &str| {
+            SkillCatalogEntry::try_new(
+                id,
+                name,
+                None,
+                directory,
+                crate::skill_catalog_columns().map(|column| (column, false)),
+            )
+            .expect("catalog entry")
+        };
+        let catalog = [
+            make_entry("owner/a:demo", "Demo", "demo-a"),
+            make_entry("owner/b:demo", "demo", "demo-b"),
+        ];
+
+        assert!(matches!(
+            inspect_installed_skills(&catalog, &runtime),
+            Err(SkillReadError::DuplicateControlName { .. })
+        ));
+    }
+
+    #[test]
     fn missing_sources_are_read_only_without_touching_native_paths() {
         let temp = tempdir().expect("tempdir");
         let source = temp.path().join("missing-source");
@@ -1254,6 +1254,25 @@ mod tests {
         assert_eq!(claude.reason(), Some(SkillControlReason::MissingSource));
         assert!(!native.exists());
         assert!(!unified.exists());
+    }
+
+    #[test]
+    fn managed_deployment_markers_are_not_accepted_as_sources() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let native = temp.path().join("native");
+        let unified = temp.path().join("unified");
+        write_skill(&source, "demo", "source");
+        fs::write(source.join("demo").join(MANAGED_MARKER), "{}").expect("managed marker");
+        let runtime =
+            SkillRuntime::try_new(&source, &unified, [app_runtime(&native, AppType::Claude)])
+                .expect("runtime");
+
+        let snapshots =
+            inspect_installed_skills(&[catalog_entry("demo", true)], &runtime).expect("snapshots");
+        let claude = state(&snapshots[0], &AppType::Claude);
+        assert_eq!(claude.enabled(), None);
+        assert_eq!(claude.reason(), Some(SkillControlReason::InvalidSource));
     }
 
     #[test]
@@ -1282,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn required_hermes_skill_stays_read_only_when_not_installed() {
+    fn required_hermes_skill_can_be_enabled_but_not_disabled() {
         let temp = tempdir().expect("tempdir");
         let source = temp.path().join("source");
         let native = temp.path().join("native");
@@ -1311,6 +1330,8 @@ mod tests {
         let hermes = state(&snapshots[0], &AppType::Hermes);
         assert_eq!(hermes.enabled(), Some(false));
         assert!(!hermes.writable());
+        assert!(hermes.can_enable());
+        assert!(!hermes.can_disable());
         assert_eq!(hermes.reason(), Some(SkillControlReason::Required));
     }
 
@@ -1469,7 +1490,7 @@ mod tests {
         for root in [&source, &native] {
             write_skill(root, "demo", "source");
             let mut deep = root.join("demo");
-            for _ in 0..=MAX_SKILL_TREE_DEPTH {
+            for _ in 0..=MAX_TREE_DEPTH {
                 deep.push("d");
             }
             fs::create_dir_all(&deep).expect("deep tree");
@@ -1509,27 +1530,28 @@ mod tests {
         write_skill(temp.path(), "demo", "manifest");
         let skill = temp.path().join("demo");
 
-        let mut manifest_budget = SnapshotBudget {
-            bytes: MAX_SKILL_SNAPSHOT_BYTES,
-            ..SnapshotBudget::default()
-        };
+        let mut manifest_budget =
+            ScanBudget::new(MAX_SKILL_SNAPSHOT_ENTRIES, MAX_SKILL_SNAPSHOT_BYTES);
+        manifest_budget
+            .charge_bytes(MAX_SKILL_SNAPSHOT_BYTES)
+            .unwrap();
         assert!(matches!(
             inspect_source(&skill, &mut manifest_budget),
             SourceObservation::Unreadable
         ));
 
-        let mut tree_budget = SnapshotBudget {
-            entries: MAX_SKILL_SNAPSHOT_ENTRIES,
-            ..SnapshotBudget::default()
-        };
-        assert!(tree_digest(&skill, &mut tree_budget).is_err());
+        let mut tree_budget = ScanBudget::new(MAX_SKILL_SNAPSHOT_ENTRIES, MAX_SKILL_SNAPSHOT_BYTES);
+        tree_budget
+            .charge_entries(MAX_SKILL_SNAPSHOT_ENTRIES)
+            .unwrap();
+        assert!(digest_tree(&skill, None, &mut tree_budget).is_err());
 
-        let mut tree_budget = SnapshotBudget {
-            bytes: MAX_SKILL_SNAPSHOT_BYTES - 1,
-            ..SnapshotBudget::default()
-        };
-        assert!(tree_digest(&skill, &mut tree_budget).is_err());
-        assert_eq!(tree_budget.bytes, MAX_SKILL_SNAPSHOT_BYTES);
+        let mut tree_budget = ScanBudget::new(MAX_SKILL_SNAPSHOT_ENTRIES, MAX_SKILL_SNAPSHOT_BYTES);
+        tree_budget
+            .charge_bytes(MAX_SKILL_SNAPSHOT_BYTES - 1)
+            .unwrap();
+        assert!(digest_tree(&skill, None, &mut tree_budget).is_err());
+        assert_eq!(tree_budget.remaining_bytes(), 0);
     }
 
     #[test]
@@ -1551,6 +1573,8 @@ mod tests {
                 "selected": false,
                 "enabled": true,
                 "writable": false,
+                "canEnable": true,
+                "canDisable": false,
                 "reason": "directUnifiedDiscovery",
             })
         );

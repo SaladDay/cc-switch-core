@@ -30,6 +30,7 @@ dependencies = [
  "http",
  "json-five",
  "json5",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -37,6 +38,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml_edit",
+ "windows-sys",
 ]
 
 [[package]]

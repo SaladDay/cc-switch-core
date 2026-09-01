@@ -154,6 +154,9 @@ fn validate_directory(directory: &str) -> Result<(), SkillCatalogEntryError> {
         || directory.trim() != directory
         || directory.starts_with('.')
         || directory.contains(['/', '\\'])
+        || directory.contains(['<', '>', ':', '"', '|', '?', '*'])
+        || directory.ends_with('.')
+        || is_windows_reserved_name(directory)
         || directory.len() > MAX_SKILL_DIRECTORY_BYTES
         || directory.chars().any(char::is_control)
     {
@@ -162,6 +165,25 @@ fn validate_directory(directory: &str) -> Result<(), SkillCatalogEntryError> {
         });
     }
     Ok(())
+}
+
+fn is_windows_reserved_name(directory: &str) -> bool {
+    let stem = directory.split('.').next().unwrap_or(directory);
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+
+    let Some(suffix) = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    matches!(
+        suffix,
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+    )
 }
 
 /// A malformed shared-catalog row rejected before any path is joined.
@@ -236,6 +258,24 @@ mod tests {
             SkillCatalogEntry::try_new("id", "name", None, "demo", duplicate),
             Err(SkillCatalogEntryError::DuplicateColumn { .. })
         ));
+    }
+
+    #[test]
+    fn catalog_entries_reject_nonportable_directories() {
+        for directory in [
+            "CON",
+            "nul.txt",
+            "COM1",
+            "lpt³.log",
+            "trailing.",
+            "contains:colon",
+            "contains*glob",
+        ] {
+            assert!(matches!(
+                SkillCatalogEntry::try_new("id", "name", None, directory, selections()),
+                Err(SkillCatalogEntryError::InvalidDirectory { .. })
+            ));
+        }
     }
 
     #[test]

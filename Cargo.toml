@@ -18,5 +18,11 @@ json-five = "0.3.1"
 serde_yaml = "0.9"
 sha2 = "0.10"
 
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "redox", target_vendor = "apple"))'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = "3"

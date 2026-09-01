@@ -13,9 +13,10 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the common advisory-lock path for live configuration writes.
 ///
-/// Hosts should begin their shared-catalog write transaction before taking an
-/// exclusive lock here, then hold the lock through commit or rollback. Keeping
-/// that order consistent avoids cross-product deadlocks and split state.
+/// Hosts should take an exclusive lock here before reading switch inputs, then
+/// hold it through their short shared-catalog transaction and receipt decision.
+/// Keeping that order consistent avoids cross-product deadlocks without
+/// holding a database write lock during filesystem copies.
 pub fn shared_live_config_lock_path(home: &Path) -> PathBuf {
     home.join(".cc-switch/live-config.lock")
 }
@@ -233,6 +234,125 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), FileError> {
         });
     }
     Ok(())
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
+pub(crate) fn move_path_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        source,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))
+))]
+pub(crate) fn move_path_no_replace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn move_path_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let source = wide_windows_path(source)?;
+    let destination = wide_windows_path(destination)?;
+    // SAFETY: both buffers are owned, NUL-terminated UTF-16 paths and remain
+    // alive for the duration of the synchronous Windows API call.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn move_path_no_replace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn wide_windows_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let path = std::path::absolute(path)?;
+    let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if value.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows paths cannot contain NUL",
+        ));
+    }
+    if !value.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+        && !value.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
+    {
+        if value.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+            let mut extended = "\\\\?\\UNC\\".encode_utf16().collect::<Vec<_>>();
+            extended.extend_from_slice(&value[2..]);
+            value = extended;
+        } else {
+            let mut extended = "\\\\?\\".encode_utf16().collect::<Vec<_>>();
+            extended.extend(value);
+            value = extended;
+        }
+    }
+    value.push(0);
+    Ok(value)
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    // Windows directory handles do not consistently support FlushFileBuffers;
+    // MoveFileExW above requests write-through for visible directory changes.
+    Ok(())
+}
+
+pub(crate) fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::DirBuilder::new().create(path)
+    }
 }
 
 fn sort_json_keys(value: &Value) -> Value {

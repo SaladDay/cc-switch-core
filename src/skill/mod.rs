@@ -2,20 +2,33 @@
 //!
 //! The contract describes where an application's requested Skill selection
 //! lives and how the application discovers installed Skills. Selection and
-//! discovery are independent inputs to effective state. The read layer may
-//! observe host-resolved paths; all database and filesystem writes remain in
-//! later layers.
+//! discovery are independent inputs to effective state. Hosts resolve paths,
+//! own database transactions and perform logical document I/O; Core owns the
+//! shared observation, projection, deployment and rollback rules.
 
 mod catalog;
 mod config;
+mod deploy;
 mod read;
+mod tree;
+mod write;
 
 use crate::LogicalTarget;
 
 pub use catalog::{skill_catalog_columns, SkillCatalogEntry, SkillCatalogEntryError};
+pub use deploy::{
+    apply_skill_deployment, SkillDeploymentError, SkillDeploymentPlan, SkillDeploymentReceipt,
+    SkillSyncMethod,
+};
 pub use read::{
     inspect_installed_skills, InstalledSkillSnapshot, SkillAppRuntime, SkillAppState,
     SkillControlReason, SkillReadError, SkillRuntime, SkillRuntimeError,
+};
+pub use write::{
+    execute_skill_live_plan, prepare_skill_reconciliation, prepare_skill_switch,
+    SkillCatalogChange, SkillCatalogDecision, SkillCatalogGuard, SkillLiveExecutionError,
+    SkillLiveFailure, SkillLiveReceipt, SkillLiveRollbackError, SkillLiveRollbackFailure,
+    SkillPrepareError, SkillSwitchPlan, SkillWriteOrder,
 };
 
 /// A schema-backed `skills` selection column declared by Core.

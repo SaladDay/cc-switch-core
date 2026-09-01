@@ -22,6 +22,7 @@ pub mod fs;
 pub mod gemini;
 pub mod grokbuild;
 pub mod hermes;
+mod json5_patch;
 mod mcp;
 mod native_import;
 pub mod openclaw;
@@ -33,6 +34,7 @@ mod provider;
 mod registry;
 mod simple_provider;
 mod skill;
+mod yaml_patch;
 
 pub use adapter::{builtin_app_adapter, builtin_app_adapters, AppAdapter};
 pub use app_type::{AppType, ParseAppTypeError};
@@ -72,8 +74,13 @@ pub use simple_provider::{
     SimpleProviderPreset, SimpleProviderProtocol, SimpleProviderValues,
 };
 pub use skill::{
-    inspect_installed_skills, skill_catalog_columns, InstalledSkillSnapshot, SkillAppContract,
-    SkillAppRuntime, SkillAppState, SkillCatalogColumn, SkillCatalogEntry, SkillCatalogEntryError,
-    SkillConfigTarget, SkillControlReason, SkillDiscovery, SkillReadError, SkillRuntime,
-    SkillRuntimeError, SkillSelectionStore,
+    apply_skill_deployment, execute_skill_live_plan, inspect_installed_skills,
+    prepare_skill_reconciliation, prepare_skill_switch, skill_catalog_columns,
+    InstalledSkillSnapshot, SkillAppContract, SkillAppRuntime, SkillAppState, SkillCatalogChange,
+    SkillCatalogColumn, SkillCatalogDecision, SkillCatalogEntry, SkillCatalogEntryError,
+    SkillCatalogGuard, SkillConfigTarget, SkillControlReason, SkillDeploymentError,
+    SkillDeploymentPlan, SkillDeploymentReceipt, SkillDiscovery, SkillLiveExecutionError,
+    SkillLiveFailure, SkillLiveReceipt, SkillLiveRollbackError, SkillLiveRollbackFailure,
+    SkillPrepareError, SkillReadError, SkillRuntime, SkillRuntimeError, SkillSelectionStore,
+    SkillSwitchPlan, SkillSyncMethod, SkillWriteOrder,
 };
