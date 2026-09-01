@@ -399,6 +399,12 @@ struct InterruptedOperationMarker {
     directory: String,
 }
 
+enum OperationMarkerFile {
+    Missing,
+    Invalid,
+    Valid(InterruptedOperationMarker),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ManagedCopyMarker {
     version: u8,
@@ -1265,12 +1271,14 @@ pub fn apply_skill_deployment_with_policy(
     match state {
         SkillDeploymentState::Missing => Ok(observed_receipt(paths.destination, expectation)),
         SkillDeploymentState::Linked | SkillDeploymentState::Copied => {
-            disable_deployment(paths.destination, directory, expectation)
+            disable_deployment(paths, directory, expectation)
         }
     }
 }
 
 struct DeploymentPaths {
+    source_root: PathBuf,
+    destination_root: PathBuf,
     source: PathBuf,
     destination: PathBuf,
 }
@@ -1292,6 +1300,8 @@ fn deployment_paths(
     let source = source_root.join(directory);
     validate_skill_source(&source)?;
     Ok(DeploymentPaths {
+        source_root: source_root.to_owned(),
+        destination_root: destination_root.to_owned(),
         source,
         destination: destination_root.join(directory),
     })
@@ -1508,7 +1518,7 @@ fn enable_deployment(
         .to_owned();
     crate::fs::create_dir_all_durable(&parent)
         .map_err(|source| SkillConfigError::io(&parent, source))?;
-    ensure_distinct_roots(&paths.source, &paths.destination)?;
+    ensure_distinct_roots(&paths.source_root, &paths.destination_root)?;
 
     if !matches!(sync_method, SkillSyncMethod::Copy) {
         match create_link_deployment(&paths, directory) {
@@ -1632,22 +1642,30 @@ fn recover_created(receipt: SkillDeploymentReceipt, error: SkillConfigError) -> 
 }
 
 fn disable_deployment(
-    destination: PathBuf,
+    paths: DeploymentPaths,
     directory: &str,
     expectation: DeploymentExpectation,
 ) -> Result<SkillDeploymentReceipt, SkillConfigError> {
-    let parent = destination
+    ensure_distinct_roots(&paths.source_root, &paths.destination_root)?;
+    require_expectation(&paths.destination, &expectation)?;
+    let parent = paths
+        .destination
         .parent()
         .expect("a deployment has a destination root");
     let temporary_root =
         create_temporary_directory(parent, directory, InterruptedOperation::Disable)?;
     let backup = temporary_root.join("deployment");
-    if let Err(error) = rename_path(&destination, &backup) {
+    if let Err(error) = ensure_distinct_roots(&paths.source_root, &paths.destination_root)
+        .and_then(|()| require_expectation(&paths.destination, &expectation))
+    {
+        return Err(cleanup_temporary(&temporary_root, error));
+    }
+    if let Err(error) = rename_path(&paths.destination, &backup) {
         return Err(cleanup_temporary(&temporary_root, error));
     }
     let receipt = SkillDeploymentReceipt {
         change: DeploymentChange::Removed {
-            destination,
+            destination: paths.destination,
             temporary_root,
             backup,
             expectation,
@@ -2101,17 +2119,38 @@ fn read_operation_marker(
     temporary_root: &Path,
 ) -> Result<Option<InterruptedOperationMarker>, SkillConfigError> {
     let path = temporary_root.join(TEMP_MARKER_FILE);
-    let metadata = match fs::symlink_metadata(&path) {
+    match read_operation_marker_file(&path)? {
+        OperationMarkerFile::Valid(marker) => return Ok(Some(marker)),
+        OperationMarkerFile::Invalid => return Ok(None),
+        OperationMarkerFile::Missing => {}
+    }
+
+    let staging = temporary_root.join(TEMP_MARKER_STAGING_FILE);
+    match read_operation_marker_file(&staging)? {
+        OperationMarkerFile::Valid(marker) => {
+            rename_path(&staging, &path)?;
+            Ok(Some(marker))
+        }
+        OperationMarkerFile::Missing | OperationMarkerFile::Invalid => Ok(None),
+    }
+}
+
+fn read_operation_marker_file(path: &Path) -> Result<OperationMarkerFile, SkillConfigError> {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => metadata,
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(_) => return Ok(OperationMarkerFile::Invalid),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OperationMarkerFile::Missing)
+        }
         Err(source) => return Err(SkillConfigError::io(path, source)),
     };
     if metadata.len() > MAX_TEMP_MARKER_BYTES {
-        return Ok(None);
+        return Ok(OperationMarkerFile::Invalid);
     }
-    let contents = fs::read(&path).map_err(|source| SkillConfigError::io(&path, source))?;
-    Ok(serde_json::from_slice(&contents).ok())
+    let contents = fs::read(path).map_err(|source| SkillConfigError::io(path, source))?;
+    Ok(serde_json::from_slice(&contents)
+        .map(OperationMarkerFile::Valid)
+        .unwrap_or(OperationMarkerFile::Invalid))
 }
 
 fn recover_interrupted_enable(
@@ -2130,11 +2169,9 @@ fn recover_interrupted_enable(
         }
         Ok((SkillDeploymentState::Missing, _)) => {}
         Err(SkillConfigError::Conflict { .. }) => {
-            return Err(SkillConfigError::Recovery {
-                message: format!(
-                    "interrupted Skill enable has unverified staged content at {staged:?}"
-                ),
-            });
+            // A valid operation marker establishes that the stage is Core-owned
+            // scratch space. An incomplete copy can be discarded and rebuilt.
+            return remove_directory(temporary_root);
         }
         Err(error) => return Err(error),
     }
@@ -3209,7 +3246,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_enable_preserves_unverified_staged_content() {
+    fn interrupted_enable_discards_owned_partial_stage_and_retries() {
         let (_temporary, source, destination) = roots();
         fs::create_dir_all(&destination).unwrap();
         let temporary_root =
@@ -3221,14 +3258,36 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(
-            apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy),
-            Err(SkillConfigError::Recovery { .. })
-        ));
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
         assert_eq!(
-            fs::read_to_string(temporary_root.join("deployment/SKILL.md")).unwrap(),
-            "changed while interrupted"
+            fs::read_to_string(destination.join("docs/SKILL.md")).unwrap(),
+            "# Docs\n"
         );
+        assert!(!temporary_root.exists());
+    }
+
+    #[test]
+    fn staged_operation_marker_is_finalized_during_recovery() {
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        let temporary_root =
+            create_temporary_directory(&destination, "docs", InterruptedOperation::Enable).unwrap();
+        fs::rename(
+            temporary_root.join(TEMP_MARKER_FILE),
+            temporary_root.join(TEMP_MARKER_STAGING_FILE),
+        )
+        .unwrap();
+
+        apply_skill_deployment(&source, &destination, "docs", true, SkillSyncMethod::Copy)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert!(destination.join("docs/SKILL.md").is_file());
+        assert!(!temporary_root.exists());
     }
 
     #[test]
@@ -3515,6 +3574,40 @@ mod tests {
                 SkillSyncMethod::Copy,
                 SkillCopyPolicy::ManagedOnly
             ),
+            Err(SkillConfigError::OverlappingRoots { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(source.join("docs/SKILL.md")).unwrap(),
+            "# Docs\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disable_rechecks_root_identity_before_moving_a_matching_copy() {
+        use std::os::unix::fs::symlink;
+
+        let (_temporary, source, destination) = roots();
+        fs::create_dir_all(&destination).unwrap();
+        copy_tree(
+            &source.join("docs"),
+            &destination.join("docs"),
+            &mut TreeBudget::default(),
+        )
+        .unwrap();
+        let paths = deployment_paths(&source, &destination, "docs").unwrap();
+        let (_, expectation) = inspect_paths_with_policy(
+            &paths.source,
+            &paths.destination,
+            "docs",
+            SkillCopyPolicy::AllowMatching,
+        )
+        .unwrap();
+        fs::remove_dir_all(&destination).unwrap();
+        symlink(&source, &destination).unwrap();
+
+        assert!(matches!(
+            disable_deployment(paths, "docs", expectation),
             Err(SkillConfigError::OverlappingRoots { .. })
         ));
         assert_eq!(
