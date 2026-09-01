@@ -453,7 +453,8 @@ impl<E: Error + 'static> Error for SkillLiveRollbackError<E> {}
 /// commits. If the commit outcome is uncertain, it re-reads the row and uses
 /// [`SkillSwitchPlan::decide_catalog`] before releasing the live lock. Startup
 /// reconciliation follows the committed catalog; Core keeps no second
-/// selection store.
+/// selection store. A pending recovery must be reconciled before another
+/// user-requested target is accepted.
 pub fn prepare_skill_switch(
     catalog: &[SkillCatalogEntry],
     skill_id: &str,
@@ -472,7 +473,9 @@ pub fn prepare_skill_switch(
 /// `catalog` has the same completeness requirement as
 /// [`prepare_skill_switch`].
 ///
-/// Every application converges to its committed shared-catalog value.
+/// Every application converges to its committed shared-catalog value. Valid
+/// interrupted reference states are resumed by this path; conflicting or
+/// unowned native entries remain unavailable.
 pub fn prepare_skill_reconciliation(
     catalog: &[SkillCatalogEntry],
     skill_id: &str,
@@ -510,12 +513,21 @@ fn prepare(
         .apps()
         .find(|state| state.app() == app)
         .expect("the requested runtime produces an application state");
-    state
-        .enabled()
-        .ok_or_else(|| SkillPrepareError::Unavailable {
+    let recovery_pending = state.reason() == Some(SkillControlReason::RecoveryPending);
+    if recovery_pending && requested.is_some() {
+        return Err(SkillPrepareError::Unavailable {
             app: app.as_str().to_owned(),
             reason: state.reason(),
-        })?;
+        });
+    }
+    if !recovery_pending {
+        state
+            .enabled()
+            .ok_or_else(|| SkillPrepareError::Unavailable {
+                app: app.as_str().to_owned(),
+                reason: state.reason(),
+            })?;
+    }
     let selected = state
         .selected()
         .ok_or_else(|| SkillPrepareError::SelectionUnavailable {
@@ -523,17 +535,19 @@ fn prepare(
         })?;
     let target_enabled = requested.unwrap_or(selected);
 
-    let target_allowed = if target_enabled {
-        state.can_enable()
-    } else {
-        state.can_disable()
-    };
-    if !target_allowed {
-        return Err(SkillPrepareError::Constrained {
-            app: app.as_str().to_owned(),
-            target_enabled,
-            reason: state.reason(),
-        });
+    if !recovery_pending {
+        let target_allowed = if target_enabled {
+            state.can_enable()
+        } else {
+            state.can_disable()
+        };
+        if !target_allowed {
+            return Err(SkillPrepareError::Constrained {
+                app: app.as_str().to_owned(),
+                target_enabled,
+                reason: state.reason(),
+            });
+        }
     }
 
     let descriptor = builtin_app_registry().for_app(app);
@@ -542,7 +556,7 @@ fn prepare(
         .expect("Skill runtimes require an application contract");
     let direct_discovery_noop = contract.discovery().reads_unified_store()
         && runtime.source_root() == runtime.unified_root();
-    let reference = (!direct_discovery_noop).then(|| {
+    let reference = (recovery_pending || !direct_discovery_noop).then(|| {
         SkillReferencePlan::new(
             entry.id(),
             app.clone(),
@@ -550,7 +564,7 @@ fn prepare(
             app_runtime.native_root(),
             app_runtime.state_root(),
             entry.directory(),
-            target_enabled,
+            target_enabled && !direct_discovery_noop,
         )
     });
 

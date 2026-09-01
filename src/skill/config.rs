@@ -268,11 +268,13 @@ fn parse_hermes(
                     })?;
                     match platforms.get(serde_yaml::Value::String(platform.to_owned())) {
                         None | Some(serde_yaml::Value::Null) => HashSet::new(),
-                        Some(value) => {
-                            yaml_name_list(target, value, "'skills.platform_disabled.*'")?
-                                .into_iter()
-                                .collect()
-                        }
+                        Some(value) => normalized_yaml_name_list(
+                            target,
+                            value,
+                            "'skills.platform_disabled.*'",
+                        )?
+                        .into_iter()
+                        .collect(),
                     }
                 }
             }
@@ -281,7 +283,7 @@ fn parse_hermes(
     let disabled_key = serde_yaml::Value::String("disabled".to_owned());
     let disabled = match skills.get(&disabled_key) {
         None | Some(serde_yaml::Value::Null) => HashSet::new(),
-        Some(value) => yaml_name_list(target, value, "'skills.disabled'")?
+        Some(value) => normalized_yaml_name_list(target, value, "'skills.disabled'")?
             .into_iter()
             .collect(),
     };
@@ -308,27 +310,23 @@ fn parse_yaml(
     Ok(root)
 }
 
-fn yaml_name_list(
+fn yaml_name_values(
     target: SkillConfigTarget,
     value: &serde_yaml::Value,
     label: &str,
 ) -> Result<Vec<String>, SkillConfigReadError> {
     match value {
         serde_yaml::Value::Null => Ok(Vec::new()),
-        serde_yaml::Value::String(value) => {
-            let value = value.trim();
-            Ok((!value.is_empty())
-                .then(|| value.to_owned())
-                .into_iter()
-                .collect())
-        }
+        serde_yaml::Value::String(value) => Ok((!value.trim().is_empty())
+            .then(|| value.clone())
+            .into_iter()
+            .collect()),
         serde_yaml::Value::Sequence(values) => values
             .iter()
             .map(|value| {
                 value
                     .as_str()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
+                    .filter(|value| !value.trim().is_empty())
                     .map(str::to_owned)
                     .ok_or_else(|| invalid(target, &format!("{label} must contain strings")))
             })
@@ -338,6 +336,17 @@ fn yaml_name_list(
             &format!("{label} must be a string or string array"),
         )),
     }
+}
+
+fn normalized_yaml_name_list(
+    target: SkillConfigTarget,
+    value: &serde_yaml::Value,
+    label: &str,
+) -> Result<Vec<String>, SkillConfigReadError> {
+    Ok(yaml_name_values(target, value, label)?
+        .into_iter()
+        .map(|value| value.trim().to_owned())
+        .collect())
 }
 
 fn invalid(target: SkillConfigTarget, message: &str) -> SkillConfigReadError {
@@ -575,12 +584,12 @@ fn project_hermes(
         .and_then(|skills| skills.get(&disabled_key))
         .filter(|value| !value.is_null())
         .map(|value| {
-            yaml_name_list(target, value, "'skills.disabled'")
+            yaml_name_values(target, value, "'skills.disabled'")
                 .map_err(SkillConfigWriteError::from_read)
         })
         .transpose()?
         .unwrap_or_default();
-    let contains = disabled.iter().any(|entry| entry == name);
+    let contains = disabled.iter().any(|entry| entry.trim() == name);
     if contains != enabled {
         return Ok(None);
     }
@@ -597,7 +606,7 @@ fn project_hermes(
         ));
     }
 
-    let next = changed_names(disabled, name, enabled, |left, right| left == right);
+    let next = changed_names(disabled, name, enabled, |left, right| left.trim() == right);
     let projected = yaml_patch::replace_top_level_string_sequence(
         original,
         "skills",
@@ -995,6 +1004,25 @@ mod tests {
         assert!(output.starts_with("model:\n  default: test\n"));
         let parsed: serde_yaml::Value = serde_yaml::from_str(&output).unwrap();
         assert_eq!(parsed["skills"]["paths"][0], "team");
+    }
+
+    #[test]
+    fn hermes_projection_preserves_other_disabled_values() {
+        let input = b"skills:\n  disabled: [\" keep \", demo]\n";
+        let output = project_native_control(
+            SkillConfigTarget::HermesConfig,
+            Some(input),
+            None,
+            "demo",
+            "demo",
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&output).unwrap();
+        assert_eq!(parsed["skills"]["disabled"][0], " keep ");
+        assert_eq!(parsed["skills"]["disabled"].as_sequence().unwrap().len(), 1);
     }
 
     #[test]

@@ -465,6 +465,7 @@ impl SkillAppState {
 pub enum SkillControlReason {
     MissingSource,
     InvalidSource,
+    RecoveryPending,
     NativeConflict,
     UnifiedConflict,
     ObservationFailed,
@@ -663,6 +664,9 @@ fn inspect_app(
         .expect("Skill runtime construction requires a contract");
     let selected = entry.selected_for(&runtime.app);
     let native = inspect_native_relation(entry, runtime, &source.path);
+    if native.is_recoverable() {
+        return state_unavailable(runtime, selected, SkillControlReason::RecoveryPending);
+    }
     if native.is_unreadable() {
         return state_unavailable(runtime, selected, SkillControlReason::ObservationFailed);
     }
@@ -823,6 +827,7 @@ fn inspect_source(path: &Path, budget: &mut SnapshotBudget) -> SourceObservation
 enum PathRelation {
     Missing,
     Selected,
+    Recoverable,
     External,
     Blocked,
     Unreadable,
@@ -835,6 +840,10 @@ impl PathRelation {
 
     fn is_external(self) -> bool {
         matches!(self, Self::External | Self::Blocked)
+    }
+
+    fn is_recoverable(self) -> bool {
+        self == Self::Recoverable
     }
 
     fn is_unreadable(self) -> bool {
@@ -878,6 +887,7 @@ fn inspect_native_relation(
             PathRelation::Missing
         }
         SkillReferenceObservation::ManagedPresent => PathRelation::Selected,
+        SkillReferenceObservation::RecoveryPending => PathRelation::Recoverable,
         SkillReferenceObservation::Unmanaged => PathRelation::External,
         SkillReferenceObservation::Conflict => PathRelation::Blocked,
         SkillReferenceObservation::Unreadable => PathRelation::Unreadable,
