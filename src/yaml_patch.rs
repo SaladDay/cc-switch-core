@@ -72,10 +72,20 @@ fn line_has_reference(line: &str) -> bool {
 }
 
 fn unquoted_yaml_code(line: &str) -> String {
+    scan_yaml_line(line).0
+}
+
+fn line_has_comment(line: &str) -> bool {
+    scan_yaml_line(line).1
+}
+
+fn scan_yaml_line(line: &str) -> (String, bool) {
     let mut output = String::with_capacity(line.len());
     let mut characters = line.chars().peekable();
     let mut quote = None;
     let mut escaped = false;
+    let mut previous = None;
+    let mut last_non_whitespace = None;
     while let Some(character) = characters.next() {
         if let Some(active_quote) = quote {
             output.push(' ');
@@ -89,40 +99,28 @@ fn unquoted_yaml_code(line: &str) -> String {
                     characters.next();
                 } else {
                     quote = None;
+                    last_non_whitespace = Some(character);
                 }
             }
-        } else if matches!(character, '\'' | '"') {
+        } else if matches!(character, '\'' | '"') && quoted_scalar_can_start(last_non_whitespace) {
             quote = Some(character);
             output.push(' ');
-        } else if character == '#' {
-            break;
+        } else if character == '#' && previous.is_none_or(char::is_whitespace) {
+            return (output, true);
         } else {
             output.push(character);
+            if !character.is_whitespace() {
+                last_non_whitespace = Some(character);
+            }
         }
+        previous = Some(character);
     }
-    output
+    (output, false)
 }
 
-fn line_has_comment(line: &str) -> bool {
-    let mut single_quoted = false;
-    let mut double_quoted = false;
-    let mut escaped = false;
-    for character in line.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if double_quoted && character == '\\' {
-            escaped = true;
-        } else if !double_quoted && character == '\'' {
-            single_quoted = !single_quoted;
-        } else if !single_quoted && character == '"' {
-            double_quoted = !double_quoted;
-        } else if !single_quoted && !double_quoted && character == '#' {
-            return true;
-        }
-    }
-    false
+fn quoted_scalar_can_start(last_non_whitespace: Option<char>) -> bool {
+    last_non_whitespace
+        .is_none_or(|character| matches!(character, ':' | '-' | '?' | '[' | '{' | ','))
 }
 
 fn uses_flow_root(raw: &str) -> bool {
@@ -177,6 +175,22 @@ mod tests {
         ));
         assert!(!top_level_section_has_references(
             "skills:\n  note: 'literal * value'\nother: &outside value\n",
+            "skills"
+        ));
+    }
+
+    #[test]
+    fn comments_after_plain_apostrophes_are_detected() {
+        assert!(top_level_section_has_comments(
+            "skills:\n  note: don't remove # keep\n  disabled: []\n",
+            "skills"
+        ));
+        assert!(!top_level_section_has_comments(
+            "skills:\n  note: 'literal # value'\n  url: https://example.com/#fragment\n",
+            "skills"
+        ));
+        assert!(top_level_section_has_comments(
+            "skills:\n  note: 'literal # value' # keep\n",
             "skills"
         ));
     }
