@@ -237,7 +237,13 @@ pub fn resolve_skill_effective_state(
         Some(SkillConfigState::ExternallyDisabled) => {
             constrained(None, SkillControlReason::ExternallyDisabled)
         }
-        Some(SkillConfigState::Required) => constrained(Some(true), SkillControlReason::Required),
+        Some(SkillConfigState::Required) if native_enabled == Some(false) => SkillEffectiveState {
+            enabled: Some(false),
+            reason: None,
+        },
+        Some(SkillConfigState::Required) => {
+            constrained(native_enabled, SkillControlReason::Required)
+        }
         Some(state @ (SkillConfigState::Enabled | SkillConfigState::Disabled)) => {
             let configured = state == SkillConfigState::Enabled;
             SkillEffectiveState {
@@ -838,6 +844,9 @@ fn ensure_json_skill_control_writable(
     let Some(contents) = contents.filter(|contents| !contents.is_empty()) else {
         return Ok(());
     };
+    if contents.len() > MAX_OPERATION_CONTENT_BYTES {
+        return Err(invalid_skill_config(target, "document is too large"));
+    }
     let original = std::str::from_utf8(contents)
         .map_err(|_| invalid_skill_config(target, "document is not UTF-8"))?;
     let has_comments =
@@ -1339,31 +1348,63 @@ fn ensure_distinct_roots(source: &Path, destination: &Path) -> Result<(), SkillC
 }
 
 fn resolve_candidate(path: &Path) -> Result<PathBuf, SkillConfigError> {
-    let mut ancestor = path;
-    let mut suffix = Vec::new();
-    loop {
+    let (resolved, suffix) = canonicalized_ancestor(path)?;
+    let normalized = append_normalized_suffix(resolved, &suffix, path)?;
+
+    // Normalizing a missing `segment/..` pair can reveal an existing symlink.
+    // Resolve once more so callers compare the final filesystem identity.
+    let (resolved, suffix) = canonicalized_ancestor(&normalized)?;
+    append_normalized_suffix(resolved, &suffix, path)
+}
+
+fn canonicalized_ancestor(path: &Path) -> Result<(PathBuf, PathBuf), SkillConfigError> {
+    let mut last_missing = None;
+    for ancestor in path.ancestors() {
         match fs::canonicalize(ancestor) {
-            Ok(mut resolved) => {
-                for component in suffix.iter().rev() {
-                    resolved.push(component);
-                }
-                return Ok(resolved);
+            Ok(resolved) => {
+                let suffix =
+                    path.strip_prefix(ancestor)
+                        .map_err(|_| SkillConfigError::RelativeRoot {
+                            path: path.to_owned(),
+                        })?;
+                return Ok((resolved, suffix.to_owned()));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let name = ancestor.file_name().ok_or_else(|| SkillConfigError::Io {
-                    path: path.to_owned(),
-                    source: error,
-                })?;
-                suffix.push(name.to_os_string());
-                ancestor = ancestor
-                    .parent()
-                    .ok_or_else(|| SkillConfigError::RelativeRoot {
-                        path: path.to_owned(),
-                    })?;
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                last_missing = Some((ancestor.to_owned(), source));
             }
             Err(source) => return Err(SkillConfigError::io(ancestor, source)),
         }
     }
+    let (ancestor, source) = last_missing.ok_or_else(|| SkillConfigError::RelativeRoot {
+        path: path.to_owned(),
+    })?;
+    Err(SkillConfigError::io(ancestor, source))
+}
+
+fn append_normalized_suffix(
+    mut resolved: PathBuf,
+    suffix: &Path,
+    original: &Path,
+) -> Result<PathBuf, SkillConfigError> {
+    for component in suffix.components() {
+        match component {
+            Component::Normal(name) => resolved.push(name),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return Err(SkillConfigError::RelativeRoot {
+                        path: original.to_owned(),
+                    });
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(SkillConfigError::RelativeRoot {
+                    path: original.to_owned(),
+                })
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn inspect_paths(
@@ -1467,6 +1508,7 @@ fn enable_deployment(
         .to_owned();
     crate::fs::create_dir_all_durable(&parent)
         .map_err(|source| SkillConfigError::io(&parent, source))?;
+    ensure_distinct_roots(&paths.source, &paths.destination)?;
 
     if !matches!(sync_method, SkillSyncMethod::Copy) {
         match create_link_deployment(&paths, directory) {
@@ -2441,14 +2483,25 @@ mod tests {
             .enabled(),
             Some(true)
         );
-        let required = resolve_skill_effective_state(
+        let missing_required = resolve_skill_effective_state(
             controlled,
             SkillDiscoveryState::Selected,
             Some(false),
             Some(SkillConfigState::Required),
         );
-        assert_eq!(required.enabled(), Some(true));
-        assert_eq!(required.reason(), Some(SkillControlReason::Required));
+        assert_eq!(missing_required.enabled(), Some(false));
+        assert_eq!(missing_required.reason(), None);
+        let present_required = resolve_skill_effective_state(
+            controlled,
+            SkillDiscoveryState::Selected,
+            Some(true),
+            Some(SkillConfigState::Required),
+        );
+        assert_eq!(present_required.enabled(), Some(true));
+        assert_eq!(
+            present_required.reason(),
+            Some(SkillControlReason::Required)
+        );
 
         let direct = SkillAppContract::host_managed().with_unified_store_discovery();
         assert_eq!(
@@ -2657,6 +2710,21 @@ mod tests {
                 false
             ),
             Err(SkillConfigError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn gemini_skill_control_rejects_oversized_documents_before_parsing() {
+        let oversized = vec![b' '; MAX_OPERATION_CONTENT_BYTES + 1];
+
+        assert!(matches!(
+            inspect_skill_config_state(
+                SkillConfigTarget::GeminiSettings,
+                Some(&oversized),
+                "docs"
+            ),
+            Err(SkillConfigError::InvalidConfig { message, .. })
+                if message == "document is too large"
         ));
     }
 
@@ -3416,6 +3484,43 @@ mod tests {
             inspect_skill_deployment(&source, &source.join("nested"), "docs"),
             Err(SkillConfigError::OverlappingRoots { .. })
         ));
+    }
+
+    #[test]
+    fn missing_parent_segments_cannot_hide_overlapping_roots() {
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let aliased = temporary.path().join("missing").join("..").join("source");
+
+        assert!(matches!(
+            ensure_distinct_roots(&source, &aliased),
+            Err(SkillConfigError::OverlappingRoots { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enable_rechecks_root_identity_after_the_destination_parent_appears() {
+        use std::os::unix::fs::symlink;
+
+        let (_temporary, source, destination) = roots();
+        let paths = deployment_paths(&source, &destination, "docs").unwrap();
+        symlink(&source, &destination).unwrap();
+
+        assert!(matches!(
+            enable_deployment(
+                paths,
+                "docs",
+                SkillSyncMethod::Copy,
+                SkillCopyPolicy::ManagedOnly
+            ),
+            Err(SkillConfigError::OverlappingRoots { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(source.join("docs/SKILL.md")).unwrap(),
+            "# Docs\n"
+        );
     }
 
     #[cfg(unix)]
