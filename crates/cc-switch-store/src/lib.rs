@@ -5,18 +5,64 @@
 //! can initialize the canonical `providers` table needed by native products.
 
 use std::{
+    fmt,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
 use thiserror::Error;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Canonical table shared by CC Switch products.
 pub const PROVIDERS_TABLE: &str = "providers";
+
+const SELECT_PROVIDER_COLUMNS: &str = "id, app_type, name, settings_config,
+    website_url, category, created_at, sort_index, notes, icon, icon_color,
+    meta, is_current, in_failover_queue";
+
+/// An unparsed row from the shared `providers` table.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderRow {
+    pub id: String,
+    pub app_type: String,
+    pub name: String,
+    pub settings_config: String,
+    pub website_url: Option<String>,
+    pub category: Option<String>,
+    pub created_at: Option<i64>,
+    pub sort_index: Option<i64>,
+    pub notes: Option<String>,
+    pub icon: Option<String>,
+    pub icon_color: Option<String>,
+    pub meta: String,
+    pub is_current: i64,
+    pub in_failover_queue: i64,
+}
+
+impl fmt::Debug for ProviderRow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderRow")
+            .field("id", &self.id)
+            .field("app_type", &self.app_type)
+            .field("name", &self.name)
+            .field("settings_config", &"<redacted>")
+            .field("website_url", &self.website_url)
+            .field("category", &self.category)
+            .field("created_at", &self.created_at)
+            .field("sort_index", &self.sort_index)
+            .field("notes", &self.notes)
+            .field("icon", &self.icon)
+            .field("icon_color", &self.icon_color)
+            .field("meta", &"<redacted>")
+            .field("is_current", &self.is_current)
+            .field("in_failover_queue", &self.in_failover_queue)
+            .finish()
+    }
+}
 
 const CREATE_PROVIDERS_TABLE: &str = "CREATE TABLE IF NOT EXISTS providers (
     id TEXT NOT NULL,
@@ -444,6 +490,59 @@ impl SharedDatabase {
     }
 }
 
+/// Reads shared provider rows in the ordering used by CC Switch products.
+pub fn read_provider_rows(
+    connection: &Connection,
+    app_type: Option<&str>,
+) -> Result<Vec<ProviderRow>, SharedStoreError> {
+    let sql = format!(
+        "SELECT {SELECT_PROVIDER_COLUMNS} FROM providers
+         WHERE (?1 IS NULL OR app_type = ?1)
+         ORDER BY COALESCE(sort_index, 999999), created_at ASC, id ASC, app_type ASC"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let providers = statement
+        .query_map([app_type], provider_from_row)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(SharedStoreError::from)?;
+    Ok(providers)
+}
+
+/// Reads one shared provider row by its composite identity.
+pub fn read_provider_row(
+    connection: &Connection,
+    id: &str,
+    app_type: &str,
+) -> Result<Option<ProviderRow>, SharedStoreError> {
+    let sql = format!(
+        "SELECT {SELECT_PROVIDER_COLUMNS} FROM providers
+         WHERE id = ?1 AND app_type = ?2"
+    );
+    connection
+        .query_row(&sql, [id, app_type], provider_from_row)
+        .optional()
+        .map_err(SharedStoreError::from)
+}
+
+fn provider_from_row(row: &Row<'_>) -> Result<ProviderRow, rusqlite::Error> {
+    Ok(ProviderRow {
+        id: row.get(0)?,
+        app_type: row.get(1)?,
+        name: row.get(2)?,
+        settings_config: row.get(3)?,
+        website_url: row.get(4)?,
+        category: row.get(5)?,
+        created_at: row.get(6)?,
+        sort_index: row.get(7)?,
+        notes: row.get(8)?,
+        icon: row.get(9)?,
+        icon_color: row.get(10)?,
+        meta: row.get(11)?,
+        is_current: row.get(12)?,
+        in_failover_queue: row.get(13)?,
+    })
+}
+
 fn resolve_database_path(path: PathBuf) -> Result<PathBuf, SharedStoreError> {
     let file_name = path.file_name().map(ToOwned::to_owned).ok_or_else(|| {
         SharedStoreError::InvalidDatabase("database path has no file name".to_owned())
@@ -653,6 +752,64 @@ mod tests {
                 .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
                 .expect("read busy_timeout pragma"),
             5_000
+        );
+    }
+
+    #[test]
+    fn provider_reads_are_raw_filtered_and_stably_ordered() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "INSERT INTO providers
+                    (id, app_type, name, settings_config, created_at, sort_index, meta,
+                     is_current, in_failover_queue)
+                 VALUES
+                    ('later', 'claude', 'Later', 'secret-settings', 1, 2,
+                     'secret-meta', 7, -2),
+                    ('first', 'claude', 'First', '{}', 2, 1, '{}', 0, 0),
+                    ('other', 'codex', 'Other', '{}', 0, 0, '{}', 0, 0),
+                    ('first', 'codex', 'Duplicate', '{}', 2, 1, '{}', 0, 0)",
+            )
+            .expect("insert provider fixtures");
+
+        let rows = read_provider_rows(&connection, Some("claude")).expect("read providers");
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["first", "later"]
+        );
+        assert_eq!(rows[1].settings_config, "secret-settings");
+        assert_eq!(rows[1].is_current, 7);
+        assert_eq!(rows[1].in_failover_queue, -2);
+        let debug = format!("{:?}", rows[1]);
+        assert!(!debug.contains("secret-settings"));
+        assert!(!debug.contains("secret-meta"));
+        assert_eq!(
+            read_provider_row(&connection, "first", "claude")
+                .expect("read provider")
+                .expect("provider exists"),
+            rows[0]
+        );
+        assert!(read_provider_row(&connection, "missing", "codex")
+            .expect("read missing provider")
+            .is_none());
+        assert_eq!(
+            read_provider_rows(&connection, None)
+                .expect("read all providers")
+                .iter()
+                .map(|row| (row.id.as_str(), row.app_type.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("other", "codex"),
+                ("first", "claude"),
+                ("first", "codex"),
+                ("later", "claude"),
+            ]
         );
     }
 
