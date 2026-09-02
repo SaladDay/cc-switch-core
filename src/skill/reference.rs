@@ -14,7 +14,7 @@ use crate::{fs::sync_directory, AppType};
 
 use super::read::{resolve_root, roots_overlap};
 
-const OWNER_VERSION: u8 = 5;
+const OWNER_VERSION: u8 = 6;
 const MAX_OWNER_BYTES: u64 = 4096;
 static OWNER_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -97,8 +97,8 @@ impl ReferencePaths {
             .parent()
             .expect("owner path has a parent")
             .join(format!(
-                "{}.retired-anchor-{:016x}-{:016x}",
-                self.stem, identity.volume, identity.file
+                "{}.retired-anchor-{:016x}-{:016x}-{:016x}",
+                self.stem, identity.volume, identity.file, identity.generation
             ))
     }
 }
@@ -108,6 +108,7 @@ impl ReferencePaths {
 struct ObjectIdentity {
     volume: u64,
     file: u64,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,10 +437,23 @@ fn prepare_paths(plan: &SkillReferencePlan) -> Result<ReferencePaths, SkillRefer
     require_real_directory(&plan.destination_root)?;
     require_private_state_directory(&plan.state_root)?;
     require_same_filesystem(&plan.destination_root, &plan.state_root)?;
+    require_stable_identity(&plan.state_root)?;
     validate_root_pair(&plan.source_root, &plan.destination_root)?;
     validate_root_pair(&plan.source_root, &plan.state_root)?;
     validate_root_pair(&plan.destination_root, &plan.state_root)?;
     Ok(paths)
+}
+
+#[cfg(unix)]
+fn require_stable_identity(path: &Path) -> Result<(), SkillReferenceError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| SkillReferenceError::io(path, source))?;
+    object_generation(path, &metadata).map(|_| ())
+}
+
+#[cfg(not(unix))]
+fn require_stable_identity(_path: &Path) -> Result<(), SkillReferenceError> {
+    Ok(())
 }
 
 fn build_paths(plan: &SkillReferencePlan) -> Result<ReferencePaths, SkillReferenceError> {
@@ -1290,7 +1304,7 @@ fn inspect_reference(path: &Path) -> Result<ReferenceEntry, SkillReferenceError>
 
 #[cfg(unix)]
 fn object_identity(
-    _path: &Path,
+    path: &Path,
     metadata: &fs::Metadata,
 ) -> Result<ObjectIdentity, SkillReferenceError> {
     use std::os::unix::fs::MetadataExt;
@@ -1298,7 +1312,44 @@ fn object_identity(
     Ok(ObjectIdentity {
         volume: metadata.dev(),
         file: metadata.ino(),
+        generation: object_generation(path, metadata)?,
     })
+}
+
+#[cfg(unix)]
+fn object_generation(path: &Path, metadata: &fs::Metadata) -> Result<u64, SkillReferenceError> {
+    creation_generation(path, metadata.created())
+}
+
+#[cfg(unix)]
+fn creation_generation(
+    path: &Path,
+    created: std::io::Result<SystemTime>,
+) -> Result<u64, SkillReferenceError> {
+    let created = match created {
+        Ok(created) => created,
+        Err(source) if source.kind() == std::io::ErrorKind::Unsupported => {
+            return Err(SkillReferenceError::UnsupportedFilesystem {
+                path: path.to_owned(),
+            })
+        }
+        Err(source) => return Err(SkillReferenceError::io(path, source)),
+    };
+    let (side, duration) = match created.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (1_u8, duration),
+        Err(error) => (0_u8, error.duration()),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"cc-switch-object-generation\0");
+    hasher.update([side]);
+    hasher.update(duration.as_secs().to_le_bytes());
+    hasher.update(duration.subsec_nanos().to_le_bytes());
+    let digest = hasher.finalize();
+    Ok(u64::from_le_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 prefix has eight bytes"),
+    ))
 }
 
 #[cfg(windows)]
@@ -1356,6 +1407,8 @@ fn object_identity(
     Ok(ObjectIdentity {
         volume: u64::from(information.dwVolumeSerialNumber),
         file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        generation: (u64::from(information.ftCreationTime.dwHighDateTime) << 32)
+            | u64::from(information.ftCreationTime.dwLowDateTime),
     })
 }
 
@@ -1406,7 +1459,7 @@ fn owner_stem(
     destination_fingerprint: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"cc-switch-skill-reference-v5\0");
+    hasher.update(b"cc-switch-skill-reference-v6\0");
     hasher.update(app.as_str().as_bytes());
     hasher.update(b"\0");
     hasher.update(skill_id.as_bytes());
@@ -1833,6 +1886,8 @@ pub enum SkillReferenceError {
     OwnerWrite { path: PathBuf, message: String },
     #[error("Skill references are unsupported on this platform: {path:?}")]
     UnsupportedPlatform { path: PathBuf },
+    #[error("Skill references require filesystem creation-time identity: {path:?}")]
+    UnsupportedFilesystem { path: PathBuf },
     #[error("Skill reference I/O failed at {path:?}: {source}")]
     Io {
         path: PathBuf,
@@ -1855,6 +1910,22 @@ impl SkillReferenceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_creation_time_is_rejected_explicitly() {
+        let path = Path::new("/state");
+        let error = creation_generation(
+            path,
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SkillReferenceError::UnsupportedFilesystem { path: actual } if actual == path
+        ));
+    }
 
     fn roots() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let temporary = tempfile::tempdir().unwrap();
@@ -2000,7 +2071,7 @@ mod tests {
         ));
         assert!(matches!(
             inspect_reference(&destination).unwrap(),
-            ReferenceEntry::Other
+            ReferenceEntry::Incomplete | ReferenceEntry::Other
         ));
     }
 

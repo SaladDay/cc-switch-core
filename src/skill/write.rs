@@ -748,6 +748,13 @@ mod tests {
         fs::write(root.join("demo/SKILL.md"), "# Demo\n").unwrap();
     }
 
+    fn delete_native_reference_for_test(path: &Path) {
+        #[cfg(windows)]
+        fs::remove_dir(path).unwrap();
+        #[cfg(not(windows))]
+        fs::remove_file(path).unwrap();
+    }
+
     fn runtime(
         source: &Path,
         unified: &Path,
@@ -1110,7 +1117,7 @@ mod tests {
             false,
         )
         .unwrap();
-        fs::remove_file(native.join("demo")).unwrap();
+        delete_native_reference_for_test(&native.join("demo"));
         fs::create_dir_all(native.join("demo")).unwrap();
         fs::write(native.join("demo/SKILL.md"), "external").unwrap();
 
