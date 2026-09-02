@@ -12,7 +12,8 @@ use std::{
 };
 
 use rusqlite::{
-    types::ValueRef, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior,
+    params, types::ValueRef, Connection, OpenFlags, OptionalExtension, Params, Row, Transaction,
+    TransactionBehavior,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -55,6 +56,62 @@ impl ProviderRow {
     }
 }
 
+/// Raw values for inserting one row into the shared `providers` table.
+pub struct ProviderInsert<'a> {
+    pub id: &'a str,
+    pub app_type: &'a str,
+    pub name: &'a str,
+    pub settings_config: &'a str,
+    pub website_url: Option<&'a str>,
+    pub category: Option<&'a str>,
+    pub created_at: Option<i64>,
+    pub sort_index: Option<i64>,
+    pub notes: Option<&'a str>,
+    pub icon: Option<&'a str>,
+    pub icon_color: Option<&'a str>,
+    pub meta: &'a str,
+    pub is_current: i64,
+    pub in_failover_queue: i64,
+}
+
+impl fmt::Debug for ProviderInsert<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderInsert")
+            .field("id", &self.id)
+            .field("app_type", &self.app_type)
+            .field("name", &self.name)
+            .field("settings_config", &"<redacted>")
+            .field("website_url", &self.website_url)
+            .field("category", &self.category)
+            .field("created_at", &self.created_at)
+            .field("sort_index", &self.sort_index)
+            .field("notes", &self.notes)
+            .field("icon", &self.icon)
+            .field("icon_color", &self.icon_color)
+            .field("meta", &"<redacted>")
+            .field("is_current", &self.is_current)
+            .field("in_failover_queue", &self.in_failover_queue)
+            .finish()
+    }
+}
+
+/// Result of one provider-row write.
+///
+/// `NotApplied` covers both a missing row and a host trigger that deliberately
+/// suppresses the write. Hosts decide how to interpret it inside their own
+/// transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ProviderWriteOutcome {
+    /// SQLite reported one directly affected row. Host triggers may still
+    /// change the final row state, which remains host-owned.
+    Applied,
+    /// SQLite reported no directly affected row, including a missing identity
+    /// or a host trigger that deliberately suppressed the statement.
+    NotApplied,
+}
+
 impl fmt::Debug for ProviderRow {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -77,7 +134,7 @@ impl fmt::Debug for ProviderRow {
     }
 }
 
-const CREATE_PROVIDERS_TABLE: &str = "CREATE TABLE IF NOT EXISTS providers (
+const CREATE_PROVIDERS_TABLE: &str = "CREATE TABLE IF NOT EXISTS main.providers (
     id TEXT NOT NULL,
     app_type TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -197,6 +254,13 @@ pub enum SharedStoreError {
     },
     #[error("shared database failed: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("shared provider write failed")]
+    ProviderWrite {
+        code: Option<rusqlite::ErrorCode>,
+        extended_code: Option<i32>,
+        /// SQLite ended the host transaction while executing the write.
+        transaction_aborted: bool,
+    },
     #[error("shared database is invalid: {0}")]
     InvalidDatabase(String),
 }
@@ -259,7 +323,7 @@ impl SharedDatabase {
                 .any(|column| column.name == expected.name)
             {
                 transaction.execute_batch(&format!(
-                    "ALTER TABLE providers ADD COLUMN {} {}",
+                    "ALTER TABLE main.providers ADD COLUMN {} {}",
                     expected.name, expected.declaration
                 ))?;
             }
@@ -503,14 +567,198 @@ impl SharedDatabase {
     }
 }
 
+/// Starts the immediate transaction used for coordinated provider writes.
+///
+/// Hosts retain ownership of the transaction and may combine these shared row
+/// operations with product-specific tables or external rollback handling. A
+/// nested savepoint rolls back statement effects that SQLite might otherwise
+/// retain when a provider write reports an error. After any provider write
+/// error, the host must stop using and drop the transaction; `transaction_aborted`
+/// reports when SQLite has already ended it.
+pub fn begin_immediate_transaction(
+    connection: &mut Connection,
+) -> Result<Transaction<'_>, SharedStoreError> {
+    connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(SharedStoreError::from)
+}
+
+/// Inserts one raw provider row without parsing host-owned JSON fields.
+pub fn insert_provider(
+    transaction: &mut Transaction<'_>,
+    provider: &ProviderInsert<'_>,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    execute_provider_write(
+        transaction,
+        "INSERT INTO main.providers (
+            id, app_type, name, settings_config, website_url, category,
+            created_at, sort_index, notes, icon, icon_color, meta,
+            is_current, in_failover_queue
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+         )",
+        params![
+            provider.id,
+            provider.app_type,
+            provider.name,
+            provider.settings_config,
+            provider.website_url,
+            provider.category,
+            provider.created_at,
+            provider.sort_index,
+            provider.notes,
+            provider.icon,
+            provider.icon_color,
+            provider.meta,
+            provider.is_current,
+            provider.in_failover_queue,
+        ],
+    )
+}
+
+/// Updates the user-visible name and raw settings of one provider.
+pub fn update_provider_configuration(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    name: &str,
+    settings_config: &str,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    execute_provider_write(
+        transaction,
+        "UPDATE main.providers SET name = ?1, settings_config = ?2
+         WHERE id COLLATE BINARY = ?3 AND app_type COLLATE BINARY = ?4",
+        params![name, settings_config, id, app_type],
+    )
+}
+
+/// Updates the raw metadata JSON of one provider.
+pub fn update_provider_metadata(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    meta: &str,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    execute_provider_write(
+        transaction,
+        "UPDATE main.providers SET meta = ?1
+         WHERE id COLLATE BINARY = ?2 AND app_type COLLATE BINARY = ?3",
+        params![meta, id, app_type],
+    )
+}
+
+/// Changes the current flag on one provider.
+pub fn set_provider_current(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    is_current: bool,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    execute_provider_write(
+        transaction,
+        "UPDATE main.providers SET is_current = ?1
+         WHERE id COLLATE BINARY = ?2 AND app_type COLLATE BINARY = ?3",
+        params![is_current, id, app_type],
+    )
+}
+
+/// Deletes one provider by its composite identity.
+pub fn delete_provider(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    execute_provider_write(
+        transaction,
+        "DELETE FROM main.providers
+         WHERE id COLLATE BINARY = ?1 AND app_type COLLATE BINARY = ?2",
+        params![id, app_type],
+    )
+}
+
+fn execute_provider_write<P: Params>(
+    transaction: &mut Transaction<'_>,
+    sql: &str,
+    params: P,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    if transaction.is_autocommit() {
+        return Err(SharedStoreError::ProviderWrite {
+            code: None,
+            extended_code: None,
+            transaction_aborted: true,
+        });
+    }
+    verify_provider_write_schema(transaction)?;
+    let transaction_aborted = transaction.is_autocommit();
+    let savepoint = transaction
+        .savepoint()
+        .map_err(|error| redact_provider_write_error(error, transaction_aborted))?;
+    let result = (|| {
+        let mut statement = savepoint.prepare(sql)?;
+        let mut rows = statement.query(params)?;
+        while rows.next()?.is_some() {}
+        Ok(savepoint.changes() as usize)
+    })();
+    let changed = match result {
+        Ok(changed) => changed,
+        Err(error) => {
+            let _ = savepoint.finish();
+            return Err(redact_provider_write_error(
+                error,
+                transaction.is_autocommit(),
+            ));
+        }
+    };
+    let outcome = match changed {
+        0 => ProviderWriteOutcome::NotApplied,
+        1 => ProviderWriteOutcome::Applied,
+        _ => {
+            savepoint
+                .finish()
+                .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
+            return Err(SharedStoreError::InvalidDatabase(
+                "provider write affected multiple rows".to_owned(),
+            ));
+        }
+    };
+    savepoint
+        .commit()
+        .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
+    Ok(outcome)
+}
+
+fn redact_provider_write_error(
+    error: rusqlite::Error,
+    transaction_aborted: bool,
+) -> SharedStoreError {
+    let extended_code = match &error {
+        rusqlite::Error::SqliteFailure(error, _) => Some(error.extended_code),
+        _ => None,
+    };
+    SharedStoreError::ProviderWrite {
+        code: error.sqlite_error_code(),
+        extended_code,
+        transaction_aborted,
+    }
+}
+
+fn verify_provider_write_schema(transaction: &Transaction<'_>) -> Result<(), SharedStoreError> {
+    verify_provider_schema(transaction).map_err(|error| match error {
+        SharedStoreError::Database(error) => {
+            redact_provider_write_error(error, transaction.is_autocommit())
+        }
+        error => error,
+    })
+}
+
 /// Reads shared provider rows in the ordering used by CC Switch products.
 pub fn read_provider_rows(
     connection: &Connection,
     app_type: Option<&str>,
 ) -> Result<Vec<ProviderRow>, SharedStoreError> {
     let sql = format!(
-        "SELECT {SELECT_PROVIDER_FIELDS}, providers.* FROM providers
-         WHERE (?1 IS NULL OR app_type = ?1)
+        "SELECT {SELECT_PROVIDER_FIELDS}, providers.* FROM main.providers AS providers
+         WHERE (?1 IS NULL OR app_type COLLATE BINARY = ?1)
          ORDER BY COALESCE(sort_index, 999999), created_at ASC, id ASC, app_type ASC"
     );
     let mut statement = connection.prepare(&sql)?;
@@ -528,8 +776,8 @@ pub fn read_provider_row(
     app_type: &str,
 ) -> Result<Option<ProviderRow>, SharedStoreError> {
     let sql = format!(
-        "SELECT {SELECT_PROVIDER_FIELDS}, providers.* FROM providers
-         WHERE id = ?1 AND app_type = ?2"
+        "SELECT {SELECT_PROVIDER_FIELDS}, providers.* FROM main.providers AS providers
+         WHERE id COLLATE BINARY = ?1 AND app_type COLLATE BINARY = ?2"
     );
     connection
         .query_row(&sql, [id, app_type], provider_from_row)
@@ -612,7 +860,7 @@ fn resolve_database_path(path: PathBuf) -> Result<PathBuf, SharedStoreError> {
 fn provider_columns(connection: &Connection) -> Result<Vec<ExistingColumn>, SharedStoreError> {
     let object_type = connection
         .query_row(
-            "SELECT type FROM sqlite_schema WHERE name = 'providers'",
+            "SELECT type FROM main.sqlite_schema WHERE name = 'providers'",
             [],
             |row| row.get::<_, String>(0),
         )
@@ -623,7 +871,7 @@ fn provider_columns(connection: &Connection) -> Result<Vec<ExistingColumn>, Shar
         ));
     }
 
-    let mut statement = connection.prepare("PRAGMA table_xinfo(providers)")?;
+    let mut statement = connection.prepare("PRAGMA main.table_xinfo(providers)")?;
     let columns = statement
         .query_map([], |row| {
             Ok(ExistingColumn {
@@ -704,7 +952,8 @@ fn verify_provider_schema(connection: &Connection) -> Result<(), SharedStoreErro
 fn verify_provider_primary_key_index(connection: &Connection) -> Result<(), SharedStoreError> {
     let primary_key_index = connection
         .query_row(
-            "SELECT name FROM pragma_index_list('providers') WHERE origin = 'pk' AND partial = 0",
+            "SELECT name FROM pragma_index_list('providers', 'main')
+             WHERE origin = 'pk' AND partial = 0",
             [],
             |row| row.get::<_, String>(0),
         )
@@ -715,7 +964,7 @@ fn verify_provider_primary_key_index(connection: &Connection) -> Result<(), Shar
             )
         })?;
     let mut statement = connection.prepare(
-        "SELECT name, \"desc\", coll FROM pragma_index_xinfo(?1)
+        "SELECT name, \"desc\", coll FROM pragma_index_xinfo(?1, 'main')
          WHERE key = 1 ORDER BY seqno",
     )?;
     let indexed_columns = statement
@@ -744,6 +993,29 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    fn provider_insert<'a>(
+        id: &'a str,
+        settings_config: &'a str,
+        meta: &'a str,
+    ) -> ProviderInsert<'a> {
+        ProviderInsert {
+            id,
+            app_type: "claude",
+            name: "Provider",
+            settings_config,
+            website_url: None,
+            category: None,
+            created_at: Some(1),
+            sort_index: Some(0),
+            notes: None,
+            icon: None,
+            icon_color: None,
+            meta,
+            is_current: 0,
+            in_failover_queue: 0,
+        }
+    }
 
     #[test]
     fn new_database_has_the_canonical_provider_contract() {
@@ -918,6 +1190,633 @@ mod tests {
                 )
                 .expect("restore sensitive value");
         }
+    }
+
+    #[test]
+    fn provider_write_primitives_preserve_host_extensions() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "ALTER TABLE main.providers
+                 ADD COLUMN future_column TEXT NOT NULL DEFAULT 'keep';
+                 CREATE TEMP TABLE providers AS
+                 SELECT * FROM main.providers WHERE 0;",
+            )
+            .expect("add host extension and temporary shadow");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        let mut provider = provider_insert("provider", "secret-settings", "secret-meta");
+        provider.name = "Original";
+        provider.website_url = Some("https://example.com");
+        provider.category = Some("custom");
+        provider.sort_index = Some(2);
+        provider.notes = Some("note");
+        provider.icon = Some("icon");
+        provider.icon_color = Some("#fff");
+        provider.in_failover_queue = 1;
+        let debug = format!("{provider:?}");
+        assert!(!debug.contains("secret-settings"));
+        assert!(!debug.contains("secret-meta"));
+        assert_eq!(
+            insert_provider(&mut transaction, &provider).expect("insert provider"),
+            ProviderWriteOutcome::Applied
+        );
+        assert_eq!(
+            update_provider_configuration(&mut transaction, "provider", "claude", "Updated", "{}",)
+                .expect("update provider configuration"),
+            ProviderWriteOutcome::Applied
+        );
+        assert_eq!(
+            update_provider_metadata(&mut transaction, "provider", "claude", "{}")
+                .expect("update provider metadata"),
+            ProviderWriteOutcome::Applied
+        );
+        assert_eq!(
+            set_provider_current(&mut transaction, "provider", "claude", true)
+                .expect("set current provider"),
+            ProviderWriteOutcome::Applied
+        );
+        assert_eq!(
+            set_provider_current(&mut transaction, "provider", "claude", false)
+                .expect("clear current provider"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit provider writes");
+
+        let row = read_provider_row(&connection, "provider", "claude")
+            .expect("read provider")
+            .expect("provider exists");
+        assert_eq!(row.name, "Updated");
+        assert_eq!(row.settings_config, "{}");
+        assert_eq!(row.meta, "{}");
+        assert_eq!(row.is_current, 0);
+        assert_eq!(row.in_failover_queue, 1);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT future_column FROM main.providers
+                     WHERE id = 'provider' AND app_type = 'claude'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read host extension"),
+            "keep"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM temp.providers", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("read temporary shadow"),
+            0
+        );
+
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            update_provider_configuration(&mut transaction, "missing", "claude", "Missing", "{}",)
+                .expect("update missing configuration"),
+            ProviderWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            update_provider_metadata(&mut transaction, "missing", "claude", "{}")
+                .expect("update missing metadata"),
+            ProviderWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            set_provider_current(&mut transaction, "missing", "claude", true)
+                .expect("set missing current provider"),
+            ProviderWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            delete_provider(&mut transaction, "provider", "claude").expect("delete provider"),
+            ProviderWriteOutcome::Applied
+        );
+        assert_eq!(
+            delete_provider(&mut transaction, "provider", "claude")
+                .expect("delete missing provider"),
+            ProviderWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit provider deletes");
+    }
+
+    #[test]
+    fn provider_writes_report_host_trigger_suppression() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut connection = database.connect().expect("connect shared database");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            insert_provider(
+                &mut transaction,
+                &provider_insert("provider", "original", "original")
+            )
+            .expect("insert provider fixture"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit provider fixture");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER ignore_insert BEFORE INSERT ON providers
+                 BEGIN SELECT RAISE(IGNORE); END;
+                 CREATE TRIGGER ignore_config BEFORE UPDATE OF name, settings_config ON providers
+                 BEGIN SELECT RAISE(IGNORE); END;
+                 CREATE TRIGGER ignore_meta BEFORE UPDATE OF meta ON providers
+                 BEGIN SELECT RAISE(IGNORE); END;
+                 CREATE TRIGGER ignore_current BEFORE UPDATE OF is_current ON providers
+                 BEGIN SELECT RAISE(IGNORE); END;
+                 CREATE TRIGGER ignore_delete BEFORE DELETE ON providers
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .expect("create suppressing host triggers");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+
+        assert_eq!(
+            insert_provider(&mut transaction, &provider_insert("ignored", "{}", "{}"))
+                .expect("suppress insert"),
+            ProviderWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            update_provider_configuration(
+                &mut transaction,
+                "provider",
+                "claude",
+                "Updated",
+                "new",
+            )
+            .expect("suppress configuration update"),
+            ProviderWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            update_provider_metadata(&mut transaction, "provider", "claude", "new")
+                .expect("suppress metadata update"),
+            ProviderWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            set_provider_current(&mut transaction, "provider", "claude", true)
+                .expect("suppress current update"),
+            ProviderWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            delete_provider(&mut transaction, "provider", "claude").expect("suppress delete"),
+            ProviderWriteOutcome::NotApplied
+        );
+
+        assert!(read_provider_row(&transaction, "ignored", "claude")
+            .expect("read ignored provider")
+            .is_none());
+        let unchanged = read_provider_row(&transaction, "provider", "claude")
+            .expect("read provider")
+            .expect("provider remains");
+        assert_eq!(unchanged.name, "Provider");
+        assert_eq!(unchanged.settings_config, "original");
+        assert_eq!(unchanged.meta, "original");
+        assert_eq!(unchanged.is_current, 0);
+        transaction.commit().expect("commit suppressed writes");
+    }
+
+    #[test]
+    fn provider_write_errors_do_not_expose_trigger_messages() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut connection = database.connect().expect("connect shared database");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            insert_provider(&mut transaction, &provider_insert("provider", "{}", "{}"))
+                .expect("insert provider fixture"),
+            ProviderWriteOutcome::Applied
+        );
+        let duplicate = insert_provider(&mut transaction, &provider_insert("provider", "{}", "{}"))
+            .expect_err("duplicate provider must fail");
+        assert!(matches!(
+            &duplicate,
+            SharedStoreError::ProviderWrite {
+                code: Some(rusqlite::ErrorCode::ConstraintViolation),
+                extended_code: Some(rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY),
+                transaction_aborted: false,
+            }
+        ));
+        transaction.commit().expect("commit provider fixture");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_sensitive_insert BEFORE INSERT ON providers
+                 BEGIN SELECT RAISE(ABORT, 'secret-settings'); END;
+                 CREATE TRIGGER reject_sensitive_config
+                 BEFORE UPDATE OF settings_config ON providers
+                 BEGIN SELECT RAISE(ABORT, 'secret-settings'); END;
+                 CREATE TRIGGER reject_sensitive_meta BEFORE UPDATE OF meta ON providers
+                 BEGIN SELECT RAISE(ABORT, 'secret-meta'); END;
+                 CREATE TRIGGER reject_sensitive_current
+                 BEFORE UPDATE OF is_current ON providers
+                 BEGIN SELECT RAISE(ABORT, 'secret-meta'); END;
+                 CREATE TRIGGER reject_sensitive_delete BEFORE DELETE ON providers
+                 BEGIN SELECT RAISE(ABORT, 'secret-meta'); END;",
+            )
+            .expect("create rejecting host triggers");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+
+        let errors = [
+            insert_provider(
+                &mut transaction,
+                &provider_insert("blocked", "secret-settings", "secret-meta"),
+            )
+            .expect_err("insert must be rejected"),
+            update_provider_configuration(
+                &mut transaction,
+                "provider",
+                "claude",
+                "Provider",
+                "secret-settings",
+            )
+            .expect_err("configuration update must be rejected"),
+            update_provider_metadata(&mut transaction, "provider", "claude", "secret-meta")
+                .expect_err("metadata update must be rejected"),
+            set_provider_current(&mut transaction, "provider", "claude", true)
+                .expect_err("current update must be rejected"),
+            delete_provider(&mut transaction, "provider", "claude")
+                .expect_err("delete must be rejected"),
+        ];
+        for error in errors {
+            assert!(matches!(
+                &error,
+                SharedStoreError::ProviderWrite {
+                    code: Some(rusqlite::ErrorCode::ConstraintViolation),
+                    extended_code: Some(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+                    transaction_aborted: false,
+                }
+            ));
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            assert!(!display.contains("secret-"));
+            assert!(!debug.contains("secret-"));
+        }
+        assert!(!duplicate.to_string().contains("secret-"));
+        assert!(!format!("{duplicate:?}").contains("secret-"));
+        transaction.rollback().expect("roll back rejected writes");
+    }
+
+    #[test]
+    fn provider_write_schema_errors_are_redacted() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "PRAGMA writable_schema = ON;
+                 INSERT INTO main.sqlite_schema(type, name, tbl_name, rootpage, sql)
+                 VALUES (
+                    'trigger', 'secret-settings', 'providers', 0,
+                    'CREATE TRIGGER secret-settings broken'
+                 );
+                 PRAGMA writable_schema = OFF;",
+            )
+            .expect("install malformed schema fixture");
+        let schema_version: i64 = connection
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .expect("read schema version");
+        connection
+            .pragma_update(None, "schema_version", schema_version + 1)
+            .expect("reload malformed schema");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+
+        let error = insert_provider(&mut transaction, &provider_insert("provider", "{}", "{}"))
+            .expect_err("malformed schema must reject provider write");
+        assert!(matches!(
+            &error,
+            SharedStoreError::ProviderWrite {
+                code: Some(_),
+                transaction_aborted: false,
+                ..
+            }
+        ));
+        assert!(!error.to_string().contains("secret-settings"));
+        assert!(!format!("{error:?}").contains("secret-settings"));
+        transaction
+            .rollback()
+            .expect("roll back provider transaction");
+    }
+
+    #[test]
+    fn provider_writes_are_atomic_with_fail_triggers_and_count_changes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut connection = database.connect().expect("connect shared database");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            insert_provider(&mut transaction, &provider_insert("provider", "old", "{}"))
+                .expect("insert provider fixture"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit provider fixture");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_after_insert AFTER INSERT ON providers
+                 BEGIN SELECT RAISE(FAIL, 'secret-after-insert'); END;
+                 CREATE TRIGGER reject_after_delete AFTER DELETE ON providers
+                 BEGIN SELECT RAISE(FAIL, 'secret-after-delete'); END;",
+            )
+            .expect("create fail triggers");
+
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        let errors = [
+            insert_provider(&mut transaction, &provider_insert("failed", "{}", "{}"))
+                .expect_err("after-insert trigger must fail"),
+            delete_provider(&mut transaction, "provider", "claude")
+                .expect_err("after-delete trigger must fail"),
+        ];
+        for error in errors {
+            assert!(!error.to_string().contains("secret-"));
+            assert!(!format!("{error:?}").contains("secret-"));
+        }
+        assert!(read_provider_row(&transaction, "failed", "claude")
+            .expect("read failed insert")
+            .is_none());
+        assert!(read_provider_row(&transaction, "provider", "claude")
+            .expect("read failed delete")
+            .is_some());
+        transaction.commit().expect("commit outer transaction");
+
+        connection
+            .execute_batch(
+                "DROP TRIGGER reject_after_insert;
+                 DROP TRIGGER reject_after_delete;
+                 PRAGMA count_changes = ON;",
+            )
+            .expect("enable changed-row results");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            update_provider_configuration(
+                &mut transaction,
+                "provider",
+                "claude",
+                "Updated",
+                "new",
+            )
+            .expect("update with count_changes enabled"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit provider update");
+        assert_eq!(
+            read_provider_row(&connection, "provider", "claude")
+                .expect("read updated provider")
+                .expect("provider exists")
+                .settings_config,
+            "new"
+        );
+
+        connection
+            .execute_batch(
+                "PRAGMA count_changes = OFF;
+                 CREATE TABLE host_state (value TEXT NOT NULL);
+                 CREATE TRIGGER rollback_after_delete AFTER DELETE ON providers
+                 BEGIN SELECT RAISE(ROLLBACK, 'secret-rollback'); END;",
+            )
+            .expect("create rollback trigger");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        transaction
+            .execute("INSERT INTO host_state VALUES ('pending')", [])
+            .expect("write host state");
+        let error = delete_provider(&mut transaction, "provider", "claude")
+            .expect_err("rollback trigger must abort the transaction");
+        assert!(matches!(
+            &error,
+            SharedStoreError::ProviderWrite {
+                code: Some(rusqlite::ErrorCode::ConstraintViolation),
+                extended_code: Some(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+                transaction_aborted: true,
+            }
+        ));
+        assert!(!error.to_string().contains("secret-"));
+        assert!(!format!("{error:?}").contains("secret-"));
+        assert!(transaction.is_autocommit());
+        assert!(matches!(
+            insert_provider(
+                &mut transaction,
+                &provider_insert("must-not-commit", "{}", "{}"),
+            )
+            .expect_err("inactive transaction must reject another write"),
+            SharedStoreError::ProviderWrite {
+                transaction_aborted: true,
+                ..
+            }
+        ));
+        drop(transaction);
+        assert!(read_provider_row(&connection, "provider", "claude")
+            .expect("read rolled-back provider")
+            .is_some());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM host_state", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("read rolled-back host state"),
+            0
+        );
+        assert!(read_provider_row(&connection, "must-not-commit", "claude")
+            .expect("read rejected provider")
+            .is_none());
+    }
+
+    #[test]
+    fn provider_writes_reject_a_noncanonical_identity_before_changes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut connection = database.connect().expect("connect shared database");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            insert_provider(&mut transaction, &provider_insert("duplicate", "{}", "{}"))
+                .expect("insert provider fixture"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit provider fixture");
+        connection
+            .execute_batch(
+                "ALTER TABLE providers RENAME TO canonical_providers;
+                 CREATE TABLE providers AS SELECT * FROM canonical_providers;
+                 INSERT INTO providers SELECT * FROM canonical_providers;",
+            )
+            .expect("replace provider schema without its identity constraint");
+
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert!(matches!(
+            delete_provider(&mut transaction, "duplicate", "claude")
+                .expect_err("noncanonical provider identity must fail"),
+            SharedStoreError::InvalidDatabase(_)
+        ));
+        transaction
+            .rollback()
+            .expect("roll back provider transaction");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM providers", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count unchanged providers"),
+            2
+        );
+    }
+
+    #[test]
+    fn provider_writes_use_binary_identity_matching() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cc-switch.db");
+        Connection::open(&path)
+            .expect("create fixture database")
+            .execute_batch(
+                "CREATE TABLE providers (
+                    id TEXT COLLATE NOCASE NOT NULL,
+                    app_type TEXT COLLATE NOCASE NOT NULL,
+                    name TEXT NOT NULL,
+                    settings_config TEXT NOT NULL,
+                    website_url TEXT,
+                    category TEXT,
+                    created_at INTEGER,
+                    sort_index INTEGER,
+                    notes TEXT,
+                    icon TEXT,
+                    icon_color TEXT,
+                    meta TEXT NOT NULL DEFAULT '{}',
+                    is_current BOOLEAN NOT NULL DEFAULT 0,
+                    in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
+                    PRIMARY KEY (id COLLATE BINARY, app_type COLLATE BINARY)
+                 );
+                 INSERT INTO providers (id, app_type, name, settings_config)
+                 VALUES ('Foo', 'claude', 'Upper', 'upper');",
+            )
+            .expect("create case-insensitive-column fixture");
+        let database = SharedDatabase::open(&path).expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("accept binary provider identity");
+        let mut connection = database.connect().expect("connect shared database");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            update_provider_metadata(&mut transaction, "foo", "claude", "wrong")
+                .expect("try wrong-case identity"),
+            ProviderWriteOutcome::NotApplied
+        );
+        transaction
+            .execute(
+                "INSERT INTO providers (id, app_type, name, settings_config)
+                 VALUES ('foo', 'claude', 'Lower', 'lower')",
+                [],
+            )
+            .expect("insert second binary identity");
+        assert_eq!(
+            set_provider_current(&mut transaction, "FOO", "claude", true)
+                .expect("try ambiguous wrong-case identity"),
+            ProviderWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            delete_provider(&mut transaction, "FOO", "claude")
+                .expect("try deleting ambiguous wrong-case identity"),
+            ProviderWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            update_provider_configuration(&mut transaction, "Foo", "claude", "Updated", "updated",)
+                .expect("update exact identity"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit provider writes");
+        let rows = read_provider_rows(&connection, Some("claude")).expect("read providers");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT settings_config FROM providers
+                     WHERE id COLLATE BINARY = 'Foo'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read upper-case provider"),
+            "updated"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT settings_config FROM providers
+                     WHERE id COLLATE BINARY = 'foo'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read lower-case provider"),
+            "lower"
+        );
+    }
+
+    #[test]
+    fn immediate_transactions_exclude_other_writers_and_can_roll_back() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut first = database.connect().expect("connect first writer");
+        let second = database.connect().expect("connect second writer");
+        second
+            .busy_timeout(Duration::ZERO)
+            .expect("disable second writer wait");
+        let transaction =
+            begin_immediate_transaction(&mut first).expect("begin immediate transaction");
+        transaction
+            .execute(
+                "INSERT INTO providers (id, app_type, name, settings_config)
+                 VALUES ('pending', 'claude', 'Pending', '{}')",
+                [],
+            )
+            .expect("write inside immediate transaction");
+        let error = second
+            .execute(
+                "INSERT INTO providers (id, app_type, name, settings_config)
+                 VALUES ('blocked', 'claude', 'Blocked', '{}')",
+                [],
+            )
+            .expect_err("second writer must be excluded");
+        assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
+        transaction.rollback().expect("roll back transaction");
+        assert!(read_provider_row(&second, "blocked", "claude")
+            .expect("read rolled back provider")
+            .is_none());
+        assert!(read_provider_row(&second, "pending", "claude")
+            .expect("read rolled back provider")
+            .is_none());
     }
 
     #[test]
