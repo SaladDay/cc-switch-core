@@ -35,7 +35,9 @@ const MAX_HERMES_PLATFORM_BYTES: usize = 128;
 /// Observation accepts roots that do not exist yet. Before executing a write,
 /// the host must create the selected native root and Core state root as real
 /// directories while holding the shared live-config lock. On Unix, the state
-/// root must be accessible only to its owner.
+/// root must be accessible only to its owner. Every host that shares a native
+/// root must also use the same persistent state root; changing it is an
+/// explicit offline migration, not a runtime path override.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SkillAppRuntime {
     app: AppType,
@@ -145,8 +147,9 @@ impl SkillAppRuntime {
         &self.native_root
     }
 
-    /// Returns the host-resolved private state directory on the native root's
-    /// filesystem. Core owns only entries inside this directory.
+    /// Returns the host-resolved private, persistent state directory on the
+    /// native root's filesystem. Core owns only entries inside this directory.
+    /// All hosts controlling that native root must supply the same path.
     pub fn state_root(&self) -> &Path {
         &self.state_root
     }

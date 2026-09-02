@@ -368,10 +368,13 @@ impl SkillReferenceReceipt {
 ///
 /// The host supplies a private state root on the same filesystem as the
 /// native root and creates both roots while holding the shared live-config
-/// lock. Core creates references only in that private root, then atomically
-/// moves the public entry into place without replacement. Later switches
-/// leave that entry untouched and change only its private anchor. Disabling
-/// makes the public entry resolve to no Skill without deleting or moving it.
+/// lock. The state root is part of the persistent reference identity and must
+/// remain identical across cooperating hosts; relocating it requires an
+/// explicit offline migration. Core creates references only in that private
+/// root, then atomically moves the public entry into place without replacement.
+/// Later switches leave that entry untouched and change only its private
+/// anchor. Disabling makes the public entry resolve to no Skill without
+/// deleting or moving it.
 pub fn apply_skill_reference(
     plan: &SkillReferencePlan,
 ) -> Result<SkillReferenceReceipt, SkillReferenceError> {
@@ -2036,6 +2039,29 @@ mod tests {
             Err(SkillReferenceError::InsecureStateRoot { .. })
         ));
         assert!(!destination.join("demo").exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn changing_the_persistent_state_root_never_adopts_a_public_reference() {
+        let (temporary, source, destination, state) = roots();
+        apply_skill_reference(&plan(&source, &destination, &state, true))
+            .unwrap()
+            .commit()
+            .unwrap();
+        let relocated_state = temporary.path().join("relocated-state");
+        fs::create_dir(&relocated_state).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&relocated_state, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        assert!(matches!(
+            apply_skill_reference(&plan(&source, &destination, &relocated_state, true)),
+            Err(SkillReferenceError::Unowned { .. })
+        ));
+        assert!(destination.join("demo/SKILL.md").is_file());
     }
 
     #[cfg(any(unix, windows))]
