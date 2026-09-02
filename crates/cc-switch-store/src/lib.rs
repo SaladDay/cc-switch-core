@@ -18,6 +18,13 @@ use rusqlite::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod mcp;
+
+pub use mcp::{
+    ensure_mcp_server_schema, read_mcp_server_row, read_mcp_server_rows, McpServerRow,
+    MCP_SERVERS_TABLE,
+};
+
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Canonical table shared by CC Switch products.
@@ -331,6 +338,15 @@ impl SharedDatabase {
         verify_provider_schema(&transaction)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Creates or transactionally upgrades the shared `mcp_servers` contract.
+    ///
+    /// Product migrations, live configuration state, and private MCP tables
+    /// remain owned by the host.
+    pub fn ensure_mcp_server_schema(&self) -> Result<(), SharedStoreError> {
+        let mut connection = self.connect()?;
+        ensure_mcp_server_schema(&mut connection)
     }
 
     #[cfg(unix)]
@@ -839,11 +855,11 @@ fn provider_from_row(row: &Row<'_>) -> Result<ProviderRow, rusqlite::Error> {
         meta: row.get(11)?,
         is_current: row.get(12)?,
         in_failover_queue: row.get(13)?,
-        source_fingerprint: provider_source_fingerprint(row, PROVIDER_FIELD_COUNT)?,
+        source_fingerprint: source_fingerprint(row, PROVIDER_FIELD_COUNT)?,
     })
 }
 
-fn provider_source_fingerprint(
+pub(crate) fn source_fingerprint(
     row: &Row<'_>,
     source_offset: usize,
 ) -> Result<[u8; 32], rusqlite::Error> {
