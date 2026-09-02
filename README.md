@@ -15,6 +15,36 @@ The `0.1` API contains:
 - host-neutral compare-and-swap execution with guarded rollback;
 - pure live projections and validation for all nine supported applications.
 
+## Integration model
+
+Built-in applications have one composition point: the internal
+`AppIntegration` catalog. Each row binds the public descriptor, logical
+targets, simple provider form, native import, and native projection behavior.
+App-specific parsers and projectors stay in their capability modules; shared
+entry points dispatch through that catalog. `AppType` and `LogicalTarget`
+remain stable wire contracts, so their exhaustive decoding, ownership, and
+cross-capability checks still need deliberate updates for a new App. Do not
+add a second App-shaped registry or a parallel behavior dispatcher.
+
+Conformance tests iterate every registered adapter, form, capability, and
+logical target. A new built-in App is complete only when it passes the same
+suite; products should consume the public registry and adapter APIs instead of
+copying native settings templates.
+
+## Dependency direction
+
+Core owns product-neutral contracts and pure transformations. Native hosts
+discover application config paths and apply user settings, environment
+variables, platform directories, and installation checks. Core may
+canonicalize and validate paths supplied to its Skill and filesystem
+contracts. Shared SQLite schema and migrations should live in a separate
+storage crate that depends on Core, so desktop and CLI products can share
+persistence without making Core database-specific. Core may expose stable
+display-name fallbacks, brand keys, simple forms, presets, and authentication
+modes needed by pure projections. Hosts own localized UI copy, components,
+assets, styles, process orchestration, OAuth flows and token acquisition,
+network model discovery, proxying, and plugin installation.
+
 The live-operation layer does not own paths, raw-plan syntax validation,
 concrete file I/O, locks, business state, databases, UI, OAuth flows, proxy
 behavior, catalog generation, or the plugin system. Hosts supply stable
