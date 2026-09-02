@@ -3,11 +3,13 @@
 use std::fmt;
 
 use crate::{
-    builtin_app_registry, native_import, projection, AppDescriptor, AppType, LiveDocumentSet,
-    LogicalTarget, McpAppContract, McpConfigError, McpConfigTarget, McpImport, McpServerProjection,
-    NativeAction, NativeImportError, NativeImportStep, NativePlanError, NativePlanRequest,
-    OperationPlan, OperationPlanError, ProviderSnapshot, SimpleProviderError,
-    SimpleProviderFormDescriptor, SimpleProviderValues,
+    builtin_app_registry,
+    integration::{builtin_app_integration, builtin_app_integrations},
+    native_import, projection, AppDescriptor, AppType, LiveDocumentSet, LogicalTarget,
+    McpAppContract, McpConfigError, McpConfigTarget, McpImport, McpServerProjection, NativeAction,
+    NativeImportError, NativeImportStep, NativePlanError, NativePlanRequest, OperationPlan,
+    OperationPlanError, ProviderSnapshot, SimpleProviderError, SimpleProviderFormDescriptor,
+    SimpleProviderValues,
 };
 
 mod sealed {
@@ -131,9 +133,15 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
 }
 
 #[derive(Debug)]
-struct BuiltinAdapter {
+pub(crate) struct BuiltinAdapter {
     app: AppType,
     targets: &'static [LogicalTarget],
+}
+
+impl BuiltinAdapter {
+    pub(crate) const fn new(app: AppType, targets: &'static [LogicalTarget]) -> Self {
+        Self { app, targets }
+    }
 }
 
 impl sealed::Sealed for BuiltinAdapter {}
@@ -148,91 +156,15 @@ impl AppAdapter for BuiltinAdapter {
     }
 }
 
-static CLAUDE_ADAPTER: BuiltinAdapter = BuiltinAdapter {
-    app: AppType::Claude,
-    targets: &[LogicalTarget::ClaudeSettings],
-};
-
-static CLAUDE_DESKTOP_ADAPTER: BuiltinAdapter = BuiltinAdapter {
-    app: AppType::ClaudeDesktop,
-    targets: &[
-        LogicalTarget::ClaudeDesktopNormalConfig,
-        LogicalTarget::ClaudeDesktopThreepConfig,
-        LogicalTarget::ClaudeDesktopProfile,
-        LogicalTarget::ClaudeDesktopMeta,
-    ],
-};
-
-static CODEX_ADAPTER: BuiltinAdapter = BuiltinAdapter {
-    app: AppType::Codex,
-    targets: &[
-        LogicalTarget::CodexAuth,
-        LogicalTarget::CodexConfig,
-        LogicalTarget::CodexModelCatalog,
-    ],
-};
-
-static GEMINI_ADAPTER: BuiltinAdapter = BuiltinAdapter {
-    app: AppType::Gemini,
-    targets: &[LogicalTarget::GeminiEnv, LogicalTarget::GeminiSettings],
-};
-
-static GROKBUILD_ADAPTER: BuiltinAdapter = BuiltinAdapter {
-    app: AppType::GrokBuild,
-    targets: &[LogicalTarget::GrokConfig],
-};
-
-static OPENCODE_ADAPTER: BuiltinAdapter = BuiltinAdapter {
-    app: AppType::OpenCode,
-    targets: &[LogicalTarget::OpenCodeConfig],
-};
-
-static OPENCLAW_ADAPTER: BuiltinAdapter = BuiltinAdapter {
-    app: AppType::OpenClaw,
-    targets: &[LogicalTarget::OpenClawConfig],
-};
-
-static HERMES_ADAPTER: BuiltinAdapter = BuiltinAdapter {
-    app: AppType::Hermes,
-    targets: &[LogicalTarget::HermesConfig],
-};
-
-static PI_ADAPTER: BuiltinAdapter = BuiltinAdapter {
-    app: AppType::Pi,
-    targets: &[LogicalTarget::PiModels],
-};
-
-static BUILTIN_ADAPTERS: [&dyn AppAdapter; 9] = [
-    &CLAUDE_ADAPTER,
-    &CLAUDE_DESKTOP_ADAPTER,
-    &CODEX_ADAPTER,
-    &GEMINI_ADAPTER,
-    &GROKBUILD_ADAPTER,
-    &OPENCODE_ADAPTER,
-    &OPENCLAW_ADAPTER,
-    &HERMES_ADAPTER,
-    &PI_ADAPTER,
-];
-
 /// Iterates over built-in adapters in registry display order.
 pub fn builtin_app_adapters(
 ) -> impl ExactSizeIterator<Item = &'static dyn AppAdapter> + DoubleEndedIterator + Clone {
-    BUILTIN_ADAPTERS.iter().copied()
+    builtin_app_integrations().map(|integration| integration.adapter() as &dyn AppAdapter)
 }
 
 /// Returns the built-in adapter for an application.
 pub fn builtin_app_adapter(app: &AppType) -> &'static dyn AppAdapter {
-    match app {
-        AppType::Claude => &CLAUDE_ADAPTER,
-        AppType::ClaudeDesktop => &CLAUDE_DESKTOP_ADAPTER,
-        AppType::Codex => &CODEX_ADAPTER,
-        AppType::Gemini => &GEMINI_ADAPTER,
-        AppType::GrokBuild => &GROKBUILD_ADAPTER,
-        AppType::OpenCode => &OPENCODE_ADAPTER,
-        AppType::OpenClaw => &OPENCLAW_ADAPTER,
-        AppType::Hermes => &HERMES_ADAPTER,
-        AppType::Pi => &PI_ADAPTER,
-    }
+    builtin_app_integration(app).adapter()
 }
 
 #[cfg(test)]
@@ -450,7 +382,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            CLAUDE_ADAPTER.validate_plan(&wrong_app),
+            builtin_app_adapter(&AppType::Claude).validate_plan(&wrong_app),
             Err(OperationPlanError::WrongApp { .. })
         ));
 

@@ -10,7 +10,10 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value as TomlValue};
 
-use crate::AppType;
+use crate::{
+    integration::{builtin_app_integration, builtin_app_integrations},
+    AppType,
+};
 
 /// Semantic fields exposed by a simple provider editor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -379,63 +382,64 @@ const OPENAI_COMPATIBLE_PRESETS: &[SimpleProviderPreset] = &[
     ),
 ];
 
-static CLAUDE_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
+pub(crate) static CLAUDE_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
     "claude",
     SimpleProviderProtocol::AnthropicMessages,
     true,
     BASE_OPTIONAL_KEY_REQUIRED_MODEL_OPTIONAL,
     CLAUDE_PRESETS,
 );
-static CLAUDE_DESKTOP_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
-    "claude-desktop",
-    SimpleProviderProtocol::AnthropicMessages,
-    false,
-    BASE_KEY_REQUIRED,
-    CLAUDE_DESKTOP_PRESETS,
-);
-static CODEX_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
+pub(crate) static CLAUDE_DESKTOP_FORM: SimpleProviderFormDescriptor =
+    SimpleProviderFormDescriptor::new(
+        "claude-desktop",
+        SimpleProviderProtocol::AnthropicMessages,
+        false,
+        BASE_KEY_REQUIRED,
+        CLAUDE_DESKTOP_PRESETS,
+    );
+pub(crate) static CODEX_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
     "codex",
     SimpleProviderProtocol::OpenAiResponses,
     false,
     BASE_OPTIONAL_KEY_MODEL_REQUIRED,
     CODEX_PRESETS,
 );
-static GEMINI_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
+pub(crate) static GEMINI_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
     "gemini",
     SimpleProviderProtocol::GoogleGenerativeAi,
     false,
     BASE_OPTIONAL_KEY_REQUIRED_MODEL_OPTIONAL,
     GEMINI_PRESETS,
 );
-static GROKBUILD_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
+pub(crate) static GROKBUILD_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
     "grokbuild",
     SimpleProviderProtocol::OpenAiResponses,
     false,
     BASE_KEY_MODEL_REQUIRED,
     GROKBUILD_PRESETS,
 );
-static OPENCODE_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
+pub(crate) static OPENCODE_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
     "opencode",
     SimpleProviderProtocol::OpenAiChatCompletions,
     false,
     BASE_KEY_MODEL_REQUIRED,
     OPENAI_COMPATIBLE_PRESETS,
 );
-static OPENCLAW_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
+pub(crate) static OPENCLAW_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
     "openclaw",
     SimpleProviderProtocol::OpenAiCompletions,
     false,
     BASE_KEY_MODEL_REQUIRED,
     OPENAI_COMPATIBLE_PRESETS,
 );
-static HERMES_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
+pub(crate) static HERMES_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
     "hermes",
     SimpleProviderProtocol::OpenAiChatCompletions,
     false,
     BASE_KEY_MODEL_REQUIRED,
     OPENAI_COMPATIBLE_PRESETS,
 );
-static PI_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
+pub(crate) static PI_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new(
     "pi",
     SimpleProviderProtocol::OpenAiCompletions,
     false,
@@ -443,38 +447,16 @@ static PI_FORM: SimpleProviderFormDescriptor = SimpleProviderFormDescriptor::new
     OPENAI_COMPATIBLE_PRESETS,
 );
 
-static SIMPLE_PROVIDER_FORMS: [&SimpleProviderFormDescriptor; 9] = [
-    &CLAUDE_FORM,
-    &CLAUDE_DESKTOP_FORM,
-    &CODEX_FORM,
-    &GEMINI_FORM,
-    &GROKBUILD_FORM,
-    &OPENCODE_FORM,
-    &OPENCLAW_FORM,
-    &HERMES_FORM,
-    &PI_FORM,
-];
-
 /// Iterates over every built-in simple form in registry display order.
 pub fn builtin_simple_provider_forms(
 ) -> impl ExactSizeIterator<Item = &'static SimpleProviderFormDescriptor> + DoubleEndedIterator + Clone
 {
-    SIMPLE_PROVIDER_FORMS.iter().copied()
+    builtin_app_integrations().map(|integration| integration.simple_provider_form())
 }
 
 /// Returns the simple form for one built-in application.
 pub fn simple_provider_form(app: &AppType) -> &'static SimpleProviderFormDescriptor {
-    match app {
-        AppType::Claude => &CLAUDE_FORM,
-        AppType::ClaudeDesktop => &CLAUDE_DESKTOP_FORM,
-        AppType::Codex => &CODEX_FORM,
-        AppType::Gemini => &GEMINI_FORM,
-        AppType::GrokBuild => &GROKBUILD_FORM,
-        AppType::OpenCode => &OPENCODE_FORM,
-        AppType::OpenClaw => &OPENCLAW_FORM,
-        AppType::Hermes => &HERMES_FORM,
-        AppType::Pi => &PI_FORM,
-    }
+    builtin_app_integration(app).simple_provider_form()
 }
 
 /// Extracts simple values from an application's native provider shape.

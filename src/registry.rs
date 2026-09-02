@@ -3,10 +3,8 @@
 use serde::Serialize;
 
 use crate::{
-    mcp::{
-        McpAppContract, CLAUDE_MCP, CODEX_MCP, GEMINI_MCP, GROKBUILD_MCP, HERMES_MCP, OPENCODE_MCP,
-    },
-    AppType, SkillAppContract, SkillConfigTarget, SkillDiscovery,
+    integration::{builtin_app_integration, builtin_app_integrations},
+    AppType, McpAppContract, SkillAppContract,
 };
 
 /// A product-facing capability declared by an application.
@@ -59,7 +57,7 @@ pub struct AppDescriptor {
 }
 
 impl AppDescriptor {
-    const fn new(
+    pub(crate) const fn new(
         app: AppType,
         id: &'static str,
         display_name: &'static str,
@@ -81,12 +79,12 @@ impl AppDescriptor {
         }
     }
 
-    const fn with_mcp(mut self, contract: &'static McpAppContract) -> Self {
+    pub(crate) const fn with_mcp(mut self, contract: &'static McpAppContract) -> Self {
         self.mcp_contract = Some(contract);
         self
     }
 
-    const fn with_skills(mut self, contract: SkillAppContract) -> Self {
+    pub(crate) const fn with_skills(mut self, contract: SkillAppContract) -> Self {
         self.skill_contract = Some(contract);
         self
     }
@@ -152,7 +150,7 @@ impl BuiltinAppRegistry {
     pub fn descriptors(
         &self,
     ) -> impl ExactSizeIterator<Item = &'static AppDescriptor> + DoubleEndedIterator + Clone {
-        BUILTIN_APP_DESCRIPTORS.iter().copied()
+        builtin_app_integrations().map(|integration| integration.descriptor())
     }
 
     /// Resolves a stable identifier or supported legacy alias.
@@ -173,211 +171,10 @@ pub fn builtin_app_registry() -> &'static BuiltinAppRegistry {
     &BUILTIN_APP_REGISTRY
 }
 
-const PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS: &[AppCapability] = &[
-    AppCapability::ProviderManagement,
-    AppCapability::LiveConfiguration,
-    AppCapability::CommonConfiguration,
-    AppCapability::LocalProxy,
-    AppCapability::Mcp,
-    AppCapability::Prompts,
-    AppCapability::Skills,
-];
-
-const PROVIDER_LIVE_PROXY_MCP_PROMPTS_SKILLS: &[AppCapability] = &[
-    AppCapability::ProviderManagement,
-    AppCapability::LiveConfiguration,
-    AppCapability::LocalProxy,
-    AppCapability::Mcp,
-    AppCapability::Prompts,
-    AppCapability::Skills,
-];
-
-const PROVIDER_LIVE_MCP_PROMPTS_SKILLS: &[AppCapability] = &[
-    AppCapability::ProviderManagement,
-    AppCapability::LiveConfiguration,
-    AppCapability::Mcp,
-    AppCapability::Prompts,
-    AppCapability::Skills,
-];
-
-const PROVIDER_LIVE_PROMPTS_SKILLS: &[AppCapability] = &[
-    AppCapability::ProviderManagement,
-    AppCapability::LiveConfiguration,
-    AppCapability::Prompts,
-    AppCapability::Skills,
-];
-
-const PROVIDER_LIVE_PROMPTS: &[AppCapability] = &[
-    AppCapability::ProviderManagement,
-    AppCapability::LiveConfiguration,
-    AppCapability::Prompts,
-];
-
-const PROVIDER_LIVE: &[AppCapability] = &[
-    AppCapability::ProviderManagement,
-    AppCapability::LiveConfiguration,
-];
-
 static BUILTIN_APP_REGISTRY: BuiltinAppRegistry = BuiltinAppRegistry { _private: () };
 
-use SkillConfigTarget::{GeminiSettings, GrokConfig, HermesConfig};
-use SkillDiscovery::{NativeAndUnified, NativeOnly};
-
-static CLAUDE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
-    AppType::Claude,
-    "claude",
-    "Claude",
-    "claude",
-    ProviderConfigurationMode::Switch,
-    PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
-    &[],
-)
-.with_mcp(&CLAUDE_MCP)
-.with_skills(SkillAppContract::catalog(
-    "enabled_claude",
-    NativeOnly,
-    None,
-));
-
-static CLAUDE_DESKTOP_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
-    AppType::ClaudeDesktop,
-    "claude-desktop",
-    "Claude Desktop",
-    "claude",
-    ProviderConfigurationMode::Switch,
-    PROVIDER_LIVE,
-    &["claude_desktop", "claudedesktop"],
-);
-
-static CODEX_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
-    AppType::Codex,
-    "codex",
-    "Codex",
-    "codex",
-    ProviderConfigurationMode::Switch,
-    PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
-    &[],
-)
-.with_mcp(&CODEX_MCP)
-.with_skills(SkillAppContract::catalog(
-    "enabled_codex",
-    NativeAndUnified,
-    None,
-));
-
-static GEMINI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
-    AppType::Gemini,
-    "gemini",
-    "Gemini",
-    "gemini",
-    ProviderConfigurationMode::Switch,
-    PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
-    &[],
-)
-.with_mcp(&GEMINI_MCP)
-.with_skills(SkillAppContract::catalog(
-    "enabled_gemini",
-    NativeAndUnified,
-    Some(GeminiSettings),
-));
-
-static GROKBUILD_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
-    AppType::GrokBuild,
-    "grokbuild",
-    "Grok Build",
-    "grok",
-    ProviderConfigurationMode::Switch,
-    PROVIDER_LIVE_PROXY_MCP_PROMPTS_SKILLS,
-    &["grok-build", "grok_build", "grok"],
-)
-.with_mcp(&GROKBUILD_MCP)
-.with_skills(SkillAppContract::catalog(
-    "enabled_grokbuild",
-    NativeAndUnified,
-    Some(GrokConfig),
-));
-
-static OPENCODE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
-    AppType::OpenCode,
-    "opencode",
-    "OpenCode",
-    "opencode",
-    ProviderConfigurationMode::Additive,
-    PROVIDER_LIVE_MCP_PROMPTS_SKILLS,
-    &[],
-)
-.with_mcp(&OPENCODE_MCP)
-.with_skills(SkillAppContract::catalog(
-    "enabled_opencode",
-    NativeAndUnified,
-    None,
-));
-
-static OPENCLAW_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
-    AppType::OpenClaw,
-    "openclaw",
-    "OpenClaw",
-    "openclaw",
-    ProviderConfigurationMode::Additive,
-    PROVIDER_LIVE_PROMPTS,
-    &[],
-);
-
-static HERMES_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
-    AppType::Hermes,
-    "hermes",
-    "Hermes",
-    "hermes",
-    ProviderConfigurationMode::Additive,
-    PROVIDER_LIVE_MCP_PROMPTS_SKILLS,
-    &[],
-)
-.with_mcp(&HERMES_MCP)
-.with_skills(SkillAppContract::catalog(
-    "enabled_hermes",
-    NativeOnly,
-    Some(HermesConfig),
-));
-
-static PI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
-    AppType::Pi,
-    "pi",
-    "Pi",
-    "pi",
-    ProviderConfigurationMode::Additive,
-    PROVIDER_LIVE_PROMPTS_SKILLS,
-    &[],
-)
-.with_skills(SkillAppContract::catalog(
-    "enabled_pi",
-    NativeAndUnified,
-    None,
-));
-
-static BUILTIN_APP_DESCRIPTORS: [&AppDescriptor; 9] = [
-    &CLAUDE_DESCRIPTOR,
-    &CLAUDE_DESKTOP_DESCRIPTOR,
-    &CODEX_DESCRIPTOR,
-    &GEMINI_DESCRIPTOR,
-    &GROKBUILD_DESCRIPTOR,
-    &OPENCODE_DESCRIPTOR,
-    &OPENCLAW_DESCRIPTOR,
-    &HERMES_DESCRIPTOR,
-    &PI_DESCRIPTOR,
-];
-
 pub(crate) fn descriptor_for(app: &AppType) -> &'static AppDescriptor {
-    match app {
-        AppType::Claude => &CLAUDE_DESCRIPTOR,
-        AppType::ClaudeDesktop => &CLAUDE_DESKTOP_DESCRIPTOR,
-        AppType::Codex => &CODEX_DESCRIPTOR,
-        AppType::Gemini => &GEMINI_DESCRIPTOR,
-        AppType::GrokBuild => &GROKBUILD_DESCRIPTOR,
-        AppType::OpenCode => &OPENCODE_DESCRIPTOR,
-        AppType::OpenClaw => &OPENCLAW_DESCRIPTOR,
-        AppType::Hermes => &HERMES_DESCRIPTOR,
-        AppType::Pi => &PI_DESCRIPTOR,
-    }
+    builtin_app_integration(app).descriptor()
 }
 
 #[cfg(test)]
@@ -387,6 +184,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::{
+        SkillConfigTarget::{GeminiSettings, GrokConfig, HermesConfig},
+        SkillDiscovery::{NativeAndUnified, NativeOnly},
+    };
 
     #[test]
     fn registry_keeps_stable_order_and_identifiers() {

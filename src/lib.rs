@@ -22,6 +22,7 @@ pub mod fs;
 pub mod gemini;
 pub mod grokbuild;
 pub mod hermes;
+mod integration;
 mod json5_patch;
 mod mcp;
 mod native_import;
