@@ -11,7 +11,10 @@ use std::{
     time::Duration,
 };
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{
+    types::ValueRef, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior,
+};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -19,9 +22,10 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Canonical table shared by CC Switch products.
 pub const PROVIDERS_TABLE: &str = "providers";
 
-const SELECT_PROVIDER_COLUMNS: &str = "id, app_type, name, settings_config,
+const SELECT_PROVIDER_FIELDS: &str = "id, app_type, name, settings_config,
     website_url, category, created_at, sort_index, notes, icon, icon_color,
     meta, is_current, in_failover_queue";
+const PROVIDER_FIELD_COUNT: usize = 14;
 
 /// An unparsed row from the shared `providers` table.
 #[derive(Clone, PartialEq, Eq)]
@@ -40,6 +44,15 @@ pub struct ProviderRow {
     pub meta: String,
     pub is_current: i64,
     pub in_failover_queue: i64,
+    source_fingerprint: [u8; 32],
+}
+
+impl ProviderRow {
+    /// Identifies every column value read from this source row, including
+    /// unknown future columns, without exposing their contents.
+    pub fn source_fingerprint(&self) -> &[u8; 32] {
+        &self.source_fingerprint
+    }
 }
 
 impl fmt::Debug for ProviderRow {
@@ -496,7 +509,7 @@ pub fn read_provider_rows(
     app_type: Option<&str>,
 ) -> Result<Vec<ProviderRow>, SharedStoreError> {
     let sql = format!(
-        "SELECT {SELECT_PROVIDER_COLUMNS} FROM providers
+        "SELECT {SELECT_PROVIDER_FIELDS}, providers.* FROM providers
          WHERE (?1 IS NULL OR app_type = ?1)
          ORDER BY COALESCE(sort_index, 999999), created_at ASC, id ASC, app_type ASC"
     );
@@ -515,7 +528,7 @@ pub fn read_provider_row(
     app_type: &str,
 ) -> Result<Option<ProviderRow>, SharedStoreError> {
     let sql = format!(
-        "SELECT {SELECT_PROVIDER_COLUMNS} FROM providers
+        "SELECT {SELECT_PROVIDER_FIELDS}, providers.* FROM providers
          WHERE id = ?1 AND app_type = ?2"
     );
     connection
@@ -540,7 +553,41 @@ fn provider_from_row(row: &Row<'_>) -> Result<ProviderRow, rusqlite::Error> {
         meta: row.get(11)?,
         is_current: row.get(12)?,
         in_failover_queue: row.get(13)?,
+        source_fingerprint: provider_source_fingerprint(row, PROVIDER_FIELD_COUNT)?,
     })
+}
+
+fn provider_source_fingerprint(
+    row: &Row<'_>,
+    source_offset: usize,
+) -> Result<[u8; 32], rusqlite::Error> {
+    let statement = row.as_ref();
+    let mut hasher = Sha256::new();
+    hasher.update(((statement.column_count() - source_offset) as u64).to_le_bytes());
+    for index in source_offset..statement.column_count() {
+        match row.get_ref(index)? {
+            ValueRef::Null => hasher.update([0]),
+            ValueRef::Integer(value) => {
+                hasher.update([1]);
+                hasher.update(value.to_le_bytes());
+            }
+            ValueRef::Real(value) => {
+                hasher.update([2]);
+                hasher.update(value.to_bits().to_le_bytes());
+            }
+            ValueRef::Text(value) => {
+                hasher.update([3]);
+                hasher.update((value.len() as u64).to_le_bytes());
+                hasher.update(value);
+            }
+            ValueRef::Blob(value) => {
+                hasher.update([4]);
+                hasher.update((value.len() as u64).to_le_bytes());
+                hasher.update(value);
+            }
+        }
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn resolve_database_path(path: PathBuf) -> Result<PathBuf, SharedStoreError> {
@@ -795,6 +842,13 @@ mod tests {
                 .expect("provider exists"),
             rows[0]
         );
+        let transaction = connection
+            .unchecked_transaction()
+            .expect("begin read transaction");
+        assert!(read_provider_row(&transaction, "first", "claude")
+            .expect("read provider through transaction")
+            .is_some());
+        transaction.rollback().expect("roll back read transaction");
         assert!(read_provider_row(&connection, "missing", "codex")
             .expect("read missing provider")
             .is_none());
@@ -811,6 +865,59 @@ mod tests {
                 ("later", "claude"),
             ]
         );
+
+        connection
+            .execute_batch("PRAGMA short_column_names=OFF; PRAGMA full_column_names=ON;")
+            .expect("enable qualified result names");
+        let qualified = read_provider_row(&connection, "later", "claude")
+            .expect("read with qualified result names")
+            .expect("provider exists");
+        assert_eq!(qualified, rows[1]);
+    }
+
+    #[test]
+    fn provider_read_errors_do_not_expose_sensitive_values() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let connection = database.connect().expect("connect shared database");
+        connection
+            .execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('sensitive', 'claude', 'Sensitive', '{}', '{}')",
+                [],
+            )
+            .expect("insert provider fixture");
+
+        for (column, secret) in [
+            ("settings_config", b"secret-settings".as_slice()),
+            ("meta", b"secret-meta".as_slice()),
+        ] {
+            connection
+                .execute(
+                    &format!(
+                        "UPDATE providers SET {column} = ?1
+                         WHERE id = 'sensitive' AND app_type = 'claude'"
+                    ),
+                    [secret],
+                )
+                .expect("store invalid sensitive value");
+            let error = read_provider_row(&connection, "sensitive", "claude")
+                .expect_err("invalid sensitive column must fail");
+            assert!(!error.to_string().contains("secret-"));
+            connection
+                .execute(
+                    &format!(
+                        "UPDATE providers SET {column} = '{{}}'
+                         WHERE id = 'sensitive' AND app_type = 'claude'"
+                    ),
+                    [],
+                )
+                .expect("restore sensitive value");
+        }
     }
 
     #[test]
@@ -871,6 +978,21 @@ mod tests {
                 .expect("read upgraded provider column"),
             0
         );
+
+        let before = read_provider_row(&connection, "p", "claude")
+            .expect("read provider before extension update")
+            .expect("provider exists");
+        connection
+            .execute(
+                "UPDATE providers SET future_column = 'changed' WHERE id = 'p'",
+                [],
+            )
+            .expect("update future provider column");
+        let after = read_provider_row(&connection, "p", "claude")
+            .expect("read provider after extension update")
+            .expect("provider exists");
+        assert_eq!(before.settings_config, after.settings_config);
+        assert_ne!(before.source_fingerprint(), after.source_fingerprint());
     }
 
     #[test]
