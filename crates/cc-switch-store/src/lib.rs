@@ -104,11 +104,11 @@ impl fmt::Debug for ProviderInsert<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum ProviderWriteOutcome {
-    /// SQLite reported one directly affected row. Host triggers may still
-    /// change the final row state, which remains host-owned.
+    /// One shared row write persisted without changing stored host extensions.
+    /// Host triggers may still change shared fields, which remain host-owned.
     Applied,
-    /// SQLite reported no directly affected row, including a missing identity
-    /// or a host trigger that deliberately suppressed the statement.
+    /// The write did not persist, including a missing identity, a suppressed
+    /// statement, or an update that would alter stored host extensions.
     NotApplied,
 }
 
@@ -613,6 +613,7 @@ pub fn insert_provider(
             provider.is_current,
             provider.in_failover_queue,
         ],
+        None,
     )
 }
 
@@ -629,6 +630,7 @@ pub fn update_provider_configuration(
         "UPDATE main.providers SET name = ?1, settings_config = ?2
          WHERE id COLLATE BINARY = ?3 AND app_type COLLATE BINARY = ?4",
         params![name, settings_config, id, app_type],
+        Some((id, app_type)),
     )
 }
 
@@ -648,6 +650,7 @@ pub fn update_provider_details(
          SET name = ?1, settings_config = ?2, category = ?3, meta = ?4
          WHERE id COLLATE BINARY = ?5 AND app_type COLLATE BINARY = ?6",
         params![name, settings_config, category, meta, id, app_type],
+        Some((id, app_type)),
     )
 }
 
@@ -663,6 +666,7 @@ pub fn update_provider_metadata(
         "UPDATE main.providers SET meta = ?1
          WHERE id COLLATE BINARY = ?2 AND app_type COLLATE BINARY = ?3",
         params![meta, id, app_type],
+        Some((id, app_type)),
     )
 }
 
@@ -678,6 +682,7 @@ pub fn set_provider_current(
         "UPDATE main.providers SET is_current = ?1
          WHERE id COLLATE BINARY = ?2 AND app_type COLLATE BINARY = ?3",
         params![is_current, id, app_type],
+        Some((id, app_type)),
     )
 }
 
@@ -692,6 +697,7 @@ pub fn delete_provider(
         "DELETE FROM main.providers
          WHERE id COLLATE BINARY = ?1 AND app_type COLLATE BINARY = ?2",
         params![id, app_type],
+        None,
     )
 }
 
@@ -699,6 +705,7 @@ fn execute_provider_write<P: Params>(
     transaction: &mut Transaction<'_>,
     sql: &str,
     params: P,
+    preserve_extensions_for: Option<(&str, &str)>,
 ) -> Result<ProviderWriteOutcome, SharedStoreError> {
     if transaction.is_autocommit() {
         return Err(SharedStoreError::ProviderWrite {
@@ -707,19 +714,37 @@ fn execute_provider_write<P: Params>(
             transaction_aborted: true,
         });
     }
-    verify_provider_write_schema(transaction)?;
+    let columns = verify_provider_write_schema(transaction)?;
+    let extension_guard = preserve_extensions_for.map(|identity| (identity, columns));
     let transaction_aborted = transaction.is_autocommit();
     let savepoint = transaction
         .savepoint()
         .map_err(|error| redact_provider_write_error(error, transaction_aborted))?;
     let result = (|| {
-        let mut statement = savepoint.prepare(sql)?;
-        let mut rows = statement.query(params)?;
-        while rows.next()?.is_some() {}
-        Ok(savepoint.changes() as usize)
+        let before = extension_guard
+            .as_ref()
+            .map(|((id, app_type), columns)| {
+                provider_extension_for_identity(&savepoint, id, app_type, columns)
+            })
+            .transpose()?;
+        let changed = {
+            let mut statement = savepoint.prepare(sql)?;
+            let mut rows = statement.query(params)?;
+            while rows.next()?.is_some() {}
+            savepoint.changes() as usize
+        };
+        let extensions_unchanged = extension_guard
+            .as_ref()
+            .map(|((id, app_type), columns)| {
+                provider_extension_for_identity(&savepoint, id, app_type, columns)
+                    .map(|after| before == Some(after))
+            })
+            .transpose()?
+            .unwrap_or(true);
+        Ok((changed, extensions_unchanged))
     })();
-    let changed = match result {
-        Ok(changed) => changed,
+    let (changed, extensions_unchanged) = match result {
+        Ok(result) => result,
         Err(error) => {
             let _ = savepoint.finish();
             return Err(redact_provider_write_error(
@@ -728,6 +753,12 @@ fn execute_provider_write<P: Params>(
             ));
         }
     };
+    if !extensions_unchanged {
+        savepoint
+            .finish()
+            .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
     let outcome = match changed {
         0 => ProviderWriteOutcome::NotApplied,
         1 => ProviderWriteOutcome::Applied,
@@ -761,7 +792,9 @@ fn redact_provider_write_error(
     }
 }
 
-fn verify_provider_write_schema(transaction: &Transaction<'_>) -> Result<(), SharedStoreError> {
+fn verify_provider_write_schema(
+    transaction: &Transaction<'_>,
+) -> Result<Vec<ExistingColumn>, SharedStoreError> {
     verify_provider_schema(transaction).map_err(|error| match error {
         SharedStoreError::Database(error) => {
             redact_provider_write_error(error, transaction.is_autocommit())
@@ -832,29 +865,73 @@ fn provider_source_fingerprint(
     let mut hasher = Sha256::new();
     hasher.update(((statement.column_count() - source_offset) as u64).to_le_bytes());
     for index in source_offset..statement.column_count() {
-        match row.get_ref(index)? {
-            ValueRef::Null => hasher.update([0]),
-            ValueRef::Integer(value) => {
-                hasher.update([1]);
-                hasher.update(value.to_le_bytes());
-            }
-            ValueRef::Real(value) => {
-                hasher.update([2]);
-                hasher.update(value.to_bits().to_le_bytes());
-            }
-            ValueRef::Text(value) => {
-                hasher.update([3]);
-                hasher.update((value.len() as u64).to_le_bytes());
-                hasher.update(value);
-            }
-            ValueRef::Blob(value) => {
-                hasher.update([4]);
-                hasher.update((value.len() as u64).to_le_bytes());
-                hasher.update(value);
-            }
-        }
+        hash_sql_value(&mut hasher, row.get_ref(index)?);
     }
     Ok(hasher.finalize().into())
+}
+
+fn provider_extension_fingerprint(
+    row: &Row<'_>,
+    source_offset: usize,
+    source_columns: &[ExistingColumn],
+) -> Result<[u8; 32], rusqlite::Error> {
+    let mut hasher = Sha256::new();
+    let mut count = 0_u64;
+    for (source_index, column) in source_columns.iter().enumerate() {
+        if column.hidden != 0
+            || PROVIDER_COLUMNS
+                .iter()
+                .any(|shared| shared.name == column.name)
+        {
+            continue;
+        }
+        count += 1;
+        hasher.update((column.name.len() as u64).to_le_bytes());
+        hasher.update(column.name.as_bytes());
+        hash_sql_value(&mut hasher, row.get_ref(source_offset + source_index)?);
+    }
+    hasher.update(count.to_le_bytes());
+    Ok(hasher.finalize().into())
+}
+
+fn provider_extension_for_identity(
+    connection: &Connection,
+    id: &str,
+    app_type: &str,
+    source_columns: &[ExistingColumn],
+) -> Result<Option<[u8; 32]>, rusqlite::Error> {
+    connection
+        .query_row(
+            "SELECT providers.* FROM main.providers AS providers
+             WHERE id COLLATE BINARY = ?1 AND app_type COLLATE BINARY = ?2",
+            [id, app_type],
+            |row| provider_extension_fingerprint(row, 0, source_columns),
+        )
+        .optional()
+}
+
+fn hash_sql_value(hasher: &mut Sha256, value: ValueRef<'_>) {
+    match value {
+        ValueRef::Null => hasher.update([0]),
+        ValueRef::Integer(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_le_bytes());
+        }
+        ValueRef::Real(value) => {
+            hasher.update([2]);
+            hasher.update(value.to_bits().to_le_bytes());
+        }
+        ValueRef::Text(value) => {
+            hasher.update([3]);
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+        ValueRef::Blob(value) => {
+            hasher.update([4]);
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+    }
 }
 
 fn resolve_database_path(path: PathBuf) -> Result<PathBuf, SharedStoreError> {
@@ -918,7 +995,9 @@ fn verify_base_provider_schema(columns: &[ExistingColumn]) -> Result<(), SharedS
     Ok(())
 }
 
-fn verify_provider_schema(connection: &Connection) -> Result<(), SharedStoreError> {
+fn verify_provider_schema(
+    connection: &Connection,
+) -> Result<Vec<ExistingColumn>, SharedStoreError> {
     let columns = provider_columns(connection)?;
     let mut primary_key = columns
         .iter()
@@ -965,7 +1044,7 @@ fn verify_provider_schema(connection: &Connection) -> Result<(), SharedStoreErro
             )));
         }
     }
-    Ok(())
+    Ok(columns)
 }
 
 fn verify_provider_primary_key_index(connection: &Connection) -> Result<(), SharedStoreError> {
@@ -1224,6 +1303,10 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE main.providers
                  ADD COLUMN future_column TEXT NOT NULL DEFAULT 'keep';
+                 ALTER TABLE main.providers
+                 ADD COLUMN \"host.name\" TEXT NOT NULL DEFAULT 'qualified';
+                 ALTER TABLE main.providers
+                 ADD COLUMN generated_name TEXT GENERATED ALWAYS AS (name) VIRTUAL;
                  CREATE TEMP TABLE providers AS
                  SELECT * FROM main.providers WHERE 0;",
             )
@@ -1308,6 +1391,47 @@ mod tests {
                 })
                 .expect("read temporary shadow"),
             0
+        );
+
+        connection
+            .execute_batch(
+                "PRAGMA short_column_names = OFF;
+                 PRAGMA full_column_names = ON;
+                 CREATE TRIGGER rewrite_dotted_extension
+                 BEFORE UPDATE OF name ON main.providers
+                 BEGIN
+                     UPDATE providers SET \"host.name\" = 'rewritten'
+                     WHERE id = NEW.id AND app_type = NEW.app_type;
+                     SELECT RAISE(IGNORE);
+                 END;",
+            )
+            .expect("create extension-rewriting host trigger");
+        let mut transaction = begin_immediate_transaction(&mut connection)
+            .expect("begin extension-guarded transaction");
+        assert_eq!(
+            update_provider_configuration(
+                &mut transaction,
+                "provider",
+                "claude",
+                "Rejected",
+                "rejected-settings",
+            )
+            .expect("guard provider extensions"),
+            ProviderWriteOutcome::NotApplied
+        );
+        transaction
+            .commit()
+            .expect("commit extension-guarded transaction");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT name, \"host.name\" FROM main.providers
+                     WHERE id = 'provider' AND app_type = 'claude'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("read extension-guarded provider"),
+            ("Imported".to_owned(), "qualified".to_owned())
         );
 
         let mut transaction =
