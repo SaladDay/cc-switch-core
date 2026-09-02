@@ -453,8 +453,8 @@ impl<E: Error + 'static> Error for SkillLiveRollbackError<E> {}
 /// commits. If the commit outcome is uncertain, it re-reads the row and uses
 /// [`SkillSwitchPlan::decide_catalog`] before releasing the live lock. Startup
 /// reconciliation follows the committed catalog; Core keeps no second
-/// selection store. A pending recovery must be reconciled before another
-/// user-requested target is accepted.
+/// selection store. Pending recovery or catalog/live drift must be reconciled
+/// before another user-requested target is accepted.
 pub fn prepare_skill_switch(
     catalog: &[SkillCatalogEntry],
     skill_id: &str,
@@ -514,13 +514,15 @@ fn prepare(
         .find(|state| state.app() == app)
         .expect("the requested runtime produces an application state");
     let recovery_pending = state.reason() == Some(SkillControlReason::RecoveryPending);
-    if recovery_pending && requested.is_some() {
+    let catalog_drift = state.reason() == Some(SkillControlReason::CatalogDrift);
+    let reconciliation_only = recovery_pending || catalog_drift;
+    if reconciliation_only && requested.is_some() {
         return Err(SkillPrepareError::Unavailable {
             app: app.as_str().to_owned(),
             reason: state.reason(),
         });
     }
-    if !recovery_pending {
+    if !reconciliation_only {
         state
             .enabled()
             .ok_or_else(|| SkillPrepareError::Unavailable {
@@ -535,7 +537,7 @@ fn prepare(
         })?;
     let target_enabled = requested.unwrap_or(selected);
 
-    if !recovery_pending {
+    if !reconciliation_only {
         let target_allowed = if target_enabled {
             state.can_enable()
         } else {
@@ -850,12 +852,11 @@ mod tests {
     fn gemini_switches_project_only_its_declared_document() {
         let temporary = tempdir().unwrap();
         let source = temporary.path().join("source");
-        let unified = temporary.path().join("unified");
         let native = temporary.path().join("native");
         write_skill(&source);
         let runtime = runtime(
             &source,
-            &unified,
+            &source,
             &native,
             AppType::Gemini,
             Some(ObservedDocument::present(
@@ -1066,7 +1067,31 @@ mod tests {
         let native = temporary.path().join("native");
         write_skill(&source);
         let original = b"{ theme: 'dark' }";
-        let runtime = runtime(
+        let baseline_runtime = runtime(
+            &source,
+            &unified,
+            &native,
+            AppType::Gemini,
+            Some(ObservedDocument::present(
+                LogicalTarget::GeminiSettings,
+                original,
+            )),
+        );
+        let baseline = prepare_skill_reconciliation(
+            &[entry(true)],
+            "owner/repo:demo",
+            &baseline_runtime,
+            &AppType::Gemini,
+        )
+        .unwrap();
+        let mut host = MemoryHost::default();
+        host.documents
+            .insert(LogicalTarget::GeminiSettings, original.to_vec());
+        execute_skill_live_plan(&baseline, &mut host)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let switch_runtime = runtime(
             &source,
             &unified,
             &native,
@@ -1079,16 +1104,14 @@ mod tests {
         let plan = prepare_skill_switch(
             &[entry(true)],
             "owner/repo:demo",
-            &runtime,
+            &switch_runtime,
             &AppType::Gemini,
             false,
         )
         .unwrap();
+        fs::remove_file(native.join("demo")).unwrap();
         fs::create_dir_all(native.join("demo")).unwrap();
         fs::write(native.join("demo/SKILL.md"), "external").unwrap();
-        let mut host = MemoryHost::default();
-        host.documents
-            .insert(LogicalTarget::GeminiSettings, original.to_vec());
 
         let error = execute_skill_live_plan(&plan, &mut host).unwrap_err();
 
@@ -1135,5 +1158,206 @@ mod tests {
             .unwrap();
         assert_eq!(state.enabled(), Some(true));
         assert!(state.writable());
+    }
+
+    #[test]
+    fn reconciliation_repairs_reference_drift_in_both_directions() {
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let unified = temporary.path().join("unified");
+        let native = temporary.path().join("native");
+        write_skill(&source);
+        let initial = runtime(&source, &unified, &native, AppType::Claude, None);
+
+        let snapshots = inspect_installed_skills(&[entry(true)], &initial).unwrap();
+        let state = snapshots[0].apps().next().unwrap();
+        assert_eq!(state.reason(), Some(SkillControlReason::CatalogDrift));
+
+        let enable = prepare_skill_switch(
+            &[entry(false)],
+            "owner/repo:demo",
+            &initial,
+            &AppType::Claude,
+            true,
+        )
+        .unwrap();
+        execute_skill_live_plan(&enable, &mut MemoryHost::default())
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let enabled_live = runtime(&source, &unified, &native, AppType::Claude, None);
+        let snapshots = inspect_installed_skills(&[entry(false)], &enabled_live).unwrap();
+        let state = snapshots[0].apps().next().unwrap();
+        assert_eq!(state.enabled(), Some(true));
+        assert_eq!(state.reason(), Some(SkillControlReason::CatalogDrift));
+        assert!(matches!(
+            prepare_skill_switch(
+                &[entry(false)],
+                "owner/repo:demo",
+                &enabled_live,
+                &AppType::Claude,
+                false,
+            ),
+            Err(SkillPrepareError::Unavailable {
+                reason: Some(SkillControlReason::CatalogDrift),
+                ..
+            })
+        ));
+        let disable = prepare_skill_reconciliation(
+            &[entry(false)],
+            "owner/repo:demo",
+            &enabled_live,
+            &AppType::Claude,
+        )
+        .unwrap();
+        execute_skill_live_plan(&disable, &mut MemoryHost::default())
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let disabled_live = runtime(&source, &unified, &native, AppType::Claude, None);
+        let enable = prepare_skill_reconciliation(
+            &[entry(true)],
+            "owner/repo:demo",
+            &disabled_live,
+            &AppType::Claude,
+        )
+        .unwrap();
+        execute_skill_live_plan(&enable, &mut MemoryHost::default())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let enabled_committed = runtime(&source, &unified, &native, AppType::Claude, None);
+        let disable = prepare_skill_switch(
+            &[entry(true)],
+            "owner/repo:demo",
+            &enabled_committed,
+            &AppType::Claude,
+            false,
+        )
+        .unwrap();
+        execute_skill_live_plan(&disable, &mut MemoryHost::default())
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let disabled_again = runtime(&source, &unified, &native, AppType::Claude, None);
+        let snapshots = inspect_installed_skills(&[entry(true)], &disabled_again).unwrap();
+        let state = snapshots[0].apps().next().unwrap();
+        assert_eq!(state.enabled(), Some(false));
+        assert_eq!(state.reason(), Some(SkillControlReason::CatalogDrift));
+        let restore = prepare_skill_reconciliation(
+            &[entry(true)],
+            "owner/repo:demo",
+            &disabled_again,
+            &AppType::Claude,
+        )
+        .unwrap();
+        execute_skill_live_plan(&restore, &mut MemoryHost::default())
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let restored = runtime(&source, &unified, &native, AppType::Claude, None);
+        let snapshots = inspect_installed_skills(&[entry(true)], &restored).unwrap();
+        let state = snapshots[0].apps().next().unwrap();
+        assert_eq!(state.enabled(), Some(true));
+        assert_eq!(state.reason(), None);
+    }
+
+    #[test]
+    fn direct_discovery_reconciles_configuration_without_creating_a_reference() {
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let native = temporary.path().join("native");
+        write_skill(&source);
+        let enabled = b"{ skills: { disabled: [] } }";
+        let initial = runtime(
+            &source,
+            &source,
+            &native,
+            AppType::Gemini,
+            Some(ObservedDocument::present(
+                LogicalTarget::GeminiSettings,
+                enabled,
+            )),
+        );
+        let snapshots = inspect_installed_skills(&[entry(false)], &initial).unwrap();
+        assert_eq!(
+            snapshots[0].apps().next().unwrap().reason(),
+            Some(SkillControlReason::CatalogDrift)
+        );
+
+        let disable = prepare_skill_reconciliation(
+            &[entry(false)],
+            "owner/repo:demo",
+            &initial,
+            &AppType::Gemini,
+        )
+        .unwrap();
+        assert!(disable.reference().is_none());
+        assert!(disable.configuration().is_some());
+        let mut host = MemoryHost::default();
+        host.documents
+            .insert(LogicalTarget::GeminiSettings, enabled.to_vec());
+        execute_skill_live_plan(&disable, &mut host)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let disabled = host
+            .documents
+            .get(&LogicalTarget::GeminiSettings)
+            .unwrap()
+            .clone();
+        let disabled_runtime = runtime(
+            &source,
+            &source,
+            &native,
+            AppType::Gemini,
+            Some(ObservedDocument::present(
+                LogicalTarget::GeminiSettings,
+                disabled,
+            )),
+        );
+        let snapshots = inspect_installed_skills(&[entry(false)], &disabled_runtime).unwrap();
+        let state = snapshots[0].apps().next().unwrap();
+        assert_eq!(state.enabled(), Some(false));
+        assert_eq!(state.reason(), None);
+
+        let enable = prepare_skill_reconciliation(
+            &[entry(true)],
+            "owner/repo:demo",
+            &disabled_runtime,
+            &AppType::Gemini,
+        )
+        .unwrap();
+        assert!(enable.reference().is_none());
+        assert!(enable.configuration().is_some());
+        execute_skill_live_plan(&enable, &mut host)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let enabled = host
+            .documents
+            .get(&LogicalTarget::GeminiSettings)
+            .unwrap()
+            .clone();
+        let enabled_runtime = runtime(
+            &source,
+            &source,
+            &native,
+            AppType::Gemini,
+            Some(ObservedDocument::present(
+                LogicalTarget::GeminiSettings,
+                enabled,
+            )),
+        );
+        let snapshots = inspect_installed_skills(&[entry(true)], &enabled_runtime).unwrap();
+        let state = snapshots[0].apps().next().unwrap();
+        assert_eq!(state.enabled(), Some(true));
+        assert_eq!(state.reason(), None);
     }
 }

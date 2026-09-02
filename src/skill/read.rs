@@ -466,6 +466,7 @@ pub enum SkillControlReason {
     MissingSource,
     InvalidSource,
     RecoveryPending,
+    CatalogDrift,
     NativeConflict,
     UnifiedConflict,
     ObservationFailed,
@@ -608,7 +609,15 @@ fn inspect_entry(
                 PathRelation::Missing
             };
             apps.iter()
-                .map(|app| inspect_app(entry, app, &source, &unified))
+                .map(|app| {
+                    inspect_app(
+                        entry,
+                        app,
+                        &source,
+                        &unified,
+                        runtime.source_root == runtime.unified_root,
+                    )
+                })
                 .collect()
         }
         SourceObservation::Missing => apps
@@ -656,6 +665,7 @@ fn inspect_app(
     prepared: &PreparedApp<'_>,
     source: &ReadySource,
     unified: &PathRelation,
+    source_is_unified: bool,
 ) -> SkillAppState {
     let runtime = prepared.runtime;
     let descriptor = builtin_app_registry().for_app(&runtime.app);
@@ -703,6 +713,18 @@ fn inspect_app(
             | NativeSkillControl::ExternallyDisabled,
         ) => false,
     };
+    let direct_reference_noop = contract.discovery().reads_unified_store() && source_is_unified;
+    if catalog_components_drift(selected, native, direct_reference_noop, control) {
+        return SkillAppState {
+            app: runtime.app.clone(),
+            selected,
+            enabled: Some(enabled),
+            writable: false,
+            can_enable: false,
+            can_disable: false,
+            reason: Some(SkillControlReason::CatalogDrift),
+        };
+    }
     let reason = match control {
         Some(NativeSkillControl::Required) => Some(SkillControlReason::Required),
         Some(NativeSkillControl::GloballyDisabled) => Some(SkillControlReason::GloballyDisabled),
@@ -731,6 +753,35 @@ fn inspect_app(
         can_disable,
         reason,
     }
+}
+
+fn catalog_components_drift(
+    selected: Option<bool>,
+    native: PathRelation,
+    direct_reference_noop: bool,
+    control: Option<NativeSkillControl>,
+) -> bool {
+    let Some(selected) = selected else {
+        return false;
+    };
+    let committed_target_is_constrained = matches!(
+        (selected, control),
+        (false, Some(NativeSkillControl::Required))
+            | (
+                true,
+                Some(NativeSkillControl::GloballyDisabled | NativeSkillControl::ExternallyDisabled)
+            )
+    );
+    if committed_target_is_constrained {
+        return false;
+    }
+
+    let reference_drift = !direct_reference_noop && native.is_selected() != selected;
+    let configuration_drift = matches!(
+        (selected, control),
+        (false, Some(NativeSkillControl::Enabled)) | (true, Some(NativeSkillControl::Disabled))
+    );
+    reference_drift || configuration_drift
 }
 
 fn state_unavailable(
@@ -1201,7 +1252,28 @@ mod tests {
     }
 
     #[test]
-    fn native_controls_resolve_effective_state() {
+    fn catalog_drift_preserves_unimplementable_native_constraints() {
+        assert!(!catalog_components_drift(
+            Some(false),
+            PathRelation::Selected,
+            false,
+            Some(NativeSkillControl::Required),
+        ));
+        for control in [
+            NativeSkillControl::GloballyDisabled,
+            NativeSkillControl::ExternallyDisabled,
+        ] {
+            assert!(!catalog_components_drift(
+                Some(true),
+                PathRelation::Missing,
+                false,
+                Some(control),
+            ));
+        }
+    }
+
+    #[test]
+    fn native_controls_report_catalog_drift_separately_from_effective_state() {
         let temp = tempdir().expect("tempdir");
         let unified = temp.path().join("unified");
         let native = temp.path().join("native");
@@ -1223,8 +1295,8 @@ mod tests {
             inspect_installed_skills(&[catalog_entry("demo", true)], &runtime).expect("snapshots");
         let gemini = state(&snapshots[0], &AppType::Gemini);
         assert_eq!(gemini.enabled(), Some(false));
-        assert!(gemini.writable());
-        assert_eq!(gemini.reason(), None);
+        assert!(!gemini.writable());
+        assert_eq!(gemini.reason(), Some(SkillControlReason::CatalogDrift));
     }
 
     #[test]
