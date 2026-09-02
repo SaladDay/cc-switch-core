@@ -259,13 +259,14 @@ pub(super) fn inspect_skill_reference(
     app: &AppType,
     skill_id: &str,
     directory: &str,
-    source: &Path,
+    source_root: &Path,
+    expected_source: Option<&Path>,
     destination_root: &Path,
 ) -> SkillReferenceObservation {
     let plan = SkillReferencePlan::new(
         skill_id,
         app.clone(),
-        source.parent().unwrap_or(source),
+        source_root,
         destination_root,
         state_root,
         directory,
@@ -275,8 +276,8 @@ pub(super) fn inspect_skill_reference(
         Ok(paths) => paths,
         Err(_) => return SkillReferenceObservation::Unreadable,
     };
-    let expected_source = match fs::canonicalize(source) {
-        Ok(source) => path_fingerprint(&source),
+    let expected_source = match expected_source.map(fs::canonicalize).transpose() {
+        Ok(source) => source.map(|source| path_fingerprint(&source)),
         Err(_) => return SkillReferenceObservation::Unreadable,
     };
     match inspect_reference_machine(&plan, &paths) {
@@ -286,7 +287,9 @@ pub(super) fn inspect_skill_reference(
         Ok(ReferenceInspection::Stable(state))
             if state.location == ManagedLocation::Destination
                 && state.anchor_reachable
-                && state.anchor_source.as_deref() == Some(&expected_source) =>
+                && expected_source
+                    .as_deref()
+                    .is_some_and(|source| state.anchor_source.as_deref() == Some(source)) =>
         {
             SkillReferenceObservation::ManagedPresent
         }
@@ -311,13 +314,19 @@ pub struct SkillReferenceReceipt {
     paths: ReferencePaths,
     plan: SkillReferencePlan,
     previous: ManagedState,
-    target_source: String,
+    target_source: Option<String>,
 }
 
 impl SkillReferenceReceipt {
     pub fn verify(&self) -> Result<(), SkillReferenceError> {
         let state = managed_state(&self.plan, &self.paths)?;
         if self.plan.enabled {
+            let target_source =
+                self.target_source
+                    .as_deref()
+                    .ok_or_else(|| SkillReferenceError::Conflict {
+                        path: self.paths.owner.clone(),
+                    })?;
             let owner = state
                 .owner
                 .as_ref()
@@ -325,9 +334,9 @@ impl SkillReferenceReceipt {
                     path: self.paths.owner.clone(),
                 })?;
             if state.location != ManagedLocation::Destination
-                || state.anchor_source.as_deref() != Some(&self.target_source)
+                || state.anchor_source.as_deref() != Some(target_source)
                 || !state.anchor_reachable
-                || owner.source != self.target_source
+                || owner.source != target_source
                 || owner.pending_source.is_some()
                 || owner.reference_identity.is_none()
                 || owner.anchor_identity.is_none()
@@ -374,21 +383,25 @@ impl SkillReferenceReceipt {
 /// root, then atomically moves the public entry into place without replacement.
 /// Later switches leave that entry untouched and change only its private
 /// anchor. Disabling makes the public entry resolve to no Skill without
-/// deleting or moving it.
+/// deleting or moving it, and does not require the current source to exist.
 pub fn apply_skill_reference(
     plan: &SkillReferencePlan,
 ) -> Result<SkillReferenceReceipt, SkillReferenceError> {
     let paths = prepare_paths(plan)?;
-    let source = fs::canonicalize(&paths.source)
-        .map_err(|source| SkillReferenceError::io(&paths.source, source))?;
-    let target_source = path_fingerprint(&source);
+    let target = if plan.enabled {
+        let source = fs::canonicalize(&paths.source)
+            .map_err(|error| SkillReferenceError::io(&paths.source, error))?;
+        let fingerprint = path_fingerprint(&source);
+        Some((source, fingerprint))
+    } else {
+        None
+    };
     recover_reference_state(plan, &paths)?;
     let previous = managed_state(plan, &paths)?;
 
-    let applied = if plan.enabled {
-        converge_enabled(plan, &paths, &source, &target_source)
-    } else {
-        converge_disabled(plan, &paths)
+    let applied = match target.as_ref() {
+        Some((source, fingerprint)) => converge_enabled(plan, &paths, source, fingerprint),
+        None => converge_disabled(plan, &paths),
     };
     if let Err(error) = applied {
         return match restore_previous(&paths, plan, &previous) {
@@ -403,7 +416,7 @@ pub fn apply_skill_reference(
         paths,
         plan: plan.clone(),
         previous,
-        target_source,
+        target_source: target.map(|(_, fingerprint)| fingerprint),
     })
 }
 
@@ -414,7 +427,9 @@ fn prepare_paths(plan: &SkillReferencePlan) -> Result<ReferencePaths, SkillRefer
         }
     }
     let paths = build_paths(plan)?;
-    validate_source(&paths.source)?;
+    if plan.enabled {
+        validate_source(&paths.source)?;
+    }
     validate_root_pair(&plan.source_root, &plan.destination_root)?;
     validate_root_pair(&plan.source_root, &plan.state_root)?;
     validate_root_pair(&plan.destination_root, &plan.state_root)?;
@@ -2536,7 +2551,8 @@ mod tests {
                 &AppType::Claude,
                 "owner/repo:demo",
                 "demo",
-                &other,
+                other.parent().unwrap(),
+                Some(&other),
                 &destination,
             ),
             SkillReferenceObservation::ManagedStale

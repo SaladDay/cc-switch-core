@@ -523,7 +523,13 @@ fn prepare(
             reason: state.reason(),
         });
     }
-    if !reconciliation_only {
+    let selected = state
+        .selected()
+        .ok_or_else(|| SkillPrepareError::SelectionUnavailable {
+            app: app.as_str().to_owned(),
+        })?;
+    let target_enabled = requested.unwrap_or(selected);
+    if !reconciliation_only && target_enabled {
         state
             .enabled()
             .ok_or_else(|| SkillPrepareError::Unavailable {
@@ -531,13 +537,6 @@ fn prepare(
                 reason: state.reason(),
             })?;
     }
-    let selected = state
-        .selected()
-        .ok_or_else(|| SkillPrepareError::SelectionUnavailable {
-            app: app.as_str().to_owned(),
-        })?;
-    let target_enabled = requested.unwrap_or(selected);
-
     if !reconciliation_only {
         let target_allowed = if target_enabled {
             state.can_enable()
@@ -1160,6 +1159,66 @@ mod tests {
             .unwrap();
         assert_eq!(state.enabled(), Some(true));
         assert!(state.writable());
+    }
+
+    #[test]
+    fn reconciliation_disables_an_old_reference_without_the_current_source() {
+        let temporary = tempdir().unwrap();
+        let old_source = temporary.path().join("old-source");
+        let missing_source = temporary.path().join("missing-source");
+        let unified = temporary.path().join("unified");
+        let native = temporary.path().join("native");
+        write_skill(&old_source);
+        let initial = runtime(&old_source, &unified, &native, AppType::Claude, None);
+        let enable = prepare_skill_switch(
+            &[entry(false)],
+            "owner/repo:demo",
+            &initial,
+            &AppType::Claude,
+            true,
+        )
+        .unwrap();
+        execute_skill_live_plan(&enable, &mut MemoryHost::default())
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let relocated = runtime(&missing_source, &unified, &native, AppType::Claude, None);
+        let unavailable = inspect_installed_skills(&[entry(true)], &relocated).unwrap();
+        let state = unavailable[0].apps().next().unwrap();
+        assert_eq!(state.reason(), Some(SkillControlReason::MissingSource));
+        assert!(state.can_disable());
+        let requested_disable = prepare_skill_switch(
+            &[entry(true)],
+            "owner/repo:demo",
+            &relocated,
+            &AppType::Claude,
+            false,
+        )
+        .unwrap();
+        assert!(!requested_disable.target_enabled());
+
+        let snapshots = inspect_installed_skills(&[entry(false)], &relocated).unwrap();
+        let state = snapshots[0].apps().next().unwrap();
+        assert_eq!(state.enabled(), Some(true));
+        assert_eq!(
+            state.reason(),
+            Some(SkillControlReason::ManagedReferenceDrift)
+        );
+
+        let disable = prepare_skill_reconciliation(
+            &[entry(false)],
+            "owner/repo:demo",
+            &relocated,
+            &AppType::Claude,
+        )
+        .unwrap();
+        assert!(!disable.reference().unwrap().enabled());
+        execute_skill_live_plan(&disable, &mut MemoryHost::default())
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert!(!native.join("demo/SKILL.md").exists());
     }
 
     #[test]

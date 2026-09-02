@@ -619,23 +619,21 @@ fn inspect_entry(
                         app,
                         &source,
                         &unified,
+                        &runtime.source_root,
                         runtime.source_root == runtime.unified_root,
                     )
                 })
                 .collect()
         }
-        SourceObservation::Missing => apps
-            .iter()
-            .map(|app| unavailable_state(entry, app.runtime, SkillControlReason::MissingSource))
-            .collect(),
-        SourceObservation::Invalid => apps
-            .iter()
-            .map(|app| unavailable_state(entry, app.runtime, SkillControlReason::InvalidSource))
-            .collect(),
-        SourceObservation::Unreadable => apps
-            .iter()
-            .map(|app| unavailable_state(entry, app.runtime, SkillControlReason::ObservationFailed))
-            .collect(),
+        SourceObservation::Missing => {
+            inspect_apps_without_source(entry, runtime, apps, SkillControlReason::MissingSource)
+        }
+        SourceObservation::Invalid => {
+            inspect_apps_without_source(entry, runtime, apps, SkillControlReason::InvalidSource)
+        }
+        SourceObservation::Unreadable => {
+            inspect_apps_without_source(entry, runtime, apps, SkillControlReason::ObservationFailed)
+        }
     };
 
     InstalledSkillSnapshot {
@@ -647,20 +645,85 @@ fn inspect_entry(
     }
 }
 
-fn unavailable_state(
+fn inspect_apps_without_source(
     entry: &SkillCatalogEntry,
-    runtime: &SkillAppRuntime,
+    runtime: &SkillRuntime,
+    apps: &[PreparedApp<'_>],
     reason: SkillControlReason,
+) -> Vec<SkillAppState> {
+    apps.iter()
+        .map(|app| inspect_app_without_source(entry, runtime, app, reason))
+        .collect()
+}
+
+fn inspect_app_without_source(
+    entry: &SkillCatalogEntry,
+    skill_runtime: &SkillRuntime,
+    prepared: &PreparedApp<'_>,
+    source_reason: SkillControlReason,
 ) -> SkillAppState {
+    let runtime = prepared.runtime;
     let selected = entry.selected_for(&runtime.app);
+    let native = inspect_native_relation(entry, runtime, &skill_runtime.source_root, None);
+    if native.is_unreadable() || native.is_external() {
+        return state_unavailable(runtime, selected, source_reason);
+    }
+    let control = match prepared.controls.as_ref() {
+        None => None,
+        Some(Ok(controls)) => Some(controls.control_for(entry.name(), entry.directory())),
+        Some(Err(())) => {
+            return state_unavailable(runtime, selected, SkillControlReason::InvalidConfiguration)
+        }
+    };
+    if selected == Some(false) && control != Some(NativeSkillControl::Required) {
+        let drift = if native.is_recoverable() {
+            Some(SkillControlReason::RecoveryPending)
+        } else if native.is_present() {
+            Some(SkillControlReason::ManagedReferenceDrift)
+        } else if control == Some(NativeSkillControl::Enabled) {
+            Some(SkillControlReason::CatalogDrift)
+        } else {
+            None
+        };
+        if let Some(reason) = drift {
+            let enabled = match control {
+                None | Some(NativeSkillControl::Enabled | NativeSkillControl::Required) => {
+                    native.is_present()
+                }
+                Some(
+                    NativeSkillControl::Disabled
+                    | NativeSkillControl::GloballyDisabled
+                    | NativeSkillControl::ExternallyDisabled,
+                ) => false,
+            };
+            return SkillAppState {
+                app: runtime.app.clone(),
+                selected,
+                enabled: Some(enabled),
+                writable: false,
+                can_enable: false,
+                can_disable: false,
+                reason: Some(reason),
+            };
+        }
+    }
+    let direct_reference_noop = builtin_app_registry()
+        .for_app(&runtime.app)
+        .skill_contract()
+        .is_some_and(|contract| {
+            contract.discovery().reads_unified_store()
+                && skill_runtime.source_root == skill_runtime.unified_root
+        });
+    let can_disable = control != Some(NativeSkillControl::Required)
+        && !(direct_reference_noop && control.is_none());
     SkillAppState {
         app: runtime.app.clone(),
         selected,
         enabled: None,
         writable: false,
         can_enable: false,
-        can_disable: false,
-        reason: Some(reason),
+        can_disable,
+        reason: Some(source_reason),
     }
 }
 
@@ -669,6 +732,7 @@ fn inspect_app(
     prepared: &PreparedApp<'_>,
     source: &ReadySource,
     unified: &PathRelation,
+    source_root: &Path,
     source_is_unified: bool,
 ) -> SkillAppState {
     let runtime = prepared.runtime;
@@ -677,7 +741,7 @@ fn inspect_app(
         .skill_contract()
         .expect("Skill runtime construction requires a contract");
     let selected = entry.selected_for(&runtime.app);
-    let native = inspect_native_relation(entry, runtime, &source.path);
+    let native = inspect_native_relation(entry, runtime, source_root, Some(&source.path));
     if native.is_recoverable() {
         return state_unavailable(runtime, selected, SkillControlReason::RecoveryPending);
     }
@@ -947,14 +1011,16 @@ fn inspect_direct_relation(source: &ReadySource, root: &Path, directory: &str) -
 fn inspect_native_relation(
     entry: &SkillCatalogEntry,
     runtime: &SkillAppRuntime,
-    source: &Path,
+    source_root: &Path,
+    expected_source: Option<&Path>,
 ) -> PathRelation {
     match inspect_skill_reference(
         &runtime.state_root,
         &runtime.app,
         entry.id(),
         entry.directory(),
-        source,
+        source_root,
+        expected_source,
         &runtime.native_root,
     ) {
         SkillReferenceObservation::Missing | SkillReferenceObservation::ManagedMissing => {
