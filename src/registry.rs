@@ -6,7 +6,7 @@ use crate::{
     mcp::{
         McpAppContract, CLAUDE_MCP, CODEX_MCP, GEMINI_MCP, GROKBUILD_MCP, HERMES_MCP, OPENCODE_MCP,
     },
-    AppType,
+    AppType, SkillAppContract, SkillConfigTarget, SkillDiscovery,
 };
 
 /// A product-facing capability declared by an application.
@@ -53,6 +53,8 @@ pub struct AppDescriptor {
     #[serde(skip_serializing)]
     mcp_contract: Option<&'static McpAppContract>,
     #[serde(skip_serializing)]
+    skill_contract: Option<SkillAppContract>,
+    #[serde(skip_serializing)]
     aliases: &'static [&'static str],
 }
 
@@ -74,12 +76,18 @@ impl AppDescriptor {
             configuration_mode,
             capabilities,
             mcp_contract: None,
+            skill_contract: None,
             aliases,
         }
     }
 
     const fn with_mcp(mut self, contract: &'static McpAppContract) -> Self {
         self.mcp_contract = Some(contract);
+        self
+    }
+
+    const fn with_skills(mut self, contract: SkillAppContract) -> Self {
+        self.skill_contract = Some(contract);
         self
     }
 
@@ -121,6 +129,11 @@ impl AppDescriptor {
     /// Returns the native MCP contract declared by this application.
     pub fn mcp_contract(&self) -> Option<&'static McpAppContract> {
         self.mcp_contract
+    }
+
+    /// Returns the application's installed-Skill behavior, when supported.
+    pub const fn skill_contract(&self) -> Option<SkillAppContract> {
+        self.skill_contract
     }
 
     fn matches_id(&self, normalized: &str) -> bool {
@@ -207,6 +220,9 @@ const PROVIDER_LIVE: &[AppCapability] = &[
 
 static BUILTIN_APP_REGISTRY: BuiltinAppRegistry = BuiltinAppRegistry { _private: () };
 
+use SkillConfigTarget::{GeminiSettings, GrokConfig, HermesConfig};
+use SkillDiscovery::{NativeAndUnified, NativeOnly};
+
 static CLAUDE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::Claude,
     "claude",
@@ -216,7 +232,12 @@ static CLAUDE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
     &[],
 )
-.with_mcp(&CLAUDE_MCP);
+.with_mcp(&CLAUDE_MCP)
+.with_skills(SkillAppContract::catalog(
+    "enabled_claude",
+    NativeOnly,
+    None,
+));
 
 static CLAUDE_DESKTOP_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::ClaudeDesktop,
@@ -237,7 +258,12 @@ static CODEX_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
     &[],
 )
-.with_mcp(&CODEX_MCP);
+.with_mcp(&CODEX_MCP)
+.with_skills(SkillAppContract::catalog(
+    "enabled_codex",
+    NativeAndUnified,
+    None,
+));
 
 static GEMINI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::Gemini,
@@ -248,7 +274,12 @@ static GEMINI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_COMMON_PROXY_MCP_PROMPTS_SKILLS,
     &[],
 )
-.with_mcp(&GEMINI_MCP);
+.with_mcp(&GEMINI_MCP)
+.with_skills(SkillAppContract::catalog(
+    "enabled_gemini",
+    NativeAndUnified,
+    Some(GeminiSettings),
+));
 
 static GROKBUILD_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::GrokBuild,
@@ -259,7 +290,12 @@ static GROKBUILD_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_PROXY_MCP_PROMPTS_SKILLS,
     &["grok-build", "grok_build", "grok"],
 )
-.with_mcp(&GROKBUILD_MCP);
+.with_mcp(&GROKBUILD_MCP)
+.with_skills(SkillAppContract::catalog(
+    "enabled_grokbuild",
+    NativeAndUnified,
+    Some(GrokConfig),
+));
 
 static OPENCODE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::OpenCode,
@@ -270,7 +306,12 @@ static OPENCODE_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_MCP_PROMPTS_SKILLS,
     &[],
 )
-.with_mcp(&OPENCODE_MCP);
+.with_mcp(&OPENCODE_MCP)
+.with_skills(SkillAppContract::catalog(
+    "enabled_opencode",
+    NativeAndUnified,
+    None,
+));
 
 static OPENCLAW_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::OpenClaw,
@@ -291,7 +332,12 @@ static HERMES_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     PROVIDER_LIVE_MCP_PROMPTS_SKILLS,
     &[],
 )
-.with_mcp(&HERMES_MCP);
+.with_mcp(&HERMES_MCP)
+.with_skills(SkillAppContract::catalog(
+    "enabled_hermes",
+    NativeOnly,
+    Some(HermesConfig),
+));
 
 static PI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     AppType::Pi,
@@ -301,7 +347,12 @@ static PI_DESCRIPTOR: AppDescriptor = AppDescriptor::new(
     ProviderConfigurationMode::Additive,
     PROVIDER_LIVE_PROMPTS_SKILLS,
     &[],
-);
+)
+.with_skills(SkillAppContract::catalog(
+    "enabled_pi",
+    NativeAndUnified,
+    None,
+));
 
 static BUILTIN_APP_DESCRIPTORS: [&AppDescriptor; 9] = [
     &CLAUDE_DESCRIPTOR,
@@ -497,6 +548,126 @@ mod tests {
             let descriptor = registry.find(id).expect("expected built-in descriptor");
             assert_eq!(descriptor.configuration_mode(), *mode, "{id}");
             assert_eq!(descriptor.capabilities(), *capabilities, "{id}");
+        }
+    }
+
+    #[test]
+    fn skill_capabilities_have_exactly_one_contract() {
+        for descriptor in builtin_app_registry().descriptors() {
+            assert_eq!(
+                descriptor.supports(AppCapability::Skills),
+                descriptor.skill_contract().is_some(),
+                "{}",
+                descriptor.id()
+            );
+        }
+    }
+
+    #[test]
+    fn skill_contract_matrix_is_stable() {
+        let catalog = crate::SkillCatalogColumn::new;
+
+        let actual = builtin_app_registry()
+            .descriptors()
+            .filter_map(|descriptor| {
+                descriptor.skill_contract().map(|contract| {
+                    (
+                        descriptor.id(),
+                        contract.catalog_column(),
+                        contract.discovery(),
+                        contract.config_target(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            [
+                ("claude", catalog("enabled_claude"), NativeOnly, None),
+                ("codex", catalog("enabled_codex"), NativeAndUnified, None,),
+                (
+                    "gemini",
+                    catalog("enabled_gemini"),
+                    NativeAndUnified,
+                    Some(GeminiSettings),
+                ),
+                (
+                    "grokbuild",
+                    catalog("enabled_grokbuild"),
+                    NativeAndUnified,
+                    Some(GrokConfig),
+                ),
+                (
+                    "opencode",
+                    catalog("enabled_opencode"),
+                    NativeAndUnified,
+                    None,
+                ),
+                (
+                    "hermes",
+                    catalog("enabled_hermes"),
+                    NativeOnly,
+                    Some(HermesConfig),
+                ),
+                ("pi", catalog("enabled_pi"), NativeAndUnified, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn skill_catalog_columns_are_unique_safe_identifiers() {
+        let mut columns = HashSet::new();
+        for descriptor in builtin_app_registry().descriptors() {
+            let Some(column) = descriptor
+                .skill_contract()
+                .map(SkillAppContract::catalog_column)
+            else {
+                continue;
+            };
+            assert!(
+                column.as_str().starts_with("enabled_")
+                    && column
+                        .as_str()
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "{}",
+                column.as_str()
+            );
+            assert!(
+                columns.insert(column),
+                "duplicate column {}",
+                column.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn pi_selection_is_catalog_backed_and_discovery_is_independent() {
+        let contract = builtin_app_registry()
+            .for_app(&AppType::Pi)
+            .skill_contract()
+            .expect("Pi supports Skills");
+
+        assert_eq!(contract.catalog_column().as_str(), "enabled_pi");
+        assert!(contract.discovery().reads_unified_store());
+    }
+
+    #[test]
+    fn skill_config_targets_belong_to_the_declaring_app() {
+        for descriptor in builtin_app_registry().descriptors() {
+            let Some(target) = descriptor
+                .skill_contract()
+                .and_then(SkillAppContract::config_target)
+            else {
+                continue;
+            };
+            assert_eq!(
+                target.logical_target().app(),
+                descriptor.app().clone(),
+                "{}",
+                descriptor.id()
+            );
         }
     }
 

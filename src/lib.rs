@@ -22,6 +22,7 @@ pub mod fs;
 pub mod gemini;
 pub mod grokbuild;
 pub mod hermes;
+mod json5_patch;
 mod mcp;
 mod native_import;
 pub mod openclaw;
@@ -32,6 +33,8 @@ mod projection;
 mod provider;
 mod registry;
 mod simple_provider;
+mod skill;
+mod yaml_patch;
 
 pub use adapter::{builtin_app_adapter, builtin_app_adapters, AppAdapter};
 pub use app_type::{AppType, ParseAppTypeError};
@@ -69,4 +72,15 @@ pub use simple_provider::{
     project_simple_provider_settings, simple_provider_form, SimpleProviderError,
     SimpleProviderField, SimpleProviderFieldDescriptor, SimpleProviderFormDescriptor,
     SimpleProviderPreset, SimpleProviderProtocol, SimpleProviderValues,
+};
+pub use skill::{
+    apply_skill_reference, execute_skill_live_plan, inspect_installed_skills,
+    prepare_skill_reconciliation, prepare_skill_switch, skill_catalog_columns,
+    InstalledSkillSnapshot, SkillAppContract, SkillAppRuntime, SkillAppState, SkillCatalogChange,
+    SkillCatalogColumn, SkillCatalogDecision, SkillCatalogEntry, SkillCatalogEntryError,
+    SkillCatalogGuard, SkillConfigTarget, SkillControlReason, SkillDiscovery,
+    SkillLiveExecutionError, SkillLiveFailure, SkillLiveReceipt, SkillLiveRollbackError,
+    SkillLiveRollbackFailure, SkillPrepareError, SkillReadError, SkillReferenceError,
+    SkillReferencePlan, SkillReferenceReceipt, SkillRuntime, SkillRuntimeError, SkillSwitchPlan,
+    SkillWriteOrder,
 };
