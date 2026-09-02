@@ -466,6 +466,7 @@ pub enum SkillControlReason {
     MissingSource,
     InvalidSource,
     RecoveryPending,
+    ManagedReferenceDrift,
     CatalogDrift,
     NativeConflict,
     UnifiedConflict,
@@ -696,7 +697,7 @@ fn inspect_app(
         return state_unavailable(runtime, selected, SkillControlReason::UnifiedConflict);
     }
 
-    let present = native.is_selected() || direct.is_selected();
+    let present = native.is_present() || direct.is_selected();
     let control = match prepared.controls.as_ref() {
         None => None,
         Some(Ok(controls)) => Some(controls.control_for(entry.name(), entry.directory())),
@@ -714,7 +715,7 @@ fn inspect_app(
         ) => false,
     };
     let direct_reference_noop = contract.discovery().reads_unified_store() && source_is_unified;
-    if catalog_components_drift(selected, native, direct_reference_noop, control) {
+    if let Some(drift) = catalog_component_drift(selected, native, direct_reference_noop, control) {
         return SkillAppState {
             app: runtime.app.clone(),
             selected,
@@ -722,7 +723,10 @@ fn inspect_app(
             writable: false,
             can_enable: false,
             can_disable: false,
-            reason: Some(SkillControlReason::CatalogDrift),
+            reason: Some(match drift {
+                CatalogComponentDrift::Reference => SkillControlReason::ManagedReferenceDrift,
+                CatalogComponentDrift::Configuration => SkillControlReason::CatalogDrift,
+            }),
         };
     }
     let reason = match control {
@@ -755,15 +759,19 @@ fn inspect_app(
     }
 }
 
-fn catalog_components_drift(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogComponentDrift {
+    Reference,
+    Configuration,
+}
+
+fn catalog_component_drift(
     selected: Option<bool>,
     native: PathRelation,
     direct_reference_noop: bool,
     control: Option<NativeSkillControl>,
-) -> bool {
-    let Some(selected) = selected else {
-        return false;
-    };
+) -> Option<CatalogComponentDrift> {
+    let selected = selected?;
     let committed_target_is_constrained = matches!(
         (selected, control),
         (false, Some(NativeSkillControl::Required))
@@ -773,15 +781,22 @@ fn catalog_components_drift(
             )
     );
     if committed_target_is_constrained {
-        return false;
+        return None;
     }
 
-    let reference_drift = !direct_reference_noop && native.is_selected() != selected;
+    let reference_drift = if direct_reference_noop {
+        native.is_present()
+    } else {
+        native == PathRelation::Stale || native.is_selected() != selected
+    };
+    if reference_drift {
+        return Some(CatalogComponentDrift::Reference);
+    }
     let configuration_drift = matches!(
         (selected, control),
         (false, Some(NativeSkillControl::Enabled)) | (true, Some(NativeSkillControl::Disabled))
     );
-    reference_drift || configuration_drift
+    configuration_drift.then_some(CatalogComponentDrift::Configuration)
 }
 
 fn state_unavailable(
@@ -878,6 +893,7 @@ fn inspect_source(path: &Path, budget: &mut SnapshotBudget) -> SourceObservation
 enum PathRelation {
     Missing,
     Selected,
+    Stale,
     Recoverable,
     External,
     Blocked,
@@ -887,6 +903,10 @@ enum PathRelation {
 impl PathRelation {
     fn is_selected(self) -> bool {
         self == Self::Selected
+    }
+
+    fn is_present(self) -> bool {
+        matches!(self, Self::Selected | Self::Stale)
     }
 
     fn is_external(self) -> bool {
@@ -938,6 +958,7 @@ fn inspect_native_relation(
             PathRelation::Missing
         }
         SkillReferenceObservation::ManagedPresent => PathRelation::Selected,
+        SkillReferenceObservation::ManagedStale => PathRelation::Stale,
         SkillReferenceObservation::RecoveryPending => PathRelation::Recoverable,
         SkillReferenceObservation::Unmanaged => PathRelation::External,
         SkillReferenceObservation::Conflict => PathRelation::Blocked,
@@ -1253,22 +1274,23 @@ mod tests {
 
     #[test]
     fn catalog_drift_preserves_unimplementable_native_constraints() {
-        assert!(!catalog_components_drift(
-            Some(false),
-            PathRelation::Selected,
-            false,
-            Some(NativeSkillControl::Required),
-        ));
+        assert_eq!(
+            catalog_component_drift(
+                Some(false),
+                PathRelation::Selected,
+                false,
+                Some(NativeSkillControl::Required),
+            ),
+            None
+        );
         for control in [
             NativeSkillControl::GloballyDisabled,
             NativeSkillControl::ExternallyDisabled,
         ] {
-            assert!(!catalog_components_drift(
-                Some(true),
-                PathRelation::Missing,
-                false,
-                Some(control),
-            ));
+            assert_eq!(
+                catalog_component_drift(Some(true), PathRelation::Missing, false, Some(control),),
+                None
+            );
         }
     }
 

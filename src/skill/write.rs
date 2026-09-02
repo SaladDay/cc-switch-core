@@ -514,8 +514,9 @@ fn prepare(
         .find(|state| state.app() == app)
         .expect("the requested runtime produces an application state");
     let recovery_pending = state.reason() == Some(SkillControlReason::RecoveryPending);
+    let managed_reference_drift = state.reason() == Some(SkillControlReason::ManagedReferenceDrift);
     let catalog_drift = state.reason() == Some(SkillControlReason::CatalogDrift);
-    let reconciliation_only = recovery_pending || catalog_drift;
+    let reconciliation_only = recovery_pending || managed_reference_drift || catalog_drift;
     if reconciliation_only && requested.is_some() {
         return Err(SkillPrepareError::Unavailable {
             app: app.as_str().to_owned(),
@@ -558,17 +559,18 @@ fn prepare(
         .expect("Skill runtimes require an application contract");
     let direct_discovery_noop = contract.discovery().reads_unified_store()
         && runtime.source_root() == runtime.unified_root();
-    let reference = (recovery_pending || !direct_discovery_noop).then(|| {
-        SkillReferencePlan::new(
-            entry.id(),
-            app.clone(),
-            runtime.source_root(),
-            app_runtime.native_root(),
-            app_runtime.state_root(),
-            entry.directory(),
-            target_enabled && !direct_discovery_noop,
-        )
-    });
+    let reference =
+        (recovery_pending || managed_reference_drift || !direct_discovery_noop).then(|| {
+            SkillReferencePlan::new(
+                entry.id(),
+                app.clone(),
+                runtime.source_root(),
+                app_runtime.native_root(),
+                app_runtime.state_root(),
+                entry.directory(),
+                target_enabled && !direct_discovery_noop,
+            )
+        });
 
     let configuration = match contract.config_target() {
         None => None,
@@ -1171,7 +1173,10 @@ mod tests {
 
         let snapshots = inspect_installed_skills(&[entry(true)], &initial).unwrap();
         let state = snapshots[0].apps().next().unwrap();
-        assert_eq!(state.reason(), Some(SkillControlReason::CatalogDrift));
+        assert_eq!(
+            state.reason(),
+            Some(SkillControlReason::ManagedReferenceDrift)
+        );
 
         let enable = prepare_skill_switch(
             &[entry(false)],
@@ -1190,7 +1195,10 @@ mod tests {
         let snapshots = inspect_installed_skills(&[entry(false)], &enabled_live).unwrap();
         let state = snapshots[0].apps().next().unwrap();
         assert_eq!(state.enabled(), Some(true));
-        assert_eq!(state.reason(), Some(SkillControlReason::CatalogDrift));
+        assert_eq!(
+            state.reason(),
+            Some(SkillControlReason::ManagedReferenceDrift)
+        );
         assert!(matches!(
             prepare_skill_switch(
                 &[entry(false)],
@@ -1200,7 +1208,7 @@ mod tests {
                 false,
             ),
             Err(SkillPrepareError::Unavailable {
-                reason: Some(SkillControlReason::CatalogDrift),
+                reason: Some(SkillControlReason::ManagedReferenceDrift),
                 ..
             })
         ));
@@ -1246,7 +1254,10 @@ mod tests {
         let snapshots = inspect_installed_skills(&[entry(true)], &disabled_again).unwrap();
         let state = snapshots[0].apps().next().unwrap();
         assert_eq!(state.enabled(), Some(false));
-        assert_eq!(state.reason(), Some(SkillControlReason::CatalogDrift));
+        assert_eq!(
+            state.reason(),
+            Some(SkillControlReason::ManagedReferenceDrift)
+        );
         let restore = prepare_skill_reconciliation(
             &[entry(true)],
             "owner/repo:demo",
