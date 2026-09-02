@@ -632,6 +632,25 @@ pub fn update_provider_configuration(
     )
 }
 
+/// Atomically updates the shared editable details of one provider.
+pub fn update_provider_details(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    name: &str,
+    settings_config: &str,
+    category: Option<&str>,
+    meta: &str,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    execute_provider_write(
+        transaction,
+        "UPDATE main.providers
+         SET name = ?1, settings_config = ?2, category = ?3, meta = ?4
+         WHERE id COLLATE BINARY = ?5 AND app_type COLLATE BINARY = ?6",
+        params![name, settings_config, category, meta, id, app_type],
+    )
+}
+
 /// Updates the raw metadata JSON of one provider.
 pub fn update_provider_metadata(
     transaction: &mut Transaction<'_>,
@@ -1238,6 +1257,19 @@ mod tests {
             ProviderWriteOutcome::Applied
         );
         assert_eq!(
+            update_provider_details(
+                &mut transaction,
+                "provider",
+                "claude",
+                "Imported",
+                "imported-settings",
+                Some("imported"),
+                "imported-meta",
+            )
+            .expect("update provider details"),
+            ProviderWriteOutcome::Applied
+        );
+        assert_eq!(
             set_provider_current(&mut transaction, "provider", "claude", true)
                 .expect("set current provider"),
             ProviderWriteOutcome::Applied
@@ -1252,9 +1284,10 @@ mod tests {
         let row = read_provider_row(&connection, "provider", "claude")
             .expect("read provider")
             .expect("provider exists");
-        assert_eq!(row.name, "Updated");
-        assert_eq!(row.settings_config, "{}");
-        assert_eq!(row.meta, "{}");
+        assert_eq!(row.name, "Imported");
+        assert_eq!(row.settings_config, "imported-settings");
+        assert_eq!(row.category.as_deref(), Some("imported"));
+        assert_eq!(row.meta, "imported-meta");
         assert_eq!(row.is_current, 0);
         assert_eq!(row.in_failover_queue, 1);
         assert_eq!(
@@ -1365,6 +1398,19 @@ mod tests {
             ProviderWriteOutcome::NotApplied
         );
         assert_eq!(
+            update_provider_details(
+                &mut transaction,
+                "provider",
+                "claude",
+                "Updated",
+                "new",
+                Some("new"),
+                "new",
+            )
+            .expect("suppress details update"),
+            ProviderWriteOutcome::NotApplied
+        );
+        assert_eq!(
             set_provider_current(&mut transaction, "provider", "claude", true)
                 .expect("suppress current update"),
             ProviderWriteOutcome::NotApplied
@@ -1449,6 +1495,16 @@ mod tests {
             .expect_err("configuration update must be rejected"),
             update_provider_metadata(&mut transaction, "provider", "claude", "secret-meta")
                 .expect_err("metadata update must be rejected"),
+            update_provider_details(
+                &mut transaction,
+                "provider",
+                "claude",
+                "Provider",
+                "secret-settings",
+                Some("secret-category"),
+                "secret-meta",
+            )
+            .expect_err("details update must be rejected"),
             set_provider_current(&mut transaction, "provider", "claude", true)
                 .expect_err("current update must be rejected"),
             delete_provider(&mut transaction, "provider", "claude")
