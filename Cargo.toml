@@ -7,6 +7,11 @@ repository = "https://github.com/SaladDay/cc-switch-core"
 edition = "2021"
 rust-version = "1.85.1"
 
+[workspace]
+members = ["crates/cc-switch-store"]
+default-members = [".", "crates/cc-switch-store"]
+resolver = "2"
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
