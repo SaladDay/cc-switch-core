@@ -63,6 +63,59 @@ pub enum SimpleProviderProtocol {
     OpenAiChatCompletions,
 }
 
+type SimpleProviderExtractor =
+    fn(&AppType, &Map<String, Value>) -> Result<SimpleProviderValues, SimpleProviderError>;
+type SimpleProviderProjector = fn(
+    &AppType,
+    &mut Map<String, Value>,
+    &str,
+    &SimpleProviderValues,
+) -> Result<(), SimpleProviderError>;
+
+/// Native provider behavior bound to one built-in integration.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SimpleProviderBehavior {
+    extract: SimpleProviderExtractor,
+    project: SimpleProviderProjector,
+    allows_missing_api_key: bool,
+}
+
+impl SimpleProviderBehavior {
+    pub(crate) const fn new(
+        extract: SimpleProviderExtractor,
+        project: SimpleProviderProjector,
+        allows_missing_api_key: bool,
+    ) -> Self {
+        Self {
+            extract,
+            project,
+            allows_missing_api_key,
+        }
+    }
+
+    fn extract(
+        self,
+        app: &AppType,
+        root: &Map<String, Value>,
+    ) -> Result<SimpleProviderValues, SimpleProviderError> {
+        (self.extract)(app, root)
+    }
+
+    fn project(
+        self,
+        app: &AppType,
+        root: &mut Map<String, Value>,
+        provider_name: &str,
+        values: &SimpleProviderValues,
+    ) -> Result<(), SimpleProviderError> {
+        (self.project)(app, root, provider_name, values)
+    }
+
+    pub(crate) const fn allows_missing_api_key(self) -> bool {
+        self.allows_missing_api_key
+    }
+}
+
 /// Public, non-secret values supplied by a built-in preset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -467,15 +520,9 @@ pub fn extract_simple_provider_values(
     let root = settings
         .as_object()
         .ok_or_else(|| settings_not_object(app))?;
-    match app {
-        AppType::Claude | AppType::ClaudeDesktop => extract_claude_like(app, root),
-        AppType::Codex => extract_codex(root),
-        AppType::Gemini => extract_gemini(root),
-        AppType::GrokBuild => extract_grokbuild(root),
-        AppType::OpenCode => extract_opencode(root),
-        AppType::OpenClaw | AppType::Pi => extract_openai_array_provider(app, root),
-        AppType::Hermes => extract_hermes(root),
-    }
+    builtin_app_integration(app)
+        .simple_provider_behavior()
+        .extract(app, root)
 }
 
 /// Projects simple values over optional native settings, preserving unknowns.
@@ -490,17 +537,9 @@ pub fn project_simple_provider_settings(
     }
     let values = normalize_and_validate(app, values)?;
     let mut root = existing_root(app, existing)?;
-    match app {
-        AppType::Claude => project_claude(&mut root, &values)?,
-        AppType::ClaudeDesktop => project_claude_desktop(&mut root, &values)?,
-        AppType::Codex => project_codex(&mut root, provider_name.trim(), &values)?,
-        AppType::Gemini => project_gemini(&mut root, &values)?,
-        AppType::GrokBuild => project_grokbuild(&mut root, provider_name.trim(), &values)?,
-        AppType::OpenCode => project_opencode(&mut root, provider_name.trim(), &values)?,
-        AppType::OpenClaw => project_openclaw(&mut root, &values)?,
-        AppType::Hermes => project_hermes(&mut root, &values)?,
-        AppType::Pi => project_pi(&mut root, &values)?,
-    }
+    builtin_app_integration(app)
+        .simple_provider_behavior()
+        .project(app, &mut root, provider_name.trim(), &values)?;
     Ok(Value::Object(root))
 }
 
@@ -523,7 +562,12 @@ fn normalize_and_validate(
             // Grok Build also accepts an existing `env_key`. The native
             // projector verifies that credential after locating the selected
             // model table.
-            SimpleProviderField::ApiKey => values.api_key.is_empty() && *app != AppType::GrokBuild,
+            SimpleProviderField::ApiKey => {
+                values.api_key.is_empty()
+                    && !builtin_app_integration(app)
+                        .simple_provider_behavior()
+                        .allows_missing_api_key()
+            }
             SimpleProviderField::Model => values.model.is_empty(),
         };
         if missing {
@@ -595,7 +639,7 @@ fn set_anthropic_credential(env: &mut Map<String, Value>, api_key: &str) {
     env.remove(obsolete_key);
 }
 
-fn extract_claude_like(
+pub(crate) fn extract_claude_like(
     app: &AppType,
     root: &Map<String, Value>,
 ) -> Result<SimpleProviderValues, SimpleProviderError> {
@@ -621,11 +665,13 @@ fn extract_claude_like(
     ))
 }
 
-fn project_claude(
+pub(crate) fn project_claude(
+    app: &AppType,
     root: &mut Map<String, Value>,
+    _provider_name: &str,
     values: &SimpleProviderValues,
 ) -> Result<(), SimpleProviderError> {
-    let env = object_field_mut(&AppType::Claude, root, "env")?;
+    let env = object_field_mut(app, root, "env")?;
     set_anthropic_credential(env, &values.api_key);
     set_optional_string(env, "ANTHROPIC_BASE_URL", &values.base_url);
     set_optional_string(env, "ANTHROPIC_MODEL", &values.model);
@@ -640,11 +686,13 @@ fn project_claude(
     Ok(())
 }
 
-fn project_claude_desktop(
+pub(crate) fn project_claude_desktop(
+    app: &AppType,
     root: &mut Map<String, Value>,
+    _provider_name: &str,
     values: &SimpleProviderValues,
 ) -> Result<(), SimpleProviderError> {
-    let env = object_field_mut(&AppType::ClaudeDesktop, root, "env")?;
+    let env = object_field_mut(app, root, "env")?;
     env.insert(
         "ANTHROPIC_BASE_URL".to_owned(),
         Value::String(values.base_url.clone()),
@@ -657,20 +705,22 @@ fn project_claude_desktop(
     Ok(())
 }
 
-fn extract_codex(root: &Map<String, Value>) -> Result<SimpleProviderValues, SimpleProviderError> {
-    let app = AppType::Codex;
+pub(crate) fn extract_codex(
+    app: &AppType,
+    root: &Map<String, Value>,
+) -> Result<SimpleProviderValues, SimpleProviderError> {
     let auth = match root.get("auth") {
         Some(value) => value
             .as_object()
-            .ok_or_else(|| invalid_native(&app, "auth"))?,
+            .ok_or_else(|| invalid_native(app, "auth"))?,
         None => &Map::new(),
     };
     let config = match root.get("config") {
         Some(Value::String(config)) => config.as_str(),
         Some(Value::Null) | None => "",
-        Some(_) => return Err(invalid_native(&app, "config")),
+        Some(_) => return Err(invalid_native(app, "config")),
     };
-    let document = parse_toml(&app, config)?;
+    let document = parse_toml(app, config)?;
     let model = document
         .get("model")
         .and_then(Item::as_str)
@@ -701,22 +751,22 @@ fn extract_codex(root: &Map<String, Value>) -> Result<SimpleProviderValues, Simp
     Ok(SimpleProviderValues::new(base_url, api_key, model))
 }
 
-fn project_codex(
+pub(crate) fn project_codex(
+    app: &AppType,
     root: &mut Map<String, Value>,
     provider_name: &str,
     values: &SimpleProviderValues,
 ) -> Result<(), SimpleProviderError> {
-    let app = AppType::Codex;
-    object_field_mut(&app, root, "auth")?.insert(
+    object_field_mut(app, root, "auth")?.insert(
         "OPENAI_API_KEY".to_owned(),
         Value::String(values.api_key.clone()),
     );
     let config = match root.get("config") {
         Some(Value::String(config)) => config.as_str(),
         Some(Value::Null) | None => "",
-        Some(_) => return Err(invalid_native(&app, "config")),
+        Some(_) => return Err(invalid_native(app, "config")),
     };
-    let mut document = parse_toml(&app, config)?;
+    let mut document = parse_toml(app, config)?;
     let route_id = document
         .get("model_provider")
         .and_then(Item::as_str)
@@ -726,8 +776,8 @@ fn project_codex(
         .to_owned();
     document["model_provider"] = toml_edit::value(&route_id);
     document["model"] = toml_edit::value(&values.model);
-    let routes = toml_table_item(&app, &mut document, "model_providers")?;
-    let route = nested_toml_table(&app, routes, &route_id, "model_providers")?;
+    let routes = toml_table_item(app, &mut document, "model_providers")?;
+    let route = nested_toml_table(app, routes, &route_id, "model_providers")?;
     route.insert("name", toml_edit::value(provider_name));
     route.insert(
         "base_url",
@@ -749,12 +799,14 @@ fn project_codex(
     Ok(())
 }
 
-fn extract_gemini(root: &Map<String, Value>) -> Result<SimpleProviderValues, SimpleProviderError> {
-    let app = AppType::Gemini;
+pub(crate) fn extract_gemini(
+    app: &AppType,
+    root: &Map<String, Value>,
+) -> Result<SimpleProviderValues, SimpleProviderError> {
     let env = match root.get("env") {
         Some(value) => value
             .as_object()
-            .ok_or_else(|| invalid_native(&app, "env"))?,
+            .ok_or_else(|| invalid_native(app, "env"))?,
         None => return Ok(SimpleProviderValues::new("", "", "")),
     };
     Ok(SimpleProviderValues::new(
@@ -770,11 +822,13 @@ fn extract_gemini(root: &Map<String, Value>) -> Result<SimpleProviderValues, Sim
     ))
 }
 
-fn project_gemini(
+pub(crate) fn project_gemini(
+    app: &AppType,
     root: &mut Map<String, Value>,
+    _provider_name: &str,
     values: &SimpleProviderValues,
 ) -> Result<(), SimpleProviderError> {
-    let env = object_field_mut(&AppType::Gemini, root, "env")?;
+    let env = object_field_mut(app, root, "env")?;
     env.insert(
         "GEMINI_API_KEY".to_owned(),
         Value::String(values.api_key.clone()),
@@ -784,15 +838,15 @@ fn project_gemini(
     Ok(())
 }
 
-fn extract_grokbuild(
+pub(crate) fn extract_grokbuild(
+    app: &AppType,
     root: &Map<String, Value>,
 ) -> Result<SimpleProviderValues, SimpleProviderError> {
-    let app = AppType::GrokBuild;
     let config = root
         .get("config")
         .and_then(Value::as_str)
-        .ok_or_else(|| invalid_native(&app, "config"))?;
-    let document = parse_toml(&app, config)?;
+        .ok_or_else(|| invalid_native(app, "config"))?;
+    let document = parse_toml(app, config)?;
     let selected_key = document
         .get("models")
         .and_then(|models| models.get("default"))
@@ -817,18 +871,18 @@ fn extract_grokbuild(
     ))
 }
 
-fn project_grokbuild(
+pub(crate) fn project_grokbuild(
+    app: &AppType,
     root: &mut Map<String, Value>,
     provider_name: &str,
     values: &SimpleProviderValues,
 ) -> Result<(), SimpleProviderError> {
-    let app = AppType::GrokBuild;
     let config = match root.get("config") {
         Some(Value::String(config)) => config.as_str(),
         Some(Value::Null) | None => "",
-        Some(_) => return Err(invalid_native(&app, "config")),
+        Some(_) => return Err(invalid_native(app, "config")),
     };
-    let mut document = parse_toml(&app, config)?;
+    let mut document = parse_toml(app, config)?;
     let selected_key = document
         .get("models")
         .and_then(|models| models.get("default"))
@@ -837,9 +891,9 @@ fn project_grokbuild(
         .filter(|key| !key.is_empty())
         .unwrap_or(&values.model)
         .to_owned();
-    toml_table(&app, &mut document, "models")?.insert("default", toml_edit::value(&selected_key));
-    let model_tables = toml_table_item(&app, &mut document, "model")?;
-    let selected = nested_toml_table(&app, model_tables, &selected_key, "model")?;
+    toml_table(app, &mut document, "models")?.insert("default", toml_edit::value(&selected_key));
+    let model_tables = toml_table_item(app, &mut document, "model")?;
+    let selected = nested_toml_table(app, model_tables, &selected_key, "model")?;
     selected.insert("model", toml_edit::value(&values.model));
     selected.insert("base_url", toml_edit::value(&values.base_url));
     selected.insert("name", toml_edit::value(provider_name));
@@ -851,7 +905,7 @@ fn project_grokbuild(
             .is_some_and(|value| !value.is_empty());
         if !has_env_key {
             return Err(SimpleProviderError::MissingField {
-                app_id: stable_app_id(&app),
+                app_id: stable_app_id(app),
                 field: SimpleProviderField::ApiKey,
             });
         }
@@ -877,20 +931,20 @@ fn project_grokbuild(
     Ok(())
 }
 
-fn extract_opencode(
+pub(crate) fn extract_opencode(
+    app: &AppType,
     root: &Map<String, Value>,
 ) -> Result<SimpleProviderValues, SimpleProviderError> {
-    let app = AppType::OpenCode;
     let options = match root.get("options") {
         Some(value) => value
             .as_object()
-            .ok_or_else(|| invalid_native(&app, "options"))?,
+            .ok_or_else(|| invalid_native(app, "options"))?,
         None => &Map::new(),
     };
     let model = match root.get("models") {
         Some(value) => value
             .as_object()
-            .ok_or_else(|| invalid_native(&app, "models"))?
+            .ok_or_else(|| invalid_native(app, "models"))?
             .keys()
             .next()
             .map(String::as_str)
@@ -910,24 +964,24 @@ fn extract_opencode(
     ))
 }
 
-fn project_opencode(
+pub(crate) fn project_opencode(
+    app: &AppType,
     root: &mut Map<String, Value>,
     provider_name: &str,
     values: &SimpleProviderValues,
 ) -> Result<(), SimpleProviderError> {
-    let app = AppType::OpenCode;
     root.entry("npm".to_owned())
         .or_insert_with(|| Value::String("@ai-sdk/openai-compatible".to_owned()));
     root.insert("name".to_owned(), Value::String(provider_name.to_owned()));
-    let options = object_field_mut(&app, root, "options")?;
+    let options = object_field_mut(app, root, "options")?;
     options.insert("baseURL".to_owned(), Value::String(values.base_url.clone()));
     options.insert("apiKey".to_owned(), Value::String(values.api_key.clone()));
-    let models = object_field_mut(&app, root, "models")?;
+    let models = object_field_mut(app, root, "models")?;
     select_object_model(models, &values.model);
     Ok(())
 }
 
-fn extract_openai_array_provider(
+pub(crate) fn extract_openai_array_provider(
     app: &AppType,
     root: &Map<String, Value>,
 ) -> Result<SimpleProviderValues, SimpleProviderError> {
@@ -951,18 +1005,22 @@ fn extract_openai_array_provider(
     ))
 }
 
-fn project_openclaw(
+pub(crate) fn project_openclaw(
+    app: &AppType,
     root: &mut Map<String, Value>,
+    _provider_name: &str,
     values: &SimpleProviderValues,
 ) -> Result<(), SimpleProviderError> {
-    project_openai_array_provider(&AppType::OpenClaw, root, values, true)
+    project_openai_array_provider(app, root, values, true)
 }
 
-fn project_pi(
+pub(crate) fn project_pi(
+    app: &AppType,
     root: &mut Map<String, Value>,
+    _provider_name: &str,
     values: &SimpleProviderValues,
 ) -> Result<(), SimpleProviderError> {
-    project_openai_array_provider(&AppType::Pi, root, values, false)
+    project_openai_array_provider(app, root, values, false)
 }
 
 fn project_openai_array_provider(
@@ -995,8 +1053,10 @@ fn project_openai_array_provider(
     Ok(())
 }
 
-fn extract_hermes(root: &Map<String, Value>) -> Result<SimpleProviderValues, SimpleProviderError> {
-    let app = AppType::Hermes;
+pub(crate) fn extract_hermes(
+    app: &AppType,
+    root: &Map<String, Value>,
+) -> Result<SimpleProviderValues, SimpleProviderError> {
     let model = match root.get("models") {
         Some(Value::Object(models)) => models.keys().next().map_or("", String::as_str),
         Some(Value::Array(models)) => models
@@ -1004,7 +1064,7 @@ fn extract_hermes(root: &Map<String, Value>) -> Result<SimpleProviderValues, Sim
             .and_then(|model| model.get("id"))
             .and_then(Value::as_str)
             .unwrap_or_default(),
-        Some(_) => return Err(invalid_native(&app, "models")),
+        Some(_) => return Err(invalid_native(app, "models")),
         None => "",
     };
     Ok(SimpleProviderValues::new(
@@ -1020,11 +1080,12 @@ fn extract_hermes(root: &Map<String, Value>) -> Result<SimpleProviderValues, Sim
     ))
 }
 
-fn project_hermes(
+pub(crate) fn project_hermes(
+    app: &AppType,
     root: &mut Map<String, Value>,
+    _provider_name: &str,
     values: &SimpleProviderValues,
 ) -> Result<(), SimpleProviderError> {
-    let app = AppType::Hermes;
     root.remove("baseUrl");
     root.remove("apiKey");
     root.insert(
@@ -1051,13 +1112,13 @@ fn project_hermes(
             }
             let first = models[0]
                 .as_object_mut()
-                .ok_or_else(|| invalid_native(&app, "models"))?;
+                .ok_or_else(|| invalid_native(app, "models"))?;
             first.insert("id".to_owned(), Value::String(values.model.clone()));
             first
                 .entry("name".to_owned())
                 .or_insert_with(|| Value::String(values.model.clone()));
         }
-        _ => return Err(invalid_native(&app, "models")),
+        _ => return Err(invalid_native(app, "models")),
     }
     Ok(())
 }

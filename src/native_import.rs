@@ -13,8 +13,9 @@ use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 use crate::{
-    claude, claude_desktop, codex, gemini, grokbuild, hermes, openclaw, opencode, pi, AppType,
-    LiveDocumentSet, LogicalTarget, NativeProviderMode, ProviderSnapshot,
+    claude, claude_desktop, codex, gemini, grokbuild, hermes, integration::builtin_app_integration,
+    openclaw, opencode, pi, AppType, LiveDocumentSet, LogicalTarget, NativeProviderMode,
+    ProviderSnapshot,
 };
 
 const CLAUDE_DESKTOP_OFFICIAL_ID: &str = "claude-desktop-official";
@@ -103,7 +104,7 @@ pub enum NativeImportError {
     InvalidCandidate { app_id: String, message: String },
 }
 
-enum ProjectError {
+pub(crate) enum ProjectError {
     Observe(LogicalTarget),
     Rejected(NativeImportError),
 }
@@ -114,7 +115,28 @@ impl From<NativeImportError> for ProjectError {
     }
 }
 
-type ProjectResult<T> = Result<T, ProjectError>;
+pub(crate) type ProjectResult<T> = Result<T, ProjectError>;
+type NativeImporter = fn(&AppType, &LiveDocumentSet) -> ProjectResult<Vec<NativeImportCandidate>>;
+
+/// Native import behavior bound to one built-in integration.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativeImportBehavior {
+    project: NativeImporter,
+}
+
+impl NativeImportBehavior {
+    pub(crate) const fn new(project: NativeImporter) -> Self {
+        Self { project }
+    }
+
+    fn project(
+        self,
+        app: &AppType,
+        documents: &LiveDocumentSet,
+    ) -> ProjectResult<Vec<NativeImportCandidate>> {
+        (self.project)(app, documents)
+    }
+}
 
 pub(crate) fn project_native_import(
     adapter_app: &AppType,
@@ -127,55 +149,26 @@ pub(crate) fn project_native_import(
         });
     }
 
-    match project(adapter_app, documents) {
+    match builtin_app_integration(adapter_app)
+        .native_import_behavior()
+        .project(adapter_app, documents)
+    {
         Ok(candidates) => Ok(NativeImportStep::Ready { candidates }),
         Err(ProjectError::Observe(target)) => Ok(NativeImportStep::Observe { target }),
         Err(ProjectError::Rejected(error)) => Err(error),
     }
 }
 
-fn project(
+pub(crate) fn import_claude(
     app: &AppType,
     documents: &LiveDocumentSet,
 ) -> ProjectResult<Vec<NativeImportCandidate>> {
-    match app {
-        AppType::Claude => import_claude(documents),
-        AppType::Codex => import_codex(documents),
-        AppType::Gemini => import_gemini(documents),
-        AppType::GrokBuild => import_grokbuild(documents),
-        AppType::OpenCode => import_json_entries(
-            documents,
-            app.clone(),
-            LogicalTarget::OpenCodeConfig,
-            &["provider"],
-            "OpenCode",
-        ),
-        AppType::OpenClaw => import_json_entries(
-            documents,
-            app.clone(),
-            LogicalTarget::OpenClawConfig,
-            &["models", "providers"],
-            "OpenClaw",
-        ),
-        AppType::ClaudeDesktop => import_claude_desktop(documents),
-        AppType::Hermes => import_hermes(documents),
-        AppType::Pi => import_json_entries(
-            documents,
-            app.clone(),
-            LogicalTarget::PiModels,
-            &["providers"],
-            "Pi",
-        ),
-    }
-}
-
-fn import_claude(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportCandidate>> {
     let target = LogicalTarget::ClaudeSettings;
     let settings = required_json_object(documents, target, "Claude Code")?;
     let snapshot = claude::prepare_live_snapshot(&settings)
         .map_err(|error| invalid_document(target, error.to_string()))?;
     Ok(vec![candidate(
-        AppType::Claude,
+        app.clone(),
         "default",
         "Imported Claude Code",
         snapshot.settings,
@@ -184,7 +177,10 @@ fn import_claude(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportC
     )?])
 }
 
-fn import_codex(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportCandidate>> {
+pub(crate) fn import_codex(
+    app: &AppType,
+    documents: &LiveDocumentSet,
+) -> ProjectResult<Vec<NativeImportCandidate>> {
     let config = optional_text(documents, LogicalTarget::CodexConfig, "Codex")?;
     let auth = optional_json_object(documents, LogicalTarget::CodexAuth, "Codex")?;
     if config.is_none() && auth.is_none() {
@@ -198,7 +194,7 @@ fn import_codex(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportCa
         .map_err(|error| invalid_document(LogicalTarget::CodexConfig, error.to_string()))?;
     let official = codex_auth_is_official(&settings["auth"]);
     Ok(vec![candidate(
-        AppType::Codex,
+        app.clone(),
         if official {
             "codex-official"
         } else {
@@ -215,7 +211,10 @@ fn import_codex(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportCa
     )?])
 }
 
-fn import_gemini(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportCandidate>> {
+pub(crate) fn import_gemini(
+    app: &AppType,
+    documents: &LiveDocumentSet,
+) -> ProjectResult<Vec<NativeImportCandidate>> {
     let env_text = optional_text(documents, LogicalTarget::GeminiEnv, "Gemini")?;
     let config = optional_json_object(documents, LogicalTarget::GeminiSettings, "Gemini")?;
     if env_text.is_none() && config.is_none() {
@@ -242,7 +241,7 @@ fn import_gemini(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportC
     })?;
     let official = mode == gemini::AuthMode::OAuthPersonal;
     Ok(vec![candidate(
-        AppType::Gemini,
+        app.clone(),
         if official {
             "gemini-official"
         } else {
@@ -263,7 +262,10 @@ fn import_gemini(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportC
     )?])
 }
 
-fn import_grokbuild(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportCandidate>> {
+pub(crate) fn import_grokbuild(
+    app: &AppType,
+    documents: &LiveDocumentSet,
+) -> ProjectResult<Vec<NativeImportCandidate>> {
     let target = LogicalTarget::GrokConfig;
     let config =
         optional_text(documents, target, "Grok Build")?.ok_or_else(|| missing("Grok Build"))?;
@@ -277,7 +279,7 @@ fn import_grokbuild(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImpo
         .map_err(|error| invalid_document(target, error.to_string()))?;
     let official = mode == grokbuild::ProviderMode::Official;
     Ok(vec![candidate(
-        AppType::GrokBuild,
+        app.clone(),
         if official {
             "grokbuild-official"
         } else {
@@ -294,24 +296,21 @@ fn import_grokbuild(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImpo
     )?])
 }
 
+type JsonProviderValidator = fn(&str, &Value) -> bool;
+
 fn import_json_entries(
     documents: &LiveDocumentSet,
-    app: AppType,
+    app: &AppType,
     target: LogicalTarget,
     keys: &[&str],
     label: &str,
+    is_valid: JsonProviderValidator,
 ) -> ProjectResult<Vec<NativeImportCandidate>> {
     let root = required_json5_object(documents, target, label)?;
     let entries = nested_object(&root, keys).ok_or_else(|| missing(label))?;
     let mut candidates = Vec::with_capacity(entries.len());
     for (key, settings) in entries {
-        let valid = match app {
-            AppType::OpenCode => opencode::prepare_provider_entry(key, settings).is_ok(),
-            AppType::OpenClaw => openclaw::prepare_provider_entry(key, settings).is_ok(),
-            AppType::Pi => pi::prepare_provider_entry(key, settings).is_ok(),
-            _ => false,
-        };
-        if !valid {
+        if !is_valid(key, settings) {
             return Err(invalid_document(
                 target,
                 format!("{label} provider '{key}' is invalid"),
@@ -338,7 +337,52 @@ fn import_json_entries(
     Ok(candidates)
 }
 
-fn import_claude_desktop(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportCandidate>> {
+pub(crate) fn import_opencode(
+    app: &AppType,
+    documents: &LiveDocumentSet,
+) -> ProjectResult<Vec<NativeImportCandidate>> {
+    import_json_entries(
+        documents,
+        app,
+        LogicalTarget::OpenCodeConfig,
+        &["provider"],
+        "OpenCode",
+        |key, settings| opencode::prepare_provider_entry(key, settings).is_ok(),
+    )
+}
+
+pub(crate) fn import_openclaw(
+    app: &AppType,
+    documents: &LiveDocumentSet,
+) -> ProjectResult<Vec<NativeImportCandidate>> {
+    import_json_entries(
+        documents,
+        app,
+        LogicalTarget::OpenClawConfig,
+        &["models", "providers"],
+        "OpenClaw",
+        |key, settings| openclaw::prepare_provider_entry(key, settings).is_ok(),
+    )
+}
+
+pub(crate) fn import_pi(
+    app: &AppType,
+    documents: &LiveDocumentSet,
+) -> ProjectResult<Vec<NativeImportCandidate>> {
+    import_json_entries(
+        documents,
+        app,
+        LogicalTarget::PiModels,
+        &["providers"],
+        "Pi",
+        |key, settings| pi::prepare_provider_entry(key, settings).is_ok(),
+    )
+}
+
+pub(crate) fn import_claude_desktop(
+    app: &AppType,
+    documents: &LiveDocumentSet,
+) -> ProjectResult<Vec<NativeImportCandidate>> {
     let profile = optional_json_object(
         documents,
         LogicalTarget::ClaudeDesktopProfile,
@@ -368,7 +412,7 @@ fn import_claude_desktop(documents: &LiveDocumentSet) -> ProjectResult<Vec<Nativ
             return Err(missing("Claude Desktop direct profile"));
         }
         return Ok(vec![candidate(
-            AppType::ClaudeDesktop,
+            app.clone(),
             CLAUDE_DESKTOP_OFFICIAL_ID,
             "Claude Desktop Official",
             json!({}),
@@ -411,7 +455,7 @@ fn import_claude_desktop(documents: &LiveDocumentSet) -> ProjectResult<Vec<Nativ
     )
     .map_err(|error| invalid_document(LogicalTarget::ClaudeDesktopProfile, error.to_string()))?;
     Ok(vec![candidate(
-        AppType::ClaudeDesktop,
+        app.clone(),
         "default",
         "Imported Claude Desktop",
         settings,
@@ -420,7 +464,10 @@ fn import_claude_desktop(documents: &LiveDocumentSet) -> ProjectResult<Vec<Nativ
     )?])
 }
 
-fn import_hermes(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportCandidate>> {
+pub(crate) fn import_hermes(
+    app: &AppType,
+    documents: &LiveDocumentSet,
+) -> ProjectResult<Vec<NativeImportCandidate>> {
     let target = LogicalTarget::HermesConfig;
     let raw = optional_text(documents, target, "Hermes")?.ok_or_else(|| missing("Hermes"))?;
     let root = parse_yaml(raw, target)?;
@@ -513,11 +560,11 @@ fn import_hermes(documents: &LiveDocumentSet) -> ProjectResult<Vec<NativeImportC
         let source = sources
             .remove(&name)
             .ok_or_else(|| NativeImportError::InvalidCandidate {
-                app_id: AppType::Hermes.as_str().to_owned(),
+                app_id: app.as_str().to_owned(),
                 message: "provider source is missing".to_owned(),
             })?;
         candidates.push(candidate(
-            AppType::Hermes,
+            app.clone(),
             &name,
             &name,
             settings,

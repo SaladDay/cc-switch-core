@@ -1,35 +1,45 @@
 //! Single built-in application integration catalog.
 
 use crate::{
-    adapter::BuiltinAdapter,
     mcp::{CLAUDE_MCP, CODEX_MCP, GEMINI_MCP, GROKBUILD_MCP, HERMES_MCP, OPENCODE_MCP},
+    native_import::{self, NativeImportBehavior},
+    projection::{self, NativeContextRequirement, NativeProjectionBehavior},
     registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
     simple_provider::{
-        CLAUDE_DESKTOP_FORM, CLAUDE_FORM, CODEX_FORM, GEMINI_FORM, GROKBUILD_FORM, HERMES_FORM,
-        OPENCLAW_FORM, OPENCODE_FORM, PI_FORM,
+        self, SimpleProviderBehavior, CLAUDE_DESKTOP_FORM, CLAUDE_FORM, CODEX_FORM, GEMINI_FORM,
+        GROKBUILD_FORM, HERMES_FORM, OPENCLAW_FORM, OPENCODE_FORM, PI_FORM,
     },
     AppType, LogicalTarget, SimpleProviderFormDescriptor, SkillAppContract, SkillConfigTarget,
     SkillDiscovery,
 };
 
 /// All contracts that must be registered for one built-in application.
+#[derive(Debug)]
 pub(crate) struct AppIntegration {
     descriptor: AppDescriptor,
-    adapter: BuiltinAdapter,
+    targets: &'static [LogicalTarget],
     simple_provider_form: &'static SimpleProviderFormDescriptor,
+    simple_provider_behavior: SimpleProviderBehavior,
+    native_import_behavior: NativeImportBehavior,
+    native_projection_behavior: NativeProjectionBehavior,
 }
 
 impl AppIntegration {
     const fn new(
-        app: AppType,
         descriptor: AppDescriptor,
         targets: &'static [LogicalTarget],
         simple_provider_form: &'static SimpleProviderFormDescriptor,
+        simple_provider_behavior: SimpleProviderBehavior,
+        native_import_behavior: NativeImportBehavior,
+        native_projection_behavior: NativeProjectionBehavior,
     ) -> Self {
         Self {
             descriptor,
-            adapter: BuiltinAdapter::new(app, targets),
+            targets,
             simple_provider_form,
+            simple_provider_behavior,
+            native_import_behavior,
+            native_projection_behavior,
         }
     }
 
@@ -37,12 +47,24 @@ impl AppIntegration {
         &self.descriptor
     }
 
-    pub(crate) const fn adapter(&self) -> &BuiltinAdapter {
-        &self.adapter
+    pub(crate) const fn targets(&self) -> &'static [LogicalTarget] {
+        self.targets
     }
 
     pub(crate) const fn simple_provider_form(&self) -> &SimpleProviderFormDescriptor {
         self.simple_provider_form
+    }
+
+    pub(crate) const fn simple_provider_behavior(&self) -> SimpleProviderBehavior {
+        self.simple_provider_behavior
+    }
+
+    pub(crate) const fn native_import_behavior(&self) -> NativeImportBehavior {
+        self.native_import_behavior
+    }
+
+    pub(crate) const fn native_projection_behavior(&self) -> NativeProjectionBehavior {
+        self.native_projection_behavior
     }
 }
 
@@ -96,7 +118,6 @@ use SkillDiscovery::{NativeAndUnified, NativeOnly};
 
 static BUILTIN_APP_INTEGRATIONS: [AppIntegration; 9] = [
     AppIntegration::new(
-        AppType::Claude,
         AppDescriptor::new(
             AppType::Claude,
             "claude",
@@ -114,9 +135,20 @@ static BUILTIN_APP_INTEGRATIONS: [AppIntegration; 9] = [
         )),
         &[LogicalTarget::ClaudeSettings],
         &CLAUDE_FORM,
+        SimpleProviderBehavior::new(
+            simple_provider::extract_claude_like,
+            simple_provider::project_claude,
+            false,
+        ),
+        NativeImportBehavior::new(native_import::import_claude),
+        NativeProjectionBehavior::new(
+            projection::claude_plan,
+            None,
+            projection::declared_native_targets,
+            NativeContextRequirement::Standard,
+        ),
     ),
     AppIntegration::new(
-        AppType::ClaudeDesktop,
         AppDescriptor::new(
             AppType::ClaudeDesktop,
             "claude-desktop",
@@ -133,9 +165,20 @@ static BUILTIN_APP_INTEGRATIONS: [AppIntegration; 9] = [
             LogicalTarget::ClaudeDesktopMeta,
         ],
         &CLAUDE_DESKTOP_FORM,
+        SimpleProviderBehavior::new(
+            simple_provider::extract_claude_like,
+            simple_provider::project_claude_desktop,
+            false,
+        ),
+        NativeImportBehavior::new(native_import::import_claude_desktop),
+        NativeProjectionBehavior::new(
+            projection::claude_desktop_plan,
+            None,
+            projection::declared_native_targets,
+            NativeContextRequirement::ClaudeDesktop,
+        ),
     ),
     AppIntegration::new(
-        AppType::Codex,
         AppDescriptor::new(
             AppType::Codex,
             "codex",
@@ -157,9 +200,20 @@ static BUILTIN_APP_INTEGRATIONS: [AppIntegration; 9] = [
             LogicalTarget::CodexModelCatalog,
         ],
         &CODEX_FORM,
+        SimpleProviderBehavior::new(
+            simple_provider::extract_codex,
+            simple_provider::project_codex,
+            false,
+        ),
+        NativeImportBehavior::new(native_import::import_codex),
+        NativeProjectionBehavior::new(
+            projection::codex_plan,
+            None,
+            projection::codex_native_targets,
+            NativeContextRequirement::Standard,
+        ),
     ),
     AppIntegration::new(
-        AppType::Gemini,
         AppDescriptor::new(
             AppType::Gemini,
             "gemini",
@@ -177,9 +231,20 @@ static BUILTIN_APP_INTEGRATIONS: [AppIntegration; 9] = [
         )),
         &[LogicalTarget::GeminiEnv, LogicalTarget::GeminiSettings],
         &GEMINI_FORM,
+        SimpleProviderBehavior::new(
+            simple_provider::extract_gemini,
+            simple_provider::project_gemini,
+            false,
+        ),
+        NativeImportBehavior::new(native_import::import_gemini),
+        NativeProjectionBehavior::new(
+            projection::gemini_plan,
+            None,
+            projection::declared_native_targets,
+            NativeContextRequirement::Standard,
+        ),
     ),
     AppIntegration::new(
-        AppType::GrokBuild,
         AppDescriptor::new(
             AppType::GrokBuild,
             "grokbuild",
@@ -197,9 +262,20 @@ static BUILTIN_APP_INTEGRATIONS: [AppIntegration; 9] = [
         )),
         &[LogicalTarget::GrokConfig],
         &GROKBUILD_FORM,
+        SimpleProviderBehavior::new(
+            simple_provider::extract_grokbuild,
+            simple_provider::project_grokbuild,
+            true,
+        ),
+        NativeImportBehavior::new(native_import::import_grokbuild),
+        NativeProjectionBehavior::new(
+            projection::grokbuild_plan,
+            None,
+            projection::declared_native_targets,
+            NativeContextRequirement::Standard,
+        ),
     ),
     AppIntegration::new(
-        AppType::OpenCode,
         AppDescriptor::new(
             AppType::OpenCode,
             "opencode",
@@ -217,9 +293,20 @@ static BUILTIN_APP_INTEGRATIONS: [AppIntegration; 9] = [
         )),
         &[LogicalTarget::OpenCodeConfig],
         &OPENCODE_FORM,
+        SimpleProviderBehavior::new(
+            simple_provider::extract_opencode,
+            simple_provider::project_opencode,
+            false,
+        ),
+        NativeImportBehavior::new(native_import::import_opencode),
+        NativeProjectionBehavior::new(
+            projection::opencode_plan,
+            Some(projection::remove_opencode),
+            projection::declared_native_targets,
+            NativeContextRequirement::Standard,
+        ),
     ),
     AppIntegration::new(
-        AppType::OpenClaw,
         AppDescriptor::new(
             AppType::OpenClaw,
             "openclaw",
@@ -231,9 +318,20 @@ static BUILTIN_APP_INTEGRATIONS: [AppIntegration; 9] = [
         ),
         &[LogicalTarget::OpenClawConfig],
         &OPENCLAW_FORM,
+        SimpleProviderBehavior::new(
+            simple_provider::extract_openai_array_provider,
+            simple_provider::project_openclaw,
+            false,
+        ),
+        NativeImportBehavior::new(native_import::import_openclaw),
+        NativeProjectionBehavior::new(
+            projection::openclaw_plan,
+            Some(projection::remove_openclaw),
+            projection::declared_native_targets,
+            NativeContextRequirement::Standard,
+        ),
     ),
     AppIntegration::new(
-        AppType::Hermes,
         AppDescriptor::new(
             AppType::Hermes,
             "hermes",
@@ -251,9 +349,20 @@ static BUILTIN_APP_INTEGRATIONS: [AppIntegration; 9] = [
         )),
         &[LogicalTarget::HermesConfig],
         &HERMES_FORM,
+        SimpleProviderBehavior::new(
+            simple_provider::extract_hermes,
+            simple_provider::project_hermes,
+            false,
+        ),
+        NativeImportBehavior::new(native_import::import_hermes),
+        NativeProjectionBehavior::new(
+            projection::hermes_plan,
+            Some(projection::hermes_remove_plan),
+            projection::declared_native_targets,
+            NativeContextRequirement::Standard,
+        ),
     ),
     AppIntegration::new(
-        AppType::Pi,
         AppDescriptor::new(
             AppType::Pi,
             "pi",
@@ -270,6 +379,18 @@ static BUILTIN_APP_INTEGRATIONS: [AppIntegration; 9] = [
         )),
         &[LogicalTarget::PiModels],
         &PI_FORM,
+        SimpleProviderBehavior::new(
+            simple_provider::extract_openai_array_provider,
+            simple_provider::project_pi,
+            false,
+        ),
+        NativeImportBehavior::new(native_import::import_pi),
+        NativeProjectionBehavior::new(
+            projection::pi_plan,
+            Some(projection::remove_pi),
+            projection::declared_native_targets,
+            NativeContextRequirement::Standard,
+        ),
     ),
 ];
 

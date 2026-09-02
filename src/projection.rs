@@ -17,10 +17,10 @@ use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 use crate::{
-    claude, claude_desktop, codex, common_config, gemini, grokbuild, hermes, openclaw, opencode,
-    pi, AppType, ContentExpectation, LiveDocumentSet, LogicalTarget, OperationPlan,
-    OperationPlanError, PlannedWrite, ProviderEntry, ProviderSnapshot, MAX_OPERATION_CONTENT_BYTES,
-    OPERATION_CONTRACT_MAJOR,
+    claude, claude_desktop, codex, common_config, gemini, grokbuild, hermes,
+    integration::builtin_app_integration, openclaw, opencode, pi, AppType, ContentExpectation,
+    LiveDocumentSet, LogicalTarget, OperationPlan, OperationPlanError, PlannedWrite, ProviderEntry,
+    ProviderSnapshot, MAX_OPERATION_CONTENT_BYTES, OPERATION_CONTRACT_MAJOR,
 };
 
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000157210";
@@ -53,6 +53,73 @@ pub enum NativeProviderMode {
 pub enum NativeProviderAccess {
     Writable,
     ReadOnly,
+}
+
+pub(crate) type NativeApply =
+    fn(&NativePlanRequest<'_>, &Value) -> Result<OperationPlan, NativePlanError>;
+pub(crate) type NativeRemove = fn(&NativePlanRequest<'_>) -> Result<OperationPlan, NativePlanError>;
+pub(crate) type NativeTargetSelector =
+    fn(&[LogicalTarget], NativeAction, &ProviderSnapshot, NativeProviderMode) -> Vec<LogicalTarget>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeContextRequirement {
+    Standard,
+    ClaudeDesktop,
+}
+
+/// Native planning behavior bound to one built-in integration.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativeProjectionBehavior {
+    apply: NativeApply,
+    remove: Option<NativeRemove>,
+    select_targets: NativeTargetSelector,
+    context: NativeContextRequirement,
+}
+
+impl NativeProjectionBehavior {
+    pub(crate) const fn new(
+        apply: NativeApply,
+        remove: Option<NativeRemove>,
+        select_targets: NativeTargetSelector,
+        context: NativeContextRequirement,
+    ) -> Self {
+        Self {
+            apply,
+            remove,
+            select_targets,
+            context,
+        }
+    }
+
+    fn apply(
+        self,
+        request: &NativePlanRequest<'_>,
+        settings: &Value,
+    ) -> Result<OperationPlan, NativePlanError> {
+        (self.apply)(request, settings)
+    }
+
+    fn remove(self, request: &NativePlanRequest<'_>) -> Result<OperationPlan, NativePlanError> {
+        self.remove
+            .ok_or_else(|| NativePlanError::UnsupportedAction {
+                app_id: request.provider.app.as_str().to_owned(),
+                action: NativeAction::Remove,
+            })?(request)
+    }
+
+    fn targets(
+        self,
+        declared_targets: &[LogicalTarget],
+        action: NativeAction,
+        provider: &ProviderSnapshot,
+        mode: NativeProviderMode,
+    ) -> Vec<LogicalTarget> {
+        (self.select_targets)(declared_targets, action, provider, mode)
+    }
+
+    pub(crate) const fn context(self) -> NativeContextRequirement {
+        self.context
+    }
 }
 
 /// App-specific context normalized by the consumer.
@@ -156,16 +223,9 @@ pub(crate) fn required_native_targets(
         });
     }
 
-    let mut targets = declared_targets.to_vec();
-    if *adapter_app == AppType::Codex && action == NativeAction::Apply {
-        if mode == NativeProviderMode::Custom {
-            targets.retain(|target| *target != LogicalTarget::CodexAuth);
-        }
-        if provider.settings.get("modelCatalog").is_none() {
-            targets.retain(|target| *target != LogicalTarget::CodexModelCatalog);
-        }
-    }
-    Ok(targets)
+    Ok(builtin_app_integration(adapter_app)
+        .native_projection_behavior()
+        .targets(declared_targets, action, provider, mode))
 }
 
 pub(crate) fn plan_native(
@@ -196,16 +256,17 @@ pub(crate) fn plan_native(
             action: NativeAction::Remove,
         });
     }
-    match (adapter_app, &request.context) {
-        (AppType::ClaudeDesktop, NativePlanContext::ClaudeDesktop { .. }) => {}
-        (AppType::ClaudeDesktop, NativePlanContext::Standard { .. }) => {
+    let behavior = builtin_app_integration(adapter_app).native_projection_behavior();
+    match (behavior.context(), &request.context) {
+        (NativeContextRequirement::ClaudeDesktop, NativePlanContext::ClaudeDesktop { .. }) => {}
+        (NativeContextRequirement::ClaudeDesktop, NativePlanContext::Standard { .. }) => {
             return Err(invalid_context(
                 adapter_app,
                 "Claude Desktop requires typed route context",
             ));
         }
-        (_, NativePlanContext::Standard { .. }) => {}
-        (_, NativePlanContext::ClaudeDesktop { .. }) => {
+        (NativeContextRequirement::Standard, NativePlanContext::Standard { .. }) => {}
+        (NativeContextRequirement::Standard, NativePlanContext::ClaudeDesktop { .. }) => {
             return Err(invalid_context(
                 adapter_app,
                 "Claude Desktop route context belongs to another application",
@@ -214,8 +275,8 @@ pub(crate) fn plan_native(
     }
 
     match request.action {
-        NativeAction::Apply => prepare_apply(request),
-        NativeAction::Remove => prepare_remove(request),
+        NativeAction::Apply => prepare_apply(request, behavior),
+        NativeAction::Remove => prepare_remove(request, behavior),
     }
 }
 
@@ -307,63 +368,20 @@ impl Write for SizeLimitedWriter {
     }
 }
 
-fn prepare_apply(request: &NativePlanRequest<'_>) -> Result<OperationPlan, NativePlanError> {
-    let app = &request.provider.app;
+fn prepare_apply(
+    request: &NativePlanRequest<'_>,
+    behavior: NativeProjectionBehavior,
+) -> Result<OperationPlan, NativePlanError> {
     let settings = apply_common_config(request)?;
-    match app {
-        AppType::Claude => {
-            let snapshot = claude::prepare_live_snapshot(&settings)
-                .map_err(|error| invalid_provider(app, error.to_string()))?;
-            single_write(
-                app,
-                request.documents,
-                LogicalTarget::ClaudeSettings,
-                pretty_json(&snapshot.settings, LogicalTarget::ClaudeSettings)?,
-            )
-        }
-        AppType::Codex => codex_plan(request, &settings),
-        AppType::Gemini => gemini_plan(request, &settings),
-        AppType::GrokBuild => grokbuild_plan(request, &settings),
-        AppType::OpenCode => {
-            require_custom_mode(request)?;
-            let entry = opencode::prepare_provider_entry(&request.provider.id, &settings)
-                .map_err(|error| invalid_provider(app, error.to_string()))?;
-            json_entry_plan(request, entry, &["provider"], JsonRoot::Empty)
-        }
-        AppType::OpenClaw => {
-            require_custom_mode(request)?;
-            let entry = openclaw::prepare_provider_entry(&request.provider.id, &settings)
-                .map_err(|error| invalid_provider(app, error.to_string()))?;
-            json_entry_plan(request, entry, &["models", "providers"], JsonRoot::OpenClaw)
-        }
-        AppType::ClaudeDesktop => claude_desktop_plan(request, &settings),
-        AppType::Hermes => {
-            require_custom_mode(request)?;
-            hermes_plan(request, &settings)
-        }
-        AppType::Pi => {
-            require_custom_mode(request)?;
-            let entry = pi::prepare_provider_entry(&request.provider.id, &settings)
-                .map_err(|error| invalid_provider(app, error.to_string()))?;
-            json_entry_plan(request, entry, &["providers"], JsonRoot::Empty)
-        }
-    }
+    behavior.apply(request, &settings)
 }
 
-fn prepare_remove(request: &NativePlanRequest<'_>) -> Result<OperationPlan, NativePlanError> {
+fn prepare_remove(
+    request: &NativePlanRequest<'_>,
+    behavior: NativeProjectionBehavior,
+) -> Result<OperationPlan, NativePlanError> {
     require_custom_mode(request)?;
-    match request.provider.app {
-        AppType::OpenCode => json_remove_plan(request, &["provider"], JsonRoot::Empty),
-        AppType::OpenClaw => {
-            json_remove_plan(request, &["models", "providers"], JsonRoot::OpenClaw)
-        }
-        AppType::Hermes => hermes_remove_plan(request),
-        AppType::Pi => json_remove_plan(request, &["providers"], JsonRoot::Empty),
-        _ => Err(NativePlanError::UnsupportedAction {
-            app_id: request.provider.app.as_str().to_owned(),
-            action: NativeAction::Remove,
-        }),
-    }
+    behavior.remove(request)
 }
 
 fn apply_common_config(request: &NativePlanRequest<'_>) -> Result<Value, NativePlanError> {
@@ -391,7 +409,127 @@ fn require_custom_mode(request: &NativePlanRequest<'_>) -> Result<(), NativePlan
     }
 }
 
-fn codex_plan(
+pub(crate) fn declared_native_targets(
+    declared_targets: &[LogicalTarget],
+    _action: NativeAction,
+    _provider: &ProviderSnapshot,
+    _mode: NativeProviderMode,
+) -> Vec<LogicalTarget> {
+    declared_targets.to_vec()
+}
+
+pub(crate) fn codex_native_targets(
+    declared_targets: &[LogicalTarget],
+    action: NativeAction,
+    provider: &ProviderSnapshot,
+    mode: NativeProviderMode,
+) -> Vec<LogicalTarget> {
+    let mut targets = declared_targets.to_vec();
+    if action == NativeAction::Apply {
+        if mode == NativeProviderMode::Custom {
+            targets.retain(|target| *target != LogicalTarget::CodexAuth);
+        }
+        if provider.settings.get("modelCatalog").is_none() {
+            targets.retain(|target| *target != LogicalTarget::CodexModelCatalog);
+        }
+    }
+    targets
+}
+
+pub(crate) fn claude_plan(
+    request: &NativePlanRequest<'_>,
+    settings: &Value,
+) -> Result<OperationPlan, NativePlanError> {
+    let snapshot = claude::prepare_live_snapshot(settings)
+        .map_err(|error| invalid_provider(&request.provider.app, error.to_string()))?;
+    single_write(
+        &request.provider.app,
+        request.documents,
+        LogicalTarget::ClaudeSettings,
+        pretty_json(&snapshot.settings, LogicalTarget::ClaudeSettings)?,
+    )
+}
+
+pub(crate) fn opencode_plan(
+    request: &NativePlanRequest<'_>,
+    settings: &Value,
+) -> Result<OperationPlan, NativePlanError> {
+    require_custom_mode(request)?;
+    let entry = opencode::prepare_provider_entry(&request.provider.id, settings)
+        .map_err(|error| invalid_provider(&request.provider.app, error.to_string()))?;
+    json_entry_plan(
+        request,
+        entry,
+        LogicalTarget::OpenCodeConfig,
+        &["provider"],
+        JsonRoot::Empty,
+    )
+}
+
+pub(crate) fn openclaw_plan(
+    request: &NativePlanRequest<'_>,
+    settings: &Value,
+) -> Result<OperationPlan, NativePlanError> {
+    require_custom_mode(request)?;
+    let entry = openclaw::prepare_provider_entry(&request.provider.id, settings)
+        .map_err(|error| invalid_provider(&request.provider.app, error.to_string()))?;
+    json_entry_plan(
+        request,
+        entry,
+        LogicalTarget::OpenClawConfig,
+        &["models", "providers"],
+        JsonRoot::OpenClaw,
+    )
+}
+
+pub(crate) fn pi_plan(
+    request: &NativePlanRequest<'_>,
+    settings: &Value,
+) -> Result<OperationPlan, NativePlanError> {
+    require_custom_mode(request)?;
+    let entry = pi::prepare_provider_entry(&request.provider.id, settings)
+        .map_err(|error| invalid_provider(&request.provider.app, error.to_string()))?;
+    json_entry_plan(
+        request,
+        entry,
+        LogicalTarget::PiModels,
+        &["providers"],
+        JsonRoot::Empty,
+    )
+}
+
+pub(crate) fn remove_opencode(
+    request: &NativePlanRequest<'_>,
+) -> Result<OperationPlan, NativePlanError> {
+    json_remove_plan(
+        request,
+        LogicalTarget::OpenCodeConfig,
+        &["provider"],
+        JsonRoot::Empty,
+    )
+}
+
+pub(crate) fn remove_openclaw(
+    request: &NativePlanRequest<'_>,
+) -> Result<OperationPlan, NativePlanError> {
+    json_remove_plan(
+        request,
+        LogicalTarget::OpenClawConfig,
+        &["models", "providers"],
+        JsonRoot::OpenClaw,
+    )
+}
+
+pub(crate) fn remove_pi(request: &NativePlanRequest<'_>) -> Result<OperationPlan, NativePlanError> {
+    json_remove_plan(
+        request,
+        LogicalTarget::PiModels,
+        &["providers"],
+        JsonRoot::Empty,
+    )
+}
+
+pub(crate) fn codex_plan(
     request: &NativePlanRequest<'_>,
     settings: &Value,
 ) -> Result<OperationPlan, NativePlanError> {
@@ -449,7 +587,7 @@ fn codex_plan(
     plan(&request.provider.app, writes)
 }
 
-fn gemini_plan(
+pub(crate) fn gemini_plan(
     request: &NativePlanRequest<'_>,
     settings: &Value,
 ) -> Result<OperationPlan, NativePlanError> {
@@ -483,7 +621,7 @@ fn gemini_plan(
     )
 }
 
-fn grokbuild_plan(
+pub(crate) fn grokbuild_plan(
     request: &NativePlanRequest<'_>,
     settings: &Value,
 ) -> Result<OperationPlan, NativePlanError> {
@@ -502,7 +640,7 @@ fn grokbuild_plan(
     )
 }
 
-fn claude_desktop_plan(
+pub(crate) fn claude_desktop_plan(
     request: &NativePlanRequest<'_>,
     settings: &Value,
 ) -> Result<OperationPlan, NativePlanError> {
@@ -654,14 +792,14 @@ fn invalid_document(target: LogicalTarget, message: impl Into<String>) -> Native
 fn json_entry_plan(
     request: &NativePlanRequest<'_>,
     entry: ProviderEntry,
+    target: LogicalTarget,
     keys: &[&str],
     default: JsonRoot,
 ) -> Result<OperationPlan, NativePlanError> {
-    let target = json_target(&request.provider.app)?;
     let original = contents(request.documents, target)?;
     let mut root = parse_json5_object(original, target, default.value())?;
     ensure_nested_object(&mut root, keys, target)?.insert(entry.key, entry.config);
-    let next = serialize_json_root(&request.provider.app, &root, original)?;
+    let next = serialize_json_root(target, &root, original)?;
     plan(
         &request.provider.app,
         vec![planned(target, original, Some(next))],
@@ -670,26 +808,27 @@ fn json_entry_plan(
 
 fn json_remove_plan(
     request: &NativePlanRequest<'_>,
+    target: LogicalTarget,
     keys: &[&str],
     default: JsonRoot,
 ) -> Result<OperationPlan, NativePlanError> {
-    let target = json_target(&request.provider.app)?;
     let original = contents(request.documents, target)?;
     let mut root = parse_json5_object(original, target, default.value())?;
     if let Some(entries) = nested_object_mut(&mut root, keys) {
         entries.remove(&request.provider.id);
     }
-    let next = serialize_json_root(&request.provider.app, &root, original)?;
+    let next = serialize_json_root(target, &root, original)?;
     plan(
         &request.provider.app,
         vec![planned(target, original, Some(next))],
     )
 }
 
-fn hermes_plan(
+pub(crate) fn hermes_plan(
     request: &NativePlanRequest<'_>,
     settings: &Value,
 ) -> Result<OperationPlan, NativePlanError> {
+    require_custom_mode(request)?;
     let entry = hermes::prepare_provider_entry(&request.provider.id, settings)
         .map_err(|error| invalid_provider(&request.provider.app, error.to_string()))?;
     let target = LogicalTarget::HermesConfig;
@@ -738,7 +877,9 @@ fn hermes_plan(
     )
 }
 
-fn hermes_remove_plan(request: &NativePlanRequest<'_>) -> Result<OperationPlan, NativePlanError> {
+pub(crate) fn hermes_remove_plan(
+    request: &NativePlanRequest<'_>,
+) -> Result<OperationPlan, NativePlanError> {
     let target = LogicalTarget::HermesConfig;
     let original = contents(request.documents, target)?;
     let raw = optional_utf8(original, target)?;
@@ -955,6 +1096,7 @@ fn ensure_nested_object<'a>(
     Ok(current)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonRoot {
     Empty,
     OpenClaw,
@@ -970,14 +1112,13 @@ impl JsonRoot {
 }
 
 fn serialize_json_root(
-    app: &AppType,
+    target: LogicalTarget,
     root: &Map<String, Value>,
     original: Option<&[u8]>,
 ) -> Result<String, NativePlanError> {
-    if *app != AppType::OpenClaw {
-        return pretty_json(&Value::Object(root.clone()), json_target(app)?);
+    if target != LogicalTarget::OpenClawConfig {
+        return pretty_json(&Value::Object(root.clone()), target);
     }
-    let target = LogicalTarget::OpenClawConfig;
     let source = optional_utf8(original, target)?;
     let source = if source.trim().is_empty() {
         OPENCLAW_DEFAULT_SOURCE
@@ -1119,18 +1260,6 @@ fn json5_key_name(key: &JSONValue) -> Option<&str> {
         | JSONValue::DoubleQuotedString(value)
         | JSONValue::SingleQuotedString(value) => Some(value),
         _ => None,
-    }
-}
-
-fn json_target(app: &AppType) -> Result<LogicalTarget, NativePlanError> {
-    match app {
-        AppType::OpenCode => Ok(LogicalTarget::OpenCodeConfig),
-        AppType::OpenClaw => Ok(LogicalTarget::OpenClawConfig),
-        AppType::Pi => Ok(LogicalTarget::PiModels),
-        _ => Err(invalid_context(
-            app,
-            "application is not a JSON additive target",
-        )),
     }
 }
 

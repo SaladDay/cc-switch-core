@@ -3,8 +3,7 @@
 use std::fmt;
 
 use crate::{
-    builtin_app_registry,
-    integration::{builtin_app_integration, builtin_app_integrations},
+    integration::{builtin_app_integration, builtin_app_integrations, AppIntegration},
     native_import, projection, AppDescriptor, AppType, LiveDocumentSet, LogicalTarget,
     McpAppContract, McpConfigError, McpConfigTarget, McpImport, McpServerProjection, NativeAction,
     NativeImportError, NativeImportStep, NativePlanError, NativePlanRequest, OperationPlan,
@@ -132,39 +131,27 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct BuiltinAdapter {
-    app: AppType,
-    targets: &'static [LogicalTarget],
-}
+impl sealed::Sealed for AppIntegration {}
 
-impl BuiltinAdapter {
-    pub(crate) const fn new(app: AppType, targets: &'static [LogicalTarget]) -> Self {
-        Self { app, targets }
-    }
-}
-
-impl sealed::Sealed for BuiltinAdapter {}
-
-impl AppAdapter for BuiltinAdapter {
+impl AppAdapter for AppIntegration {
     fn descriptor(&self) -> &'static AppDescriptor {
-        builtin_app_registry().for_app(&self.app)
+        builtin_app_integration(AppIntegration::descriptor(self).app()).descriptor()
     }
 
     fn targets(&self) -> &'static [LogicalTarget] {
-        self.targets
+        AppIntegration::targets(self)
     }
 }
 
 /// Iterates over built-in adapters in registry display order.
 pub fn builtin_app_adapters(
 ) -> impl ExactSizeIterator<Item = &'static dyn AppAdapter> + DoubleEndedIterator + Clone {
-    builtin_app_integrations().map(|integration| integration.adapter() as &dyn AppAdapter)
+    builtin_app_integrations().map(|integration| integration as &dyn AppAdapter)
 }
 
 /// Returns the built-in adapter for an application.
 pub fn builtin_app_adapter(app: &AppType) -> &'static dyn AppAdapter {
-    builtin_app_integration(app).adapter()
+    builtin_app_integration(app)
 }
 
 #[cfg(test)]
@@ -172,7 +159,25 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::{AppCapability, ContentExpectation, PlannedWrite, OPERATION_CONTRACT_MAJOR};
+    use crate::{
+        builtin_app_registry, AppCapability, ContentExpectation, PlannedWrite,
+        OPERATION_CONTRACT_MAJOR,
+    };
+
+    #[derive(Debug)]
+    struct TestAdapter;
+
+    impl sealed::Sealed for TestAdapter {}
+
+    impl AppAdapter for TestAdapter {
+        fn descriptor(&self) -> &'static AppDescriptor {
+            builtin_app_registry().for_app(&AppType::Claude)
+        }
+
+        fn targets(&self) -> &'static [LogicalTarget] {
+            &[]
+        }
+    }
 
     #[test]
     fn every_registry_app_has_one_ordered_adapter() {
@@ -386,10 +391,7 @@ mod tests {
             Err(OperationPlanError::WrongApp { .. })
         ));
 
-        let adapter_without_targets = BuiltinAdapter {
-            app: AppType::Claude,
-            targets: &[],
-        };
+        let adapter_without_targets = TestAdapter;
         let undeclared = OperationPlan {
             contract_major: OPERATION_CONTRACT_MAJOR,
             app_id: "claude".to_owned(),
