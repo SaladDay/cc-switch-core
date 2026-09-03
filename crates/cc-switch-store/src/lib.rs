@@ -2,7 +2,7 @@
 //!
 //! Hosts choose the database path and retain ownership of product migrations,
 //! extension tables, and business rules. This crate safely opens that path and
-//! can initialize the canonical `providers` table needed by native products.
+//! can initialize the canonical shared tables needed by native products.
 
 use std::{
     fmt,
@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod mcp;
+mod skill;
 
 pub use mcp::{
     delete_mcp_server, ensure_mcp_server_schema, insert_mcp_server, read_mcp_server_row,
@@ -26,6 +27,7 @@ pub use mcp::{
     verify_mcp_server_write_contract, McpServerRow, McpServerValues, McpServerWriteOutcome,
     MCP_SERVERS_TABLE,
 };
+pub use skill::{ensure_skill_schema, read_skill_catalog, SKILLS_TABLE};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -356,6 +358,15 @@ impl SharedDatabase {
     pub fn ensure_mcp_server_schema(&self) -> Result<(), SharedStoreError> {
         let mut connection = self.connect()?;
         ensure_mcp_server_schema(&mut connection)
+    }
+
+    /// Creates or transactionally upgrades the shared installed Skill catalog.
+    ///
+    /// Skill files, repositories, update metadata, and native state remain
+    /// owned by the host.
+    pub fn ensure_skill_schema(&self) -> Result<(), SharedStoreError> {
+        let mut connection = self.connect()?;
+        ensure_skill_schema(&mut connection)
     }
 
     #[cfg(unix)]
