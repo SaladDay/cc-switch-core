@@ -54,8 +54,12 @@ tables, product schema versions, or database path discovery.
 The MCP catalog has a narrower opt-in write contract. Hosts may add columns,
 indexes, and triggers, but table constraints must retain SQLite's default
 `ABORT` conflict handling. Trigger bodies keep their own conflict policies and
-product-specific MCP state remains host-owned. Read-only consumers do not need
-to opt into this write contract.
+may maintain host columns or host-owned tables. They must not replace a target
+row or mutate other MCP catalog rows. Shared writes detect and roll back a
+suppressed write or a changed public target state; a same-value replacement is
+not observable and therefore remains a host contract violation. Callers own an
+immediate transaction and product-specific MCP state. Read-only consumers do
+not need to opt into this write contract.
 
 The live-operation layer does not own paths, raw-plan syntax validation,
 concrete file I/O, locks, business state, databases, UI, OAuth flows, proxy

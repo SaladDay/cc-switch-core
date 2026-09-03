@@ -58,6 +58,7 @@ dependencies = [
 name = "cc-switch-store"
 version = "0.1.0"
 dependencies = [
+ "cc-switch-core",
  "libc",
  "rusqlite",
  "sha2",

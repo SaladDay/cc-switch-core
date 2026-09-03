@@ -21,8 +21,10 @@ use thiserror::Error;
 mod mcp;
 
 pub use mcp::{
-    ensure_mcp_server_schema, read_mcp_server_row, read_mcp_server_rows,
-    verify_mcp_server_write_contract, McpServerRow, MCP_SERVERS_TABLE,
+    delete_mcp_server, ensure_mcp_server_schema, insert_mcp_server, read_mcp_server_row,
+    read_mcp_server_rows, set_mcp_server_enabled, update_mcp_server,
+    verify_mcp_server_write_contract, McpServerRow, McpServerValues, McpServerWriteOutcome,
+    MCP_SERVERS_TABLE,
 };
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -263,6 +265,13 @@ pub enum SharedStoreError {
     Database(#[from] rusqlite::Error),
     #[error("shared provider write failed")]
     ProviderWrite {
+        code: Option<rusqlite::ErrorCode>,
+        extended_code: Option<i32>,
+        /// SQLite ended the host transaction while executing the write.
+        transaction_aborted: bool,
+    },
+    #[error("shared MCP server write failed")]
+    McpServerWrite {
         code: Option<rusqlite::ErrorCode>,
         extended_code: Option<i32>,
         /// SQLite ended the host transaction while executing the write.

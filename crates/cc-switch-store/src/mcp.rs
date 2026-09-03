@@ -1,6 +1,9 @@
 use std::fmt;
 
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior};
+use cc_switch_core::McpConfigTarget;
+use rusqlite::{
+    params, Connection, OptionalExtension, Params, Row, ToSql, Transaction, TransactionBehavior,
+};
 
 use crate::{source_fingerprint, SharedStoreError};
 
@@ -194,6 +197,85 @@ impl fmt::Debug for McpServerRow {
     }
 }
 
+/// Raw values for one shared MCP catalog row.
+pub struct McpServerValues<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub server_config: &'a str,
+    pub description: Option<&'a str>,
+    pub homepage: Option<&'a str>,
+    pub docs: Option<&'a str>,
+    pub tags: &'a str,
+    pub enabled_claude: bool,
+    pub enabled_codex: bool,
+    pub enabled_gemini: bool,
+    pub enabled_grokbuild: bool,
+    pub enabled_opencode: bool,
+    pub enabled_hermes: bool,
+}
+
+impl fmt::Debug for McpServerValues<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpServerValues")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("server_config", &"<redacted>")
+            .field("description", &self.description)
+            .field("homepage", &self.homepage)
+            .field("docs", &self.docs)
+            .field("tags", &self.tags)
+            .field("enabled_claude", &self.enabled_claude)
+            .field("enabled_codex", &self.enabled_codex)
+            .field("enabled_gemini", &self.enabled_gemini)
+            .field("enabled_grokbuild", &self.enabled_grokbuild)
+            .field("enabled_opencode", &self.enabled_opencode)
+            .field("enabled_hermes", &self.enabled_hermes)
+            .finish()
+    }
+}
+
+impl McpServerValues<'_> {
+    fn params(&self) -> [&dyn ToSql; MCP_SERVER_FIELD_COUNT] {
+        [
+            &self.id,
+            &self.name,
+            &self.server_config,
+            &self.description,
+            &self.homepage,
+            &self.docs,
+            &self.tags,
+            &self.enabled_claude,
+            &self.enabled_codex,
+            &self.enabled_gemini,
+            &self.enabled_grokbuild,
+            &self.enabled_opencode,
+            &self.enabled_hermes,
+        ]
+    }
+}
+
+fn enabled_column(target: McpConfigTarget) -> &'static str {
+    match target {
+        McpConfigTarget::Claude => "enabled_claude",
+        McpConfigTarget::Codex => "enabled_codex",
+        McpConfigTarget::Gemini => "enabled_gemini",
+        McpConfigTarget::GrokBuild => "enabled_grokbuild",
+        McpConfigTarget::OpenCode => "enabled_opencode",
+        McpConfigTarget::Hermes => "enabled_hermes",
+    }
+}
+
+/// Result of a compare-and-swap MCP row write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum McpServerWriteOutcome {
+    /// Exactly one target row reached the requested public state.
+    Applied,
+    /// The expected row state was absent, stale, or suppressed by a trigger.
+    NotApplied,
+}
+
 /// Creates or transactionally upgrades the shared `mcp_servers` table.
 ///
 /// Unknown tables, columns, rows, indexes, and triggers are retained. Product
@@ -254,6 +336,99 @@ pub fn read_mcp_server_row(
         .map_err(SharedStoreError::from)
 }
 
+/// Inserts one MCP row only when its binary identifier is absent.
+pub fn insert_mcp_server(
+    transaction: &mut Transaction<'_>,
+    server: &McpServerValues<'_>,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    if mcp_server_for_write(transaction, server.id)?.is_some() {
+        return Ok(McpServerWriteOutcome::NotApplied);
+    }
+    execute_mcp_server_write(
+        transaction,
+        "INSERT INTO main.mcp_servers (
+            id, name, server_config, description, homepage, docs, tags,
+            enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild,
+            enabled_opencode, enabled_hermes
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        server.params(),
+        |connection| {
+            Ok(read_mcp_server_row(connection, server.id)?
+                .as_ref()
+                .is_some_and(|row| mcp_server_matches(row, server)))
+        },
+    )
+}
+
+/// Replaces the public fields of one MCP row when its full source fingerprint
+/// still matches. Unknown host columns are not assigned.
+pub fn update_mcp_server(
+    transaction: &mut Transaction<'_>,
+    expected_fingerprint: &[u8; 32],
+    server: &McpServerValues<'_>,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    if !mcp_server_fingerprint_matches(transaction, server.id, expected_fingerprint)? {
+        return Ok(McpServerWriteOutcome::NotApplied);
+    }
+    execute_mcp_server_write(
+        transaction,
+        "UPDATE main.mcp_servers SET
+            name = ?2, server_config = ?3, description = ?4, homepage = ?5,
+            docs = ?6, tags = ?7, enabled_claude = ?8, enabled_codex = ?9,
+            enabled_gemini = ?10, enabled_grokbuild = ?11,
+            enabled_opencode = ?12, enabled_hermes = ?13
+         WHERE id COLLATE BINARY = ?1",
+        server.params(),
+        |connection| {
+            Ok(read_mcp_server_row(connection, server.id)?
+                .as_ref()
+                .is_some_and(|row| mcp_server_matches(row, server)))
+        },
+    )
+}
+
+/// Changes one application flag when the MCP row fingerprint still matches.
+pub fn set_mcp_server_enabled(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    expected_fingerprint: &[u8; 32],
+    target: McpConfigTarget,
+    enabled: bool,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    let Some(before) = mcp_server_for_write(transaction, id)? else {
+        return Ok(McpServerWriteOutcome::NotApplied);
+    };
+    if before.source_fingerprint() != expected_fingerprint {
+        return Ok(McpServerWriteOutcome::NotApplied);
+    }
+    let sql = format!(
+        "UPDATE main.mcp_servers SET {} = ?1 WHERE id COLLATE BINARY = ?2",
+        enabled_column(target)
+    );
+    execute_mcp_server_write(transaction, &sql, params![enabled, id], |connection| {
+        Ok(read_mcp_server_row(connection, id)?
+            .as_ref()
+            .is_some_and(|after| mcp_toggle_matches(&before, after, target, enabled)))
+    })
+}
+
+/// Deletes one MCP row when its full source fingerprint still matches.
+pub fn delete_mcp_server(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    expected_fingerprint: &[u8; 32],
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    if !mcp_server_fingerprint_matches(transaction, id, expected_fingerprint)? {
+        return Ok(McpServerWriteOutcome::NotApplied);
+    }
+    execute_mcp_server_write(
+        transaction,
+        "DELETE FROM main.mcp_servers WHERE id COLLATE BINARY = ?1",
+        [id],
+        |connection| Ok(read_mcp_server_row(connection, id)?.is_none()),
+    )
+}
+
 /// Verifies the structural contract required by shared MCP writes.
 ///
 /// Hosts may add columns, indexes, and triggers, but table constraints must
@@ -311,6 +486,153 @@ fn mcp_server_from_row(row: &Row<'_>) -> Result<McpServerRow, rusqlite::Error> {
         enabled_hermes: row.get(12)?,
         source_fingerprint: source_fingerprint(row, MCP_SERVER_FIELD_COUNT)?,
     })
+}
+
+fn mcp_server_for_write(
+    transaction: &Transaction<'_>,
+    id: &str,
+) -> Result<Option<McpServerRow>, SharedStoreError> {
+    prepare_mcp_server_write(transaction)?;
+    read_mcp_server_row(transaction, id)
+        .map_err(|error| redact_mcp_server_store_error(error, transaction.is_autocommit()))
+}
+
+fn mcp_server_fingerprint_matches(
+    transaction: &Transaction<'_>,
+    id: &str,
+    expected: &[u8; 32],
+) -> Result<bool, SharedStoreError> {
+    Ok(mcp_server_for_write(transaction, id)?
+        .as_ref()
+        .is_some_and(|row| row.source_fingerprint() == expected))
+}
+
+fn prepare_mcp_server_write(transaction: &Transaction<'_>) -> Result<(), SharedStoreError> {
+    if transaction.is_autocommit() {
+        return Err(SharedStoreError::McpServerWrite {
+            code: None,
+            extended_code: None,
+            transaction_aborted: true,
+        });
+    }
+    verify_mcp_server_write_contract(transaction)
+        .map_err(|error| redact_mcp_server_store_error(error, transaction.is_autocommit()))
+}
+
+fn execute_mcp_server_write<P, F>(
+    transaction: &mut Transaction<'_>,
+    sql: &str,
+    params: P,
+    postcondition: F,
+) -> Result<McpServerWriteOutcome, SharedStoreError>
+where
+    P: Params,
+    F: FnOnce(&Connection) -> Result<bool, SharedStoreError>,
+{
+    let transaction_aborted = transaction.is_autocommit();
+    let savepoint = transaction
+        .savepoint()
+        .map_err(|error| redact_mcp_server_write_error(error, transaction_aborted))?;
+    let result = (|| {
+        let changed = {
+            let mut statement = savepoint.prepare(sql)?;
+            let mut rows = statement.query(params)?;
+            while rows.next()?.is_some() {}
+            savepoint.changes() as usize
+        };
+        let postcondition_matches = changed == 1 && postcondition(&savepoint)?;
+        Ok::<_, SharedStoreError>((changed, postcondition_matches))
+    })();
+    let (changed, postcondition_matches) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = savepoint.finish();
+            return Err(redact_mcp_server_store_error(
+                error,
+                transaction.is_autocommit(),
+            ));
+        }
+    };
+    if changed > 1 {
+        savepoint
+            .finish()
+            .map_err(|error| redact_mcp_server_write_error(error, transaction.is_autocommit()))?;
+        return Err(SharedStoreError::InvalidDatabase(
+            "MCP server write affected multiple rows".to_owned(),
+        ));
+    }
+    if !postcondition_matches {
+        savepoint
+            .finish()
+            .map_err(|error| redact_mcp_server_write_error(error, transaction.is_autocommit()))?;
+        return Ok(McpServerWriteOutcome::NotApplied);
+    }
+    savepoint
+        .commit()
+        .map_err(|error| redact_mcp_server_write_error(error, transaction.is_autocommit()))?;
+    Ok(McpServerWriteOutcome::Applied)
+}
+
+fn redact_mcp_server_store_error(
+    error: SharedStoreError,
+    transaction_aborted: bool,
+) -> SharedStoreError {
+    match error {
+        SharedStoreError::Database(error) => {
+            redact_mcp_server_write_error(error, transaction_aborted)
+        }
+        error => error,
+    }
+}
+
+fn redact_mcp_server_write_error(
+    error: rusqlite::Error,
+    transaction_aborted: bool,
+) -> SharedStoreError {
+    let extended_code = match &error {
+        rusqlite::Error::SqliteFailure(error, _) => Some(error.extended_code),
+        _ => None,
+    };
+    SharedStoreError::McpServerWrite {
+        code: error.sqlite_error_code(),
+        extended_code,
+        transaction_aborted,
+    }
+}
+
+fn mcp_server_matches(row: &McpServerRow, values: &McpServerValues<'_>) -> bool {
+    row.id == values.id
+        && row.name == values.name
+        && row.server_config == values.server_config
+        && row.description.as_deref() == values.description
+        && row.homepage.as_deref() == values.homepage
+        && row.docs.as_deref() == values.docs
+        && row.tags == values.tags
+        && row.enabled_claude == i64::from(values.enabled_claude)
+        && row.enabled_codex == i64::from(values.enabled_codex)
+        && row.enabled_gemini == i64::from(values.enabled_gemini)
+        && row.enabled_grokbuild == i64::from(values.enabled_grokbuild)
+        && row.enabled_opencode == i64::from(values.enabled_opencode)
+        && row.enabled_hermes == i64::from(values.enabled_hermes)
+}
+
+fn mcp_toggle_matches(
+    before: &McpServerRow,
+    after: &McpServerRow,
+    target: McpConfigTarget,
+    enabled: bool,
+) -> bool {
+    let mut expected = before.clone();
+    match target {
+        McpConfigTarget::Claude => expected.enabled_claude = i64::from(enabled),
+        McpConfigTarget::Codex => expected.enabled_codex = i64::from(enabled),
+        McpConfigTarget::Gemini => expected.enabled_gemini = i64::from(enabled),
+        McpConfigTarget::GrokBuild => expected.enabled_grokbuild = i64::from(enabled),
+        McpConfigTarget::OpenCode => expected.enabled_opencode = i64::from(enabled),
+        McpConfigTarget::Hermes => expected.enabled_hermes = i64::from(enabled),
+    }
+    expected.source_fingerprint = after.source_fingerprint;
+    expected == *after
 }
 
 fn has_non_abort_conflict_policy(sql: &str) -> bool {
@@ -521,13 +843,31 @@ fn verify_mcp_server_primary_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SharedDatabase;
+    use crate::{begin_immediate_transaction, SharedDatabase};
 
     fn test_database() -> (tempfile::TempDir, SharedDatabase) {
         let directory = tempfile::tempdir().expect("temporary directory");
         let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
             .expect("open shared database");
         (directory, database)
+    }
+
+    fn values<'a>(id: &'a str, name: &'a str, server_config: &'a str) -> McpServerValues<'a> {
+        McpServerValues {
+            id,
+            name,
+            server_config,
+            description: Some("description"),
+            homepage: None,
+            docs: Some("https://example.com/docs"),
+            tags: "[\"docs\"]",
+            enabled_claude: true,
+            enabled_codex: false,
+            enabled_gemini: false,
+            enabled_grokbuild: false,
+            enabled_opencode: false,
+            enabled_hermes: false,
+        }
     }
 
     #[test]
@@ -894,5 +1234,239 @@ mod tests {
             SharedStoreError::InvalidDatabase(message)
                 if message == "mcp_servers table definition is invalid"
         ));
+    }
+
+    #[test]
+    fn write_primitives_use_binary_cas_and_preserve_host_extensions() {
+        let (_directory, database) = test_database();
+        database
+            .ensure_mcp_server_schema()
+            .expect("initialize MCP schema");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "PRAGMA count_changes = ON;
+                 ALTER TABLE mcp_servers ADD COLUMN host_note TEXT DEFAULT 'created';
+                 CREATE TABLE host_mcp_audit (event TEXT UNIQUE);
+                 INSERT INTO host_mcp_audit VALUES ('insert:server');
+                 CREATE TRIGGER host_mcp_insert AFTER INSERT ON mcp_servers BEGIN
+                    INSERT OR IGNORE INTO host_mcp_audit VALUES ('insert:' || NEW.id);
+                 END;
+                 CREATE TRIGGER host_mcp_update AFTER UPDATE OF name ON mcp_servers BEGIN
+                    UPDATE mcp_servers SET host_note = 'updated' WHERE id = NEW.id;
+                 END;",
+            )
+            .expect("add host extensions");
+
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("begin write");
+        let initial = values("server", "Server", "{\"token\":\"one\"}");
+        assert_eq!(
+            insert_mcp_server(&mut transaction, &initial).expect("insert MCP row"),
+            McpServerWriteOutcome::Applied
+        );
+        assert_eq!(
+            insert_mcp_server(&mut transaction, &initial).expect("reject duplicate MCP row"),
+            McpServerWriteOutcome::NotApplied
+        );
+        let inserted = read_mcp_server_row(&transaction, "server")
+            .expect("read inserted row")
+            .expect("inserted row exists");
+        let inserted_fingerprint = *inserted.source_fingerprint();
+        let mut updated = values("server", "Updated", "{\"token\":\"two\"}");
+        updated.enabled_gemini = true;
+        assert_eq!(
+            update_mcp_server(&mut transaction, &inserted_fingerprint, &updated)
+                .expect("update MCP row"),
+            McpServerWriteOutcome::Applied
+        );
+        assert_eq!(
+            transaction
+                .query_row(
+                    "SELECT host_note FROM mcp_servers WHERE id = 'server'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read host extension"),
+            "updated"
+        );
+        assert_eq!(
+            update_mcp_server(&mut transaction, &inserted_fingerprint, &updated)
+                .expect("reject stale MCP update"),
+            McpServerWriteOutcome::NotApplied
+        );
+        let updated_row = read_mcp_server_row(&transaction, "server")
+            .expect("read updated row")
+            .expect("updated row exists");
+        assert_eq!(
+            set_mcp_server_enabled(
+                &mut transaction,
+                "Server",
+                updated_row.source_fingerprint(),
+                McpConfigTarget::Codex,
+                true,
+            )
+            .expect("use binary identity"),
+            McpServerWriteOutcome::NotApplied
+        );
+        let updated_fingerprint = *updated_row.source_fingerprint();
+        assert_eq!(
+            set_mcp_server_enabled(
+                &mut transaction,
+                "server",
+                &updated_fingerprint,
+                McpConfigTarget::Codex,
+                true,
+            )
+            .expect("enable MCP target"),
+            McpServerWriteOutcome::Applied
+        );
+        let toggled = read_mcp_server_row(&transaction, "server")
+            .expect("read toggled row")
+            .expect("toggled row exists");
+        assert_eq!(toggled.enabled_codex, 1);
+        assert_eq!(toggled.enabled_gemini, 1);
+        let toggled_fingerprint = *toggled.source_fingerprint();
+        assert_eq!(
+            delete_mcp_server(&mut transaction, "server", &toggled_fingerprint)
+                .expect("delete MCP row"),
+            McpServerWriteOutcome::Applied
+        );
+        assert!(read_mcp_server_row(&transaction, "server")
+            .expect("read deleted row")
+            .is_none());
+        transaction.commit().expect("commit writes");
+
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM host_mcp_audit", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("read host audit"),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_host_extension_fingerprint_is_not_applied() {
+        let (_directory, database) = test_database();
+        database
+            .ensure_mcp_server_schema()
+            .expect("initialize MCP schema");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "ALTER TABLE mcp_servers ADD COLUMN host_value TEXT;
+                 INSERT INTO mcp_servers (id, name, server_config, host_value)
+                 VALUES ('server', 'Server', '{}', 'first');",
+            )
+            .expect("insert host row");
+        let stale = read_mcp_server_row(&connection, "server")
+            .expect("read MCP row")
+            .expect("MCP row exists");
+        connection
+            .execute(
+                "UPDATE mcp_servers SET host_value = 'second' WHERE id = 'server'",
+                [],
+            )
+            .expect("change host extension");
+
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("begin write");
+        assert_eq!(
+            set_mcp_server_enabled(
+                &mut transaction,
+                "server",
+                stale.source_fingerprint(),
+                McpConfigTarget::Claude,
+                true,
+            )
+            .expect("reject stale host state"),
+            McpServerWriteOutcome::NotApplied
+        );
+        transaction.rollback().expect("roll back transaction");
+    }
+
+    #[test]
+    fn suppressed_and_rewritten_writes_are_rolled_back() {
+        let (_directory, database) = test_database();
+        database
+            .ensure_mcp_server_schema()
+            .expect("initialize MCP schema");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "CREATE TABLE host_mcp_events (event TEXT);
+                 CREATE TRIGGER suppress_mcp BEFORE INSERT ON mcp_servers BEGIN
+                    INSERT INTO host_mcp_events VALUES ('suppressed');
+                    SELECT RAISE(IGNORE);
+                 END;",
+            )
+            .expect("create suppressing trigger");
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("begin write");
+        assert_eq!(
+            insert_mcp_server(&mut transaction, &values("ignored", "Ignored", "{}"))
+                .expect("handle suppressed write"),
+            McpServerWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            transaction
+                .query_row("SELECT COUNT(*) FROM host_mcp_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("read rolled-back event"),
+            0
+        );
+        transaction
+            .execute_batch(
+                "DROP TRIGGER suppress_mcp;
+                 CREATE TRIGGER rewrite_mcp AFTER INSERT ON mcp_servers BEGIN
+                    UPDATE mcp_servers SET server_config = 'rewritten' WHERE id = NEW.id;
+                 END;",
+            )
+            .expect("replace trigger");
+        assert_eq!(
+            insert_mcp_server(&mut transaction, &values("rewritten", "Rewritten", "{}"))
+                .expect("reject rewritten row"),
+            McpServerWriteOutcome::NotApplied
+        );
+        assert!(read_mcp_server_row(&transaction, "rewritten")
+            .expect("read rewritten row")
+            .is_none());
+        transaction.rollback().expect("roll back transaction");
+    }
+
+    #[test]
+    fn write_errors_are_redacted_and_savepoint_writes_are_removed() {
+        let (_directory, database) = test_database();
+        database
+            .ensure_mcp_server_schema()
+            .expect("initialize MCP schema");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "CREATE TABLE host_mcp_events (event TEXT);
+                 CREATE TRIGGER fail_mcp BEFORE INSERT ON mcp_servers BEGIN
+                    INSERT INTO host_mcp_events VALUES ('partial');
+                    SELECT RAISE(FAIL, 'secret trigger message');
+                 END;",
+            )
+            .expect("create failing trigger");
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("begin write");
+
+        let error = insert_mcp_server(
+            &mut transaction,
+            &values("failed", "Failed", "{\"token\":\"secret\"}"),
+        )
+        .expect_err("surface redacted write failure");
+        assert!(matches!(error, SharedStoreError::McpServerWrite { .. }));
+        assert_eq!(error.to_string(), "shared MCP server write failed");
+        assert_eq!(
+            transaction
+                .query_row("SELECT COUNT(*) FROM host_mcp_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("read rolled-back event"),
+            0
+        );
+        transaction.rollback().expect("roll back transaction");
     }
 }
