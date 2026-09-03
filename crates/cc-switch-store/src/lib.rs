@@ -696,7 +696,7 @@ pub fn update_provider_row(
             provider.id,
             provider.app_type,
         ],
-        ProviderWriteGuard::SideEffectsAndProviderCount,
+        ProviderWriteGuard::SideEffects,
     )
 }
 
@@ -713,6 +713,22 @@ pub fn update_provider_configuration(
         "UPDATE main.providers SET name = ?1, settings_config = ?2
          WHERE id COLLATE BINARY = ?3 AND app_type COLLATE BINARY = ?4",
         params![name, settings_config, id, app_type],
+        ProviderWriteGuard::SideEffects,
+    )
+}
+
+/// Updates only the raw settings of one provider.
+pub fn update_provider_settings_config(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    settings_config: &str,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    execute_provider_write(
+        transaction,
+        "UPDATE main.providers SET settings_config = ?1
+         WHERE id COLLATE BINARY = ?2 AND app_type COLLATE BINARY = ?3",
+        params![settings_config, id, app_type],
         ProviderWriteGuard::SideEffects,
     )
 }
@@ -788,7 +804,6 @@ pub fn delete_provider(
 enum ProviderWriteGuard {
     None,
     SideEffects,
-    SideEffectsAndProviderCount,
 }
 
 fn execute_provider_write<P: Params>(
@@ -811,10 +826,8 @@ fn execute_provider_write<P: Params>(
         .map_err(|error| redact_provider_write_error(error, transaction_aborted))?;
     let result = (|| {
         let provider_count_before = match guard {
-            ProviderWriteGuard::SideEffectsAndProviderCount => {
-                Some(provider_row_count(&savepoint)?)
-            }
-            ProviderWriteGuard::None | ProviderWriteGuard::SideEffects => None,
+            ProviderWriteGuard::SideEffects => Some(provider_row_count(&savepoint)?),
+            ProviderWriteGuard::None => None,
         };
         let total_before = sqlite_total_changes(&savepoint);
         let changed = {
@@ -1397,6 +1410,16 @@ mod tests {
         assert_eq!(
             update_provider_configuration(&mut transaction, "provider", "claude", "Updated", "{}",)
                 .expect("update provider configuration"),
+            ProviderWriteOutcome::Applied
+        );
+        assert_eq!(
+            update_provider_settings_config(
+                &mut transaction,
+                "provider",
+                "claude",
+                "settings-only",
+            )
+            .expect("update provider settings"),
             ProviderWriteOutcome::Applied
         );
         assert_eq!(
