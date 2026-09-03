@@ -61,6 +61,14 @@ not observable and therefore remains a host contract violation. Callers own an
 immediate transaction and product-specific MCP state. Read-only consumers do
 not need to opt into this write contract.
 
+Skill catalog writes accept only the catalog part of a Core `SkillSwitchPlan`.
+They compare-and-swap one registry-declared selection while leaving product
+metadata and unknown columns untouched. A trigger may maintain independent host
+data, but must not rewrite catalog rows, their host fields, or tables connected
+to the catalog through foreign keys. Suppressed or unexpected writes are rolled
+back; independent audit-table writes remain supported. Callers retain the
+immediate transaction and live file work.
+
 The live-operation layer does not own paths, raw-plan syntax validation,
 concrete file I/O, locks, business state, databases, UI, OAuth flows, proxy
 behavior, catalog generation, or the plugin system. Hosts supply stable

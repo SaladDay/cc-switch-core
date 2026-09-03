@@ -27,7 +27,10 @@ pub use mcp::{
     verify_mcp_server_write_contract, McpServerRow, McpServerValues, McpServerWriteOutcome,
     MCP_SERVERS_TABLE,
 };
-pub use skill::{ensure_skill_schema, read_skill_catalog, SKILLS_TABLE};
+pub use skill::{
+    apply_skill_catalog_plan, ensure_skill_schema, read_skill_catalog, read_skill_catalog_entry,
+    SkillCatalogWriteOutcome, SKILLS_TABLE,
+};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -274,6 +277,13 @@ pub enum SharedStoreError {
     },
     #[error("shared MCP server write failed")]
     McpServerWrite {
+        code: Option<rusqlite::ErrorCode>,
+        extended_code: Option<i32>,
+        /// SQLite ended the host transaction while executing the write.
+        transaction_aborted: bool,
+    },
+    #[error("shared Skill catalog write failed")]
+    SkillCatalogWrite {
         code: Option<rusqlite::ErrorCode>,
         extended_code: Option<i32>,
         /// SQLite ended the host transaction while executing the write.
