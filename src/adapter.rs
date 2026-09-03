@@ -98,6 +98,22 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
         )
     }
 
+    /// Returns the targets required by a consumer-projected planning policy.
+    fn required_native_targets_for_policy(
+        &self,
+        action: NativeAction,
+        provider: &ProviderSnapshot,
+        policy: &crate::NativePlanPolicy<'_>,
+    ) -> Result<Vec<LogicalTarget>, NativePlanError> {
+        projection::required_native_targets_for_policy(
+            self.descriptor().app(),
+            self.targets(),
+            action,
+            provider,
+            policy,
+        )
+    }
+
     /// Validates that an operation plan belongs to this adapter.
     fn validate_plan(&self, plan: &OperationPlan) -> Result<(), OperationPlanError> {
         plan.validate_for(self.descriptor().app())?;
@@ -118,6 +134,16 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
         request: &NativePlanRequest<'_>,
     ) -> Result<OperationPlan, NativePlanError> {
         let plan = projection::plan_native(self.descriptor().app(), request)?;
+        self.validate_plan(&plan)?;
+        Ok(plan)
+    }
+
+    /// Builds a plan from a typed consumer-projected policy.
+    fn plan_native_policy(
+        &self,
+        request: &crate::NativePolicyPlanRequest<'_>,
+    ) -> Result<OperationPlan, NativePlanError> {
+        let plan = projection::plan_native_policy(self.descriptor().app(), request)?;
         self.validate_plan(&plan)?;
         Ok(plan)
     }

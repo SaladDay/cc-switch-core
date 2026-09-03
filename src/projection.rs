@@ -60,11 +60,42 @@ pub(crate) type NativeApply =
 pub(crate) type NativeRemove = fn(&NativePlanRequest<'_>) -> Result<OperationPlan, NativePlanError>;
 pub(crate) type NativeTargetSelector =
     fn(&[LogicalTarget], NativeAction, &ProviderSnapshot, NativeProviderMode) -> Vec<LogicalTarget>;
+pub(crate) type NativePolicyPlanner =
+    fn(&NativePolicyPlanRequest<'_>) -> Result<OperationPlan, NativePlanError>;
+pub(crate) type NativePolicyTargetSelector =
+    fn(&NativePlanPolicy<'_>) -> Result<Vec<LogicalTarget>, NativePlanError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeContextRequirement {
     Standard,
     ClaudeDesktop,
+}
+
+/// Optional consumer-policy behavior registered by one built-in integration.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativePolicyBehavior {
+    plan: NativePolicyPlanner,
+    select_targets: NativePolicyTargetSelector,
+}
+
+impl NativePolicyBehavior {
+    pub(crate) const fn new(
+        plan: NativePolicyPlanner,
+        select_targets: NativePolicyTargetSelector,
+    ) -> Self {
+        Self {
+            plan,
+            select_targets,
+        }
+    }
+
+    fn plan(self, request: &NativePolicyPlanRequest<'_>) -> Result<OperationPlan, NativePlanError> {
+        (self.plan)(request)
+    }
+
+    fn targets(self, policy: &NativePlanPolicy<'_>) -> Result<Vec<LogicalTarget>, NativePlanError> {
+        (self.select_targets)(policy)
+    }
 }
 
 /// Native planning behavior bound to one built-in integration.
@@ -74,6 +105,7 @@ pub(crate) struct NativeProjectionBehavior {
     remove: Option<NativeRemove>,
     select_targets: NativeTargetSelector,
     context: NativeContextRequirement,
+    policy: Option<NativePolicyBehavior>,
 }
 
 impl NativeProjectionBehavior {
@@ -88,7 +120,13 @@ impl NativeProjectionBehavior {
             remove,
             select_targets,
             context,
+            policy: None,
         }
+    }
+
+    pub(crate) const fn with_policy(mut self, policy: NativePolicyBehavior) -> Self {
+        self.policy = Some(policy);
+        self
     }
 
     fn apply(
@@ -119,6 +157,93 @@ impl NativeProjectionBehavior {
 
     pub(crate) const fn context(self) -> NativeContextRequirement {
         self.context
+    }
+
+    pub(crate) const fn policy(self) -> Option<NativePolicyBehavior> {
+        self.policy
+    }
+}
+
+/// One consumer-projected change to a native document.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NativeDocumentProjection<'a> {
+    Preserve,
+    Write(&'a str),
+    Delete,
+}
+
+impl fmt::Debug for NativeDocumentProjection<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preserve => formatter.write_str("Preserve"),
+            Self::Write(_) => formatter.write_str("Write(<redacted>)"),
+            Self::Delete => formatter.write_str("Delete"),
+        }
+    }
+}
+
+/// Exact Codex documents already projected by a consumer-specific policy.
+///
+/// Core still owns target selection, compare-and-swap expectations, write
+/// ordering, and execution validation. The consumer retains ownership of the
+/// product-specific projection that produced these UTF-8 documents.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CodexDocumentProjection<'a> {
+    pub auth: NativeDocumentProjection<'a>,
+    pub config: &'a str,
+    pub model_catalog: NativeDocumentProjection<'a>,
+}
+
+impl fmt::Debug for CodexDocumentProjection<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexDocumentProjection")
+            .field("auth", &self.auth)
+            .field("config", &"<redacted>")
+            .field("model_catalog", &self.model_catalog)
+            .finish()
+    }
+}
+
+/// Optional planning policy for a consumer whose product-specific projection
+/// has already produced complete native documents.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NativePlanPolicy<'a> {
+    CodexDocuments(CodexDocumentProjection<'a>),
+}
+
+impl fmt::Debug for NativePlanPolicy<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CodexDocuments(projection) => formatter
+                .debug_tuple("CodexDocuments")
+                .field(projection)
+                .finish(),
+        }
+    }
+}
+
+/// Input for a policy-backed native plan that is separate from the stable
+/// app-projection context API.
+pub struct NativePolicyPlanRequest<'a> {
+    pub action: NativeAction,
+    pub provider: &'a ProviderSnapshot,
+    pub documents: &'a LiveDocumentSet,
+    pub access: NativeProviderAccess,
+    pub policy: NativePlanPolicy<'a>,
+}
+
+impl fmt::Debug for NativePolicyPlanRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativePolicyPlanRequest")
+            .field("action", &self.action)
+            .field("provider", &self.provider)
+            .field("documents", &self.documents)
+            .field("access", &self.access)
+            .field("policy", &self.policy)
+            .finish()
     }
 }
 
@@ -195,6 +320,11 @@ pub enum NativePlanError {
         target: LogicalTarget,
         message: String,
     },
+    #[error("projected native document {target:?} is invalid: {message}")]
+    InvalidProjection {
+        target: LogicalTarget,
+        message: String,
+    },
     #[error("native plan {field} exceeds the {limit}-byte input limit")]
     InputTooLarge { field: &'static str, limit: usize },
     #[error("native plan route count exceeds the {limit}-route input limit")]
@@ -210,6 +340,38 @@ pub(crate) fn required_native_targets(
     provider: &ProviderSnapshot,
     mode: NativeProviderMode,
 ) -> Result<Vec<LogicalTarget>, NativePlanError> {
+    validate_target_request(adapter_app, action, provider)?;
+    let behavior = builtin_app_integration(adapter_app).native_projection_behavior();
+    Ok(behavior.targets(declared_targets, action, provider, mode))
+}
+
+pub(crate) fn required_native_targets_for_policy(
+    adapter_app: &AppType,
+    declared_targets: &[LogicalTarget],
+    action: NativeAction,
+    provider: &ProviderSnapshot,
+    policy: &NativePlanPolicy<'_>,
+) -> Result<Vec<LogicalTarget>, NativePlanError> {
+    validate_target_request(adapter_app, action, provider)?;
+    let behavior = policy_behavior(adapter_app)?;
+    let targets = behavior.targets(policy)?;
+    if let Some(target) = targets
+        .iter()
+        .find(|target| !declared_targets.contains(target))
+    {
+        return Err(invalid_context(
+            adapter_app,
+            format!("policy selected undeclared target {target:?}"),
+        ));
+    }
+    Ok(targets)
+}
+
+fn validate_target_request(
+    adapter_app: &AppType,
+    action: NativeAction,
+    provider: &ProviderSnapshot,
+) -> Result<(), NativePlanError> {
     if provider.app != *adapter_app {
         return Err(NativePlanError::WrongProviderApp {
             expected: adapter_app.as_str().to_owned(),
@@ -222,10 +384,7 @@ pub(crate) fn required_native_targets(
             action,
         });
     }
-
-    Ok(builtin_app_integration(adapter_app)
-        .native_projection_behavior()
-        .targets(declared_targets, action, provider, mode))
+    Ok(())
 }
 
 pub(crate) fn plan_native(
@@ -257,7 +416,59 @@ pub(crate) fn plan_native(
         });
     }
     let behavior = builtin_app_integration(adapter_app).native_projection_behavior();
-    match (behavior.context(), &request.context) {
+    validate_native_context(adapter_app, behavior.context(), &request.context)?;
+
+    match request.action {
+        NativeAction::Apply => prepare_apply(request, behavior),
+        NativeAction::Remove => prepare_remove(request, behavior),
+    }
+}
+
+pub(crate) fn plan_native_policy(
+    adapter_app: &AppType,
+    request: &NativePolicyPlanRequest<'_>,
+) -> Result<OperationPlan, NativePlanError> {
+    if request.provider.app != *adapter_app {
+        return Err(NativePlanError::WrongProviderApp {
+            expected: adapter_app.as_str().to_owned(),
+            actual: request.provider.app.as_str().to_owned(),
+        });
+    }
+    if request.documents.app() != adapter_app {
+        return Err(NativePlanError::WrongDocumentApp {
+            expected: adapter_app.as_str().to_owned(),
+            actual: request.documents.app().as_str().to_owned(),
+        });
+    }
+    if request.action != NativeAction::Apply {
+        return Err(NativePlanError::UnsupportedAction {
+            app_id: adapter_app.as_str().to_owned(),
+            action: request.action,
+        });
+    }
+    validate_policy_input(request)?;
+    if request.access == NativeProviderAccess::ReadOnly {
+        return Err(NativePlanError::ReadOnlyProvider {
+            provider_id: request.provider.id.clone(),
+        });
+    }
+
+    policy_behavior(adapter_app)?.plan(request)
+}
+
+fn policy_behavior(adapter_app: &AppType) -> Result<NativePolicyBehavior, NativePlanError> {
+    builtin_app_integration(adapter_app)
+        .native_projection_behavior()
+        .policy()
+        .ok_or_else(|| invalid_context(adapter_app, "application does not accept a native policy"))
+}
+
+fn validate_native_context(
+    adapter_app: &AppType,
+    requirement: NativeContextRequirement,
+    context: &NativePlanContext<'_>,
+) -> Result<(), NativePlanError> {
+    match (requirement, context) {
         (NativeContextRequirement::ClaudeDesktop, NativePlanContext::ClaudeDesktop { .. }) => {}
         (NativeContextRequirement::ClaudeDesktop, NativePlanContext::Standard { .. }) => {
             return Err(invalid_context(
@@ -273,11 +484,7 @@ pub(crate) fn plan_native(
             ));
         }
     }
-
-    match request.action {
-        NativeAction::Apply => prepare_apply(request, behavior),
-        NativeAction::Remove => prepare_remove(request, behavior),
-    }
+    Ok(())
 }
 
 fn validate_request_input(request: &NativePlanRequest<'_>) -> Result<(), NativePlanError> {
@@ -319,6 +526,76 @@ fn validate_request_input(request: &NativePlanRequest<'_>) -> Result<(), NativeP
             });
             ensure_input_size("Claude Desktop routes", bytes)
         }
+    }
+}
+
+fn validate_policy_input(request: &NativePolicyPlanRequest<'_>) -> Result<(), NativePlanError> {
+    ensure_input_size("provider id", request.provider.id.len())?;
+    ensure_input_size("provider name", request.provider.name.len())?;
+    match request.policy {
+        NativePlanPolicy::CodexDocuments(projection) => {
+            ensure_projection_size("Codex auth", projection.auth)?;
+            ensure_input_size("Codex config", projection.config.len())?;
+            ensure_projection_size("Codex model catalog", projection.model_catalog)?;
+            validate_codex_projection(projection)
+        }
+    }
+}
+
+fn validate_codex_projection(
+    projection: CodexDocumentProjection<'_>,
+) -> Result<(), NativePlanError> {
+    if projection.config.parse::<toml_edit::DocumentMut>().is_err() {
+        return Err(invalid_projection(
+            LogicalTarget::CodexConfig,
+            "document must be valid TOML",
+        ));
+    }
+    validate_json_object_projection(LogicalTarget::CodexAuth, projection.auth)?;
+    validate_json_object_projection(LogicalTarget::CodexModelCatalog, projection.model_catalog)
+}
+
+fn validate_json_object_projection(
+    target: LogicalTarget,
+    projection: NativeDocumentProjection<'_>,
+) -> Result<(), NativePlanError> {
+    let NativeDocumentProjection::Write(contents) = projection else {
+        return Ok(());
+    };
+    if serde_json::from_str::<Map<String, Value>>(contents).is_err() {
+        return Err(invalid_projection(
+            target,
+            "document must be a valid JSON object",
+        ));
+    }
+    Ok(())
+}
+
+fn codex_document_targets(projection: CodexDocumentProjection<'_>) -> Vec<LogicalTarget> {
+    let mut targets = Vec::with_capacity(3);
+    if matches!(projection.model_catalog, NativeDocumentProjection::Write(_)) {
+        targets.push(LogicalTarget::CodexModelCatalog);
+    }
+    if matches!(projection.auth, NativeDocumentProjection::Write(_)) {
+        targets.push(LogicalTarget::CodexAuth);
+    }
+    targets.push(LogicalTarget::CodexConfig);
+    if projection.auth == NativeDocumentProjection::Delete {
+        targets.push(LogicalTarget::CodexAuth);
+    }
+    if projection.model_catalog == NativeDocumentProjection::Delete {
+        targets.push(LogicalTarget::CodexModelCatalog);
+    }
+    targets
+}
+
+fn ensure_projection_size(
+    field: &'static str,
+    projection: NativeDocumentProjection<'_>,
+) -> Result<(), NativePlanError> {
+    match projection {
+        NativeDocumentProjection::Write(contents) => ensure_input_size(field, contents.len()),
+        NativeDocumentProjection::Preserve | NativeDocumentProjection::Delete => Ok(()),
     }
 }
 
@@ -587,6 +864,53 @@ pub(crate) fn codex_plan(
     plan(&request.provider.app, writes)
 }
 
+fn codex_document_plan(
+    request: &NativePolicyPlanRequest<'_>,
+    projection: CodexDocumentProjection<'_>,
+) -> Result<OperationPlan, NativePlanError> {
+    let targets = codex_document_targets(projection);
+    let mut writes = Vec::with_capacity(targets.len());
+    for target in targets {
+        let next_contents = match target {
+            LogicalTarget::CodexConfig => Some(projection.config.to_owned()),
+            LogicalTarget::CodexAuth => projected_contents(projection.auth),
+            LogicalTarget::CodexModelCatalog => projected_contents(projection.model_catalog),
+            _ => {
+                return Err(invalid_context(
+                    &request.provider.app,
+                    "Codex policy selected a target owned by another application",
+                ));
+            }
+        };
+        let original = contents(request.documents, target)?;
+        writes.push(planned(target, original, next_contents));
+    }
+    plan(&request.provider.app, writes)
+}
+
+pub(crate) fn codex_policy_plan(
+    request: &NativePolicyPlanRequest<'_>,
+) -> Result<OperationPlan, NativePlanError> {
+    match request.policy {
+        NativePlanPolicy::CodexDocuments(projection) => codex_document_plan(request, projection),
+    }
+}
+
+pub(crate) fn codex_policy_targets(
+    policy: &NativePlanPolicy<'_>,
+) -> Result<Vec<LogicalTarget>, NativePlanError> {
+    match policy {
+        NativePlanPolicy::CodexDocuments(projection) => Ok(codex_document_targets(*projection)),
+    }
+}
+
+fn projected_contents(projection: NativeDocumentProjection<'_>) -> Option<String> {
+    match projection {
+        NativeDocumentProjection::Write(contents) => Some(contents.to_owned()),
+        NativeDocumentProjection::Preserve | NativeDocumentProjection::Delete => None,
+    }
+}
+
 pub(crate) fn gemini_plan(
     request: &NativePlanRequest<'_>,
     settings: &Value,
@@ -784,6 +1108,13 @@ fn invalid_provider(app: &AppType, message: impl Into<String>) -> NativePlanErro
 
 fn invalid_document(target: LogicalTarget, message: impl Into<String>) -> NativePlanError {
     NativePlanError::InvalidDocument {
+        target,
+        message: message.into(),
+    }
+}
+
+fn invalid_projection(target: LogicalTarget, message: impl Into<String>) -> NativePlanError {
+    NativePlanError::InvalidProjection {
         target,
         message: message.into(),
     }
@@ -1574,6 +1905,17 @@ mod tests {
             ),
             Err(NativePlanError::UnsupportedAction { .. })
         ));
+
+        let desktop = ProviderSnapshot::new(
+            "desktop",
+            AppType::ClaudeDesktop,
+            "Claude Desktop",
+            json!({}),
+        );
+        assert!(!builtin_app_adapter(&AppType::ClaudeDesktop)
+            .required_native_targets(NativeAction::Apply, &desktop, NativeProviderMode::Official,)
+            .expect("legacy target query does not require planning context")
+            .is_empty());
     }
 
     #[test]
@@ -1792,6 +2134,215 @@ mod tests {
             serde_json::from_str(write_contents(&plan, LogicalTarget::CodexModelCatalog))
                 .expect("Codex catalog JSON");
         assert_eq!(catalog["models"][0]["slug"], "qwen3-coder-plus");
+    }
+
+    #[test]
+    fn codex_document_policy_owns_targets_order_and_exact_contents() {
+        let adapter = builtin_app_adapter(&AppType::Codex);
+        let provider = ProviderSnapshot::new("codex", AppType::Codex, "Codex", json!({}));
+        let documents = document_set(
+            AppType::Codex,
+            &[
+                (LogicalTarget::CodexAuth, r#"{"old":"auth"}"#),
+                (LogicalTarget::CodexConfig, "model = \"old\"\n"),
+                (
+                    LogicalTarget::CodexModelCatalog,
+                    r#"{"models":[{"slug":"old"}]}"#,
+                ),
+            ],
+        );
+        let projection = CodexDocumentProjection {
+            auth: NativeDocumentProjection::Write(r#"{"OPENAI_API_KEY":"secret"}"#),
+            config: "model = \"next\"\n",
+            model_catalog: NativeDocumentProjection::Delete,
+        };
+        let policy = NativePlanPolicy::CodexDocuments(projection);
+
+        assert_eq!(
+            adapter
+                .required_native_targets_for_policy(NativeAction::Apply, &provider, &policy,)
+                .expect("typed Codex targets"),
+            vec![
+                LogicalTarget::CodexAuth,
+                LogicalTarget::CodexConfig,
+                LogicalTarget::CodexModelCatalog,
+            ]
+        );
+
+        let request = NativePolicyPlanRequest {
+            action: NativeAction::Apply,
+            provider: &provider,
+            documents: &documents,
+            access: NativeProviderAccess::Writable,
+            policy,
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("Write(<redacted>)"));
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("next"));
+
+        let plan = adapter
+            .plan_native_policy(&request)
+            .expect("typed Codex plan");
+        assert_eq!(
+            plan.writes
+                .iter()
+                .map(|write| write.target)
+                .collect::<Vec<_>>(),
+            vec![
+                LogicalTarget::CodexAuth,
+                LogicalTarget::CodexConfig,
+                LogicalTarget::CodexModelCatalog,
+            ]
+        );
+        assert_eq!(
+            plan.writes[0].contents.as_deref(),
+            Some(r#"{"OPENAI_API_KEY":"secret"}"#)
+        );
+        assert_eq!(
+            plan.writes[1].contents.as_deref(),
+            Some("model = \"next\"\n")
+        );
+        assert_eq!(plan.writes[2].contents, None);
+    }
+
+    #[test]
+    fn codex_document_policy_does_not_observe_preserved_targets() {
+        let adapter = builtin_app_adapter(&AppType::Codex);
+        let provider = ProviderSnapshot::new("codex", AppType::Codex, "Codex", json!({}));
+        let documents = LiveDocumentSet::try_new(
+            AppType::Codex,
+            [
+                ObservedDocument::unobserved(LogicalTarget::CodexAuth),
+                ObservedDocument::present(LogicalTarget::CodexConfig, b"before"),
+                ObservedDocument::unobserved(LogicalTarget::CodexModelCatalog),
+            ],
+        )
+        .expect("complete Codex inventory");
+        let policy = NativePlanPolicy::CodexDocuments(CodexDocumentProjection {
+            auth: NativeDocumentProjection::Preserve,
+            config: "model = \"after\"\n",
+            model_catalog: NativeDocumentProjection::Preserve,
+        });
+
+        assert_eq!(
+            adapter
+                .required_native_targets_for_policy(NativeAction::Apply, &provider, &policy,)
+                .expect("minimal Codex targets"),
+            vec![LogicalTarget::CodexConfig]
+        );
+        let plan = adapter
+            .plan_native_policy(&NativePolicyPlanRequest {
+                action: NativeAction::Apply,
+                provider: &provider,
+                documents: &documents,
+                access: NativeProviderAccess::Writable,
+                policy,
+            })
+            .expect("preserved targets remain unobserved");
+        assert_eq!(plan.writes.len(), 1);
+        assert_eq!(plan.writes[0].target, LogicalTarget::CodexConfig);
+    }
+
+    #[test]
+    fn codex_document_policy_is_bounded_and_app_scoped() {
+        let codex = ProviderSnapshot::new("codex", AppType::Codex, "Codex", json!({}));
+        let codex_documents = document_set(AppType::Codex, &[]);
+        let oversized = "x".repeat(MAX_NATIVE_PLAN_INPUT_BYTES + 1);
+        assert!(matches!(
+            builtin_app_adapter(&AppType::Codex).plan_native_policy(&NativePolicyPlanRequest {
+                action: NativeAction::Apply,
+                provider: &codex,
+                documents: &codex_documents,
+                access: NativeProviderAccess::Writable,
+                policy: NativePlanPolicy::CodexDocuments(CodexDocumentProjection {
+                    auth: NativeDocumentProjection::Preserve,
+                    config: &oversized,
+                    model_catalog: NativeDocumentProjection::Preserve,
+                }),
+            }),
+            Err(NativePlanError::InputTooLarge {
+                field: "Codex config",
+                ..
+            })
+        ));
+
+        let claude = ProviderSnapshot::new("claude", AppType::Claude, "Claude", json!({}));
+        let claude_documents = document_set(AppType::Claude, &[]);
+        assert!(matches!(
+            builtin_app_adapter(&AppType::Claude).plan_native_policy(&NativePolicyPlanRequest {
+                action: NativeAction::Apply,
+                provider: &claude,
+                documents: &claude_documents,
+                access: NativeProviderAccess::Writable,
+                policy: NativePlanPolicy::CodexDocuments(CodexDocumentProjection {
+                    auth: NativeDocumentProjection::Preserve,
+                    config: "",
+                    model_catalog: NativeDocumentProjection::Preserve,
+                }),
+            }),
+            Err(NativePlanError::InvalidContext { .. })
+        ));
+    }
+
+    #[test]
+    fn codex_document_policy_rejects_invalid_projected_syntax() {
+        let adapter = builtin_app_adapter(&AppType::Codex);
+        let provider = ProviderSnapshot::new("codex", AppType::Codex, "Codex", json!({}));
+        let documents = document_set(AppType::Codex, &[]);
+        let cases = [
+            (
+                LogicalTarget::CodexConfig,
+                CodexDocumentProjection {
+                    auth: NativeDocumentProjection::Preserve,
+                    config: "secret = [",
+                    model_catalog: NativeDocumentProjection::Preserve,
+                },
+            ),
+            (
+                LogicalTarget::CodexConfig,
+                CodexDocumentProjection {
+                    auth: NativeDocumentProjection::Preserve,
+                    config: "\u{00a0}",
+                    model_catalog: NativeDocumentProjection::Preserve,
+                },
+            ),
+            (
+                LogicalTarget::CodexAuth,
+                CodexDocumentProjection {
+                    auth: NativeDocumentProjection::Write(r#"["secret"]"#),
+                    config: "",
+                    model_catalog: NativeDocumentProjection::Preserve,
+                },
+            ),
+            (
+                LogicalTarget::CodexModelCatalog,
+                CodexDocumentProjection {
+                    auth: NativeDocumentProjection::Preserve,
+                    config: "",
+                    model_catalog: NativeDocumentProjection::Write("not-secret-json"),
+                },
+            ),
+        ];
+
+        for (target, projection) in cases {
+            let error = adapter
+                .plan_native_policy(&NativePolicyPlanRequest {
+                    action: NativeAction::Apply,
+                    provider: &provider,
+                    documents: &documents,
+                    access: NativeProviderAccess::Writable,
+                    policy: NativePlanPolicy::CodexDocuments(projection),
+                })
+                .expect_err("invalid projected syntax must fail before planning");
+            assert!(matches!(
+                error,
+                NativePlanError::InvalidProjection {
+                    target: actual,
+                    ..
+                } if actual == target
+            ));
+        }
     }
 
     #[test]

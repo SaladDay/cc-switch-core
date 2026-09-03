@@ -60,8 +60,9 @@ pub use operation::{
     MAX_OPERATION_WRITES, OPERATION_CONTRACT_MAJOR,
 };
 pub use projection::{
-    NativeAction, NativePlanContext, NativePlanError, NativePlanRequest, NativeProviderAccess,
-    NativeProviderMode, MAX_NATIVE_PLAN_INPUT_BYTES, MAX_NATIVE_PLAN_ROUTES,
+    CodexDocumentProjection, NativeAction, NativeDocumentProjection, NativePlanContext,
+    NativePlanError, NativePlanPolicy, NativePlanRequest, NativePolicyPlanRequest,
+    NativeProviderAccess, NativeProviderMode, MAX_NATIVE_PLAN_INPUT_BYTES, MAX_NATIVE_PLAN_ROUTES,
 };
 pub use provider::{ProviderEntry, ProviderSnapshot};
 pub use registry::{

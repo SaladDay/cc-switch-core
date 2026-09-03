@@ -3,7 +3,7 @@
 use crate::{
     mcp::{CLAUDE_MCP, CODEX_MCP, GEMINI_MCP, GROKBUILD_MCP, HERMES_MCP, OPENCODE_MCP},
     native_import::{self, NativeImportBehavior},
-    projection::{self, NativeContextRequirement, NativeProjectionBehavior},
+    projection::{self, NativeContextRequirement, NativePolicyBehavior, NativeProjectionBehavior},
     registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
     simple_provider::{
         self, SimpleProviderBehavior, CLAUDE_DESKTOP_FORM, CLAUDE_FORM, CODEX_FORM, GEMINI_FORM,
@@ -211,7 +211,11 @@ static BUILTIN_APP_INTEGRATIONS: [AppIntegration; 9] = [
             None,
             projection::codex_native_targets,
             NativeContextRequirement::Standard,
-        ),
+        )
+        .with_policy(NativePolicyBehavior::new(
+            projection::codex_policy_plan,
+            projection::codex_policy_targets,
+        )),
     ),
     AppIntegration::new(
         AppDescriptor::new(
