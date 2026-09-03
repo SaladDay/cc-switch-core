@@ -135,6 +135,13 @@ pub enum OperationRollbackFailure<E> {
         #[source]
         source: E,
     },
+    #[error(
+        "logical target {target:?} was not restored because dependency {dependency:?} could not be confirmed restored"
+    )]
+    Blocked {
+        target: LogicalTarget,
+        dependency: LogicalTarget,
+    },
 }
 
 /// An operation failure together with any incomplete rollback work.
@@ -219,9 +226,16 @@ struct AppliedWrite<R> {
     written: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RollbackBehavior {
+    BestEffort,
+    DependencyOrdered,
+}
+
 /// A successful operation that can still be rolled back by its host.
 pub struct OperationReceipt<R> {
     applied: Vec<AppliedWrite<R>>,
+    rollback_behavior: RollbackBehavior,
 }
 
 impl<R> OperationReceipt<R> {
@@ -233,7 +247,7 @@ impl<R> OperationReceipt<R> {
     where
         H: OperationHost<Resource = R>,
     {
-        let failures = rollback_applied(host, &self.applied);
+        let failures = rollback_applied(host, &self.applied, self.rollback_behavior, None);
         if failures.is_empty() {
             Ok(())
         } else {
@@ -261,6 +275,32 @@ impl<R> fmt::Debug for OperationReceipt<R> {
 pub fn execute_operation_plan<H>(
     plan: &OperationPlan,
     host: &mut H,
+) -> Result<OperationReceipt<H::Resource>, OperationExecutionError<H::Error>>
+where
+    H: OperationHost,
+{
+    execute_operation_plan_with_rollback(plan, host, RollbackBehavior::BestEffort)
+}
+
+/// Executes a plan whose earlier writes are prerequisites of later writes.
+///
+/// Rollback stops before an earlier write when a later write cannot be
+/// confirmed restored. This prevents restoring a prerequisite into a state
+/// that is unsafe with the remaining dependent document.
+pub fn execute_dependency_ordered_plan<H>(
+    plan: &OperationPlan,
+    host: &mut H,
+) -> Result<OperationReceipt<H::Resource>, OperationExecutionError<H::Error>>
+where
+    H: OperationHost,
+{
+    execute_operation_plan_with_rollback(plan, host, RollbackBehavior::DependencyOrdered)
+}
+
+fn execute_operation_plan_with_rollback<H>(
+    plan: &OperationPlan,
+    host: &mut H,
+    rollback_behavior: RollbackBehavior,
 ) -> Result<OperationReceipt<H::Resource>, OperationExecutionError<H::Error>>
 where
     H: OperationHost,
@@ -334,6 +374,8 @@ where
                     host,
                     OperationFailure::Conflict { target },
                     &applied,
+                    rollback_behavior,
+                    Some(target),
                 ));
             }
             Err(source) => {
@@ -342,12 +384,17 @@ where
                     host,
                     OperationFailure::Write { target, source },
                     &applied,
+                    rollback_behavior,
+                    None,
                 ));
             }
         }
     }
 
-    Ok(OperationReceipt { applied })
+    Ok(OperationReceipt {
+        applied,
+        rollback_behavior,
+    })
 }
 
 fn read_for_execution<H>(
@@ -386,25 +433,39 @@ fn failure_with_rollback<H>(
     host: &mut H,
     failure: OperationFailure<H::Error>,
     applied: &[AppliedWrite<H::Resource>],
+    rollback_behavior: RollbackBehavior,
+    blocked_by: Option<LogicalTarget>,
 ) -> OperationExecutionError<H::Error>
 where
     H: OperationHost,
 {
     OperationExecutionError {
         failure,
-        rollback_failures: rollback_applied(host, applied),
+        rollback_failures: rollback_applied(host, applied, rollback_behavior, blocked_by),
     }
 }
 
 fn rollback_applied<H>(
     host: &mut H,
     applied: &[AppliedWrite<H::Resource>],
+    behavior: RollbackBehavior,
+    mut blocked_by: Option<LogicalTarget>,
 ) -> Vec<OperationRollbackFailure<H::Error>>
 where
     H: OperationHost,
 {
     let mut failures = Vec::new();
     for applied_write in applied.iter().rev() {
+        if behavior == RollbackBehavior::DependencyOrdered {
+            if let Some(dependency) = blocked_by {
+                failures.push(OperationRollbackFailure::Blocked {
+                    target: applied_write.target,
+                    dependency,
+                });
+                continue;
+            }
+        }
+        let failure_count = failures.len();
         match host.compare_exchange(
             &applied_write.resource,
             applied_write.written.as_deref(),
@@ -447,6 +508,9 @@ where
                 source,
             }),
         }
+        if behavior == RollbackBehavior::DependencyOrdered && failures.len() > failure_count {
+            blocked_by = Some(applied_write.target);
+        }
     }
     failures
 }
@@ -474,6 +538,7 @@ mod tests {
         resources: HashMap<LogicalTarget, u8>,
         reads: HashMap<u8, usize>,
         exchanges: usize,
+        exchange_order: Vec<u8>,
         fail_resolve: Option<LogicalTarget>,
         fail_read: Option<(u8, usize)>,
         fail_exchange: Option<usize>,
@@ -537,6 +602,7 @@ mod tests {
             replacement: Option<&[u8]>,
         ) -> Result<CompareExchangeOutcome, Self::Error> {
             self.exchanges += 1;
+            self.exchange_order.push(*resource);
             if self
                 .mutate_exchange
                 .as_ref()
@@ -594,6 +660,25 @@ mod tests {
                     contents: Some((*replacement).to_owned()),
                 })
                 .collect(),
+        }
+    }
+
+    fn codex_delete_auth_plan() -> OperationPlan {
+        OperationPlan {
+            contract_major: OPERATION_CONTRACT_MAJOR,
+            app_id: "codex".to_owned(),
+            writes: vec![
+                PlannedWrite {
+                    target: LogicalTarget::CodexAuth,
+                    expected: ContentExpectation::for_contents(Some(b"old-auth")),
+                    contents: None,
+                },
+                PlannedWrite {
+                    target: LogicalTarget::CodexConfig,
+                    expected: ContentExpectation::for_contents(Some(b"old-config")),
+                    contents: Some("third-party-config".to_owned()),
+                },
+            ],
         }
     }
 
@@ -743,6 +828,105 @@ mod tests {
             host.document(LogicalTarget::CodexConfig),
             Some(&b"config"[..])
         );
+    }
+
+    #[test]
+    fn receipt_rolls_back_config_before_restoring_deleted_auth() {
+        let plan = codex_delete_auth_plan();
+        let auth = resource_for(LogicalTarget::CodexAuth);
+        let config = resource_for(LogicalTarget::CodexConfig);
+        let mut host = FakeHost::default()
+            .with_document(LogicalTarget::CodexAuth, b"old-auth")
+            .with_document(LogicalTarget::CodexConfig, b"old-config");
+
+        let receipt = execute_dependency_ordered_plan(&plan, &mut host).expect("execute plan");
+        receipt.rollback(&mut host).expect("rollback receipt");
+
+        assert_eq!(host.exchange_order, vec![auth, config, config, auth]);
+    }
+
+    #[test]
+    fn dependent_rollback_does_not_restore_auth_after_config_apply_conflict() {
+        let plan = codex_delete_auth_plan();
+        let config = resource_for(LogicalTarget::CodexConfig);
+        let mut host = FakeHost::default()
+            .with_document(LogicalTarget::CodexAuth, b"old-auth")
+            .with_document(LogicalTarget::CodexConfig, b"old-config");
+        host.mutate_exchange = Some((config, Some(b"external-config".to_vec())));
+
+        let error = execute_dependency_ordered_plan(&plan, &mut host).expect_err("config conflict");
+
+        assert!(matches!(
+            error.failure(),
+            OperationFailure::Conflict {
+                target: LogicalTarget::CodexConfig
+            }
+        ));
+        assert!(matches!(
+            error.rollback_failures(),
+            [OperationRollbackFailure::Blocked {
+                target: LogicalTarget::CodexAuth,
+                dependency: LogicalTarget::CodexConfig
+            }]
+        ));
+        assert_eq!(host.document(LogicalTarget::CodexAuth), None);
+        assert_eq!(
+            host.document(LogicalTarget::CodexConfig),
+            Some(&b"external-config"[..])
+        );
+    }
+
+    #[test]
+    fn dependent_receipt_rollback_does_not_restore_auth_after_config_conflict() {
+        let plan = codex_delete_auth_plan();
+        let mut host = FakeHost::default()
+            .with_document(LogicalTarget::CodexAuth, b"old-auth")
+            .with_document(LogicalTarget::CodexConfig, b"old-config");
+        let receipt = execute_dependency_ordered_plan(&plan, &mut host).expect("execute plan");
+        host.set_document(LogicalTarget::CodexConfig, b"external-config");
+
+        let error = receipt.rollback(&mut host).expect_err("config conflict");
+
+        assert!(matches!(
+            error.failures(),
+            [
+                OperationRollbackFailure::Changed {
+                    target: LogicalTarget::CodexConfig
+                },
+                OperationRollbackFailure::Blocked {
+                    target: LogicalTarget::CodexAuth,
+                    dependency: LogicalTarget::CodexConfig
+                }
+            ]
+        ));
+        assert_eq!(host.document(LogicalTarget::CodexAuth), None);
+    }
+
+    #[test]
+    fn dependent_receipt_rollback_does_not_restore_auth_after_config_error() {
+        let plan = codex_delete_auth_plan();
+        let mut host = FakeHost::default()
+            .with_document(LogicalTarget::CodexAuth, b"old-auth")
+            .with_document(LogicalTarget::CodexConfig, b"old-config");
+        let receipt = execute_dependency_ordered_plan(&plan, &mut host).expect("execute plan");
+        host.fail_exchange = Some(3);
+
+        let error = receipt.rollback(&mut host).expect_err("config write error");
+
+        assert!(matches!(
+            error.failures(),
+            [
+                OperationRollbackFailure::Write {
+                    target: LogicalTarget::CodexConfig,
+                    source: FakeError::Write
+                },
+                OperationRollbackFailure::Blocked {
+                    target: LogicalTarget::CodexAuth,
+                    dependency: LogicalTarget::CodexConfig
+                }
+            ]
+        ));
+        assert_eq!(host.document(LogicalTarget::CodexAuth), None);
     }
 
     #[test]

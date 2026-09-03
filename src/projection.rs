@@ -576,13 +576,10 @@ fn codex_document_targets(projection: CodexDocumentProjection<'_>) -> Vec<Logica
     if matches!(projection.model_catalog, NativeDocumentProjection::Write(_)) {
         targets.push(LogicalTarget::CodexModelCatalog);
     }
-    if matches!(projection.auth, NativeDocumentProjection::Write(_)) {
+    if !matches!(projection.auth, NativeDocumentProjection::Preserve) {
         targets.push(LogicalTarget::CodexAuth);
     }
     targets.push(LogicalTarget::CodexConfig);
-    if projection.auth == NativeDocumentProjection::Delete {
-        targets.push(LogicalTarget::CodexAuth);
-    }
     if projection.model_catalog == NativeDocumentProjection::Delete {
         targets.push(LogicalTarget::CodexModelCatalog);
     }
@@ -2242,6 +2239,47 @@ mod tests {
             .expect("preserved targets remain unobserved");
         assert_eq!(plan.writes.len(), 1);
         assert_eq!(plan.writes[0].target, LogicalTarget::CodexConfig);
+    }
+
+    #[test]
+    fn codex_document_policy_deletes_auth_before_switching_config() {
+        let adapter = builtin_app_adapter(&AppType::Codex);
+        let provider = ProviderSnapshot::new("codex", AppType::Codex, "Codex", json!({}));
+        let documents = document_set(
+            AppType::Codex,
+            &[
+                (
+                    LogicalTarget::CodexAuth,
+                    r#"{"tokens":{"access_token":"old"}}"#,
+                ),
+                (LogicalTarget::CodexConfig, "model = \"old\"\n"),
+            ],
+        );
+        let policy = NativePlanPolicy::CodexDocuments(CodexDocumentProjection {
+            auth: NativeDocumentProjection::Delete,
+            config: "model = \"third-party\"\n",
+            model_catalog: NativeDocumentProjection::Preserve,
+        });
+
+        assert_eq!(
+            adapter
+                .required_native_targets_for_policy(NativeAction::Apply, &provider, &policy)
+                .expect("typed Codex targets"),
+            vec![LogicalTarget::CodexAuth, LogicalTarget::CodexConfig]
+        );
+
+        let plan = adapter
+            .plan_native_policy(&NativePolicyPlanRequest {
+                action: NativeAction::Apply,
+                provider: &provider,
+                documents: &documents,
+                access: NativeProviderAccess::Writable,
+                policy,
+            })
+            .expect("typed Codex plan");
+        assert_eq!(plan.writes[0].target, LogicalTarget::CodexAuth);
+        assert_eq!(plan.writes[0].contents, None);
+        assert_eq!(plan.writes[1].target, LogicalTarget::CodexConfig);
     }
 
     #[test]

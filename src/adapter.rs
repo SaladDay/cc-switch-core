@@ -139,6 +139,10 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
     }
 
     /// Builds a plan from a typed consumer-projected policy.
+    ///
+    /// Multi-document policy plans must be executed with
+    /// [`crate::execute_dependency_ordered_plan`] so rollback preserves their
+    /// declared dependency order.
     fn plan_native_policy(
         &self,
         request: &crate::NativePolicyPlanRequest<'_>,

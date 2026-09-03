@@ -41,9 +41,9 @@ pub use adapter::{builtin_app_adapter, builtin_app_adapters, AppAdapter};
 pub use app_type::{AppType, ParseAppTypeError};
 pub use document::{LiveDocumentSet, LiveDocumentSetError, ObservedDocument};
 pub use executor::{
-    execute_operation_plan, CompareExchangeOutcome, OperationExecutionError, OperationFailure,
-    OperationHost, OperationRead, OperationReceipt, OperationRollbackError,
-    OperationRollbackFailure,
+    execute_dependency_ordered_plan, execute_operation_plan, CompareExchangeOutcome,
+    OperationExecutionError, OperationFailure, OperationHost, OperationRead, OperationReceipt,
+    OperationRollbackError, OperationRollbackFailure,
 };
 pub use mcp::{
     import_mcp_servers, mcp_app_contract, mcp_config_target, mcp_servers_equivalent,
