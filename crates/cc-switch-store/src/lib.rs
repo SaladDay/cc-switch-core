@@ -768,14 +768,14 @@ fn execute_provider_write<P: Params>(
         .savepoint()
         .map_err(|error| redact_provider_write_error(error, transaction_aborted))?;
     let result = (|| {
-        let total_before = savepoint.total_changes();
+        let total_before = sqlite_total_changes(&savepoint);
         let changed = {
             let mut statement = savepoint.prepare(sql)?;
             let mut rows = statement.query(params)?;
             while rows.next()?.is_some() {}
             savepoint.changes() as usize
         };
-        Ok((changed, savepoint.total_changes() - total_before))
+        Ok((changed, sqlite_total_changes(&savepoint) - total_before))
     })();
     let (changed, total_changed) = match result {
         Ok(result) => result,
@@ -809,6 +809,12 @@ fn execute_provider_write<P: Params>(
         .commit()
         .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
     Ok(outcome)
+}
+
+fn sqlite_total_changes(connection: &Connection) -> u64 {
+    // SAFETY: the shared borrow keeps this live connection handle valid for
+    // the duration of SQLite's read-only counter call.
+    unsafe { rusqlite::ffi::sqlite3_total_changes64(connection.handle()) as u64 }
 }
 
 fn redact_provider_write_error(
@@ -1535,6 +1541,37 @@ mod tests {
         assert_eq!(unchanged.meta, "original");
         assert_eq!(unchanged.is_current, 0);
         transaction.commit().expect("commit suppressed writes");
+    }
+
+    #[test]
+    fn provider_writes_do_not_require_sql_total_changes_access() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut connection = database.connect().expect("connect shared database");
+        connection.authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Function {
+                function_name: "total_changes",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }));
+        assert!(connection
+            .query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0))
+            .is_err());
+
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            insert_provider(&mut transaction, &provider_insert("provider", "{}", "{}"))
+                .expect("insert provider without SQL counter access"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit provider write");
     }
 
     #[test]

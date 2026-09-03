@@ -5,11 +5,11 @@ description = "Shared SQLite storage contracts for CC Switch applications"
 license = "MIT"
 repository = "https://github.com/SaladDay/cc-switch-core"
 edition = "2021"
-rust-version = "1.85.1"
+rust-version = "1.85.0"
 
 [dependencies]
 cc-switch-core = { version = "0.1.0", path = "../.." }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 sha2 = "0.10"
 thiserror = "2.0"
 
@@ -20,4 +20,5 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+rusqlite = { version = "0.31", features = ["hooks"] }
 tempfile = "3"
