@@ -46,12 +46,16 @@ assets, styles, process orchestration, OAuth flows and token acquisition,
 network model discovery, proxying, and plugin installation.
 
 The workspace also contains `cc-switch-store`. This separate crate owns the
-shared SQLite connection and an explicit initializer for the canonical
-`providers` table contract. Hosts can run product migrations before opting into
-that contract. The crate does not own product CRUD policy, host extension
-tables, product schema versions, or database path discovery. The shared
-contract validates its columns and binary composite identity; additional host
-constraints, indexes, triggers, and conflict policies remain host-owned.
+shared SQLite connection and explicit contracts for the canonical `providers`
+and `mcp_servers` tables. Hosts can run product migrations before opting into
+those contracts. The crate does not own product CRUD policy, host extension
+tables, product schema versions, or database path discovery.
+
+The MCP catalog has a narrower opt-in write contract. Hosts may add columns,
+indexes, and triggers, but table constraints must retain SQLite's default
+`ABORT` conflict handling. Trigger bodies keep their own conflict policies and
+product-specific MCP state remains host-owned. Read-only consumers do not need
+to opt into this write contract.
 
 The live-operation layer does not own paths, raw-plan syntax validation,
 concrete file I/O, locks, business state, databases, UI, OAuth flows, proxy

@@ -254,6 +254,46 @@ pub fn read_mcp_server_row(
         .map_err(SharedStoreError::from)
 }
 
+/// Verifies the structural contract required by shared MCP writes.
+///
+/// Hosts may add columns, indexes, and triggers, but table constraints must
+/// retain SQLite's default `ABORT` conflict handling. Trigger bodies keep their
+/// own conflict policies because shared writes do not override them.
+pub fn verify_mcp_server_write_contract(connection: &Connection) -> Result<(), SharedStoreError> {
+    verify_mcp_server_schema(connection)?;
+    let table_sql = connection
+        .query_row(
+            "SELECT sql FROM main.sqlite_schema
+             WHERE type = 'table' AND name = 'mcp_servers'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            SharedStoreError::InvalidDatabase("mcp_servers must be a table".to_owned())
+        })?;
+    verify_mcp_server_table_sql(connection, &table_sql)?;
+    if has_non_abort_conflict_policy(&table_sql) {
+        return Err(SharedStoreError::InvalidDatabase(
+            "mcp_servers constraints must use ABORT conflict handling".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_mcp_server_table_sql(connection: &Connection, sql: &str) -> Result<(), SharedStoreError> {
+    let definition = sql.strip_prefix("CREATE TABLE").ok_or_else(|| {
+        SharedStoreError::InvalidDatabase("mcp_servers table definition is invalid".to_owned())
+    })?;
+    let validation_sql = format!("CREATE TABLE IF NOT EXISTS{definition}");
+    connection
+        .prepare(&validation_sql)
+        .map(|_| ())
+        .map_err(|_| {
+            SharedStoreError::InvalidDatabase("mcp_servers table definition is invalid".to_owned())
+        })
+}
+
 fn mcp_server_from_row(row: &Row<'_>) -> Result<McpServerRow, rusqlite::Error> {
     Ok(McpServerRow {
         id: row.get(0)?,
@@ -271,6 +311,87 @@ fn mcp_server_from_row(row: &Row<'_>) -> Result<McpServerRow, rusqlite::Error> {
         enabled_hermes: row.get(12)?,
         source_fingerprint: source_fingerprint(row, MCP_SERVER_FIELD_COUNT)?,
     })
+}
+
+fn has_non_abort_conflict_policy(sql: &str) -> bool {
+    let Some(tokens) = sql_tokens(sql.as_bytes()) else {
+        return true;
+    };
+    tokens.iter().enumerate().any(|(index, token)| {
+        token.eq_ignore_ascii_case(b"ON")
+            && tokens
+                .get(index + 1)
+                .is_some_and(|token| token.eq_ignore_ascii_case(b"CONFLICT"))
+            && !tokens
+                .get(index + 2)
+                .is_some_and(|token| token.eq_ignore_ascii_case(b"ABORT"))
+    })
+}
+
+fn sql_tokens(sql: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut tokens = Vec::new();
+    let mut cursor = 0;
+    while cursor < sql.len() {
+        match sql[cursor] {
+            b'\'' | b'"' | b'`' => {
+                let quote = sql[cursor];
+                let mut terminated = false;
+                cursor += 1;
+                while cursor < sql.len() {
+                    if sql[cursor] == quote {
+                        cursor += 1;
+                        if cursor < sql.len() && sql[cursor] == quote {
+                            cursor += 1;
+                            continue;
+                        }
+                        terminated = true;
+                        break;
+                    }
+                    cursor += 1;
+                }
+                if !terminated {
+                    return None;
+                }
+            }
+            b'[' => {
+                cursor += 1;
+                while cursor < sql.len() && sql[cursor] != b']' {
+                    cursor += 1;
+                }
+                if cursor == sql.len() {
+                    return None;
+                }
+                cursor += 1;
+            }
+            b'-' if sql.get(cursor + 1) == Some(&b'-') => {
+                cursor += 2;
+                while cursor < sql.len() && sql[cursor] != b'\n' {
+                    cursor += 1;
+                }
+            }
+            b'/' if sql.get(cursor + 1) == Some(&b'*') => {
+                cursor += 2;
+                while cursor + 1 < sql.len() && !(sql[cursor] == b'*' && sql[cursor + 1] == b'/') {
+                    cursor += 1;
+                }
+                cursor = (cursor + 2).min(sql.len());
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' || byte >= 0x80 => {
+                let start = cursor;
+                cursor += 1;
+                while cursor < sql.len()
+                    && (sql[cursor].is_ascii_alphanumeric()
+                        || matches!(sql[cursor], b'_' | b'$')
+                        || sql[cursor] >= 0x80)
+                {
+                    cursor += 1;
+                }
+                tokens.push(&sql[start..cursor]);
+            }
+            _ => cursor += 1,
+        }
+    }
+    Some(tokens)
 }
 
 fn mcp_server_columns(connection: &Connection) -> Result<Vec<ExistingColumn>, SharedStoreError> {
@@ -655,5 +776,123 @@ mod tests {
                 .expect("read product version"),
             41
         );
+    }
+
+    #[test]
+    fn write_contract_accepts_host_extensions_and_trigger_policies() {
+        let (_directory, database) = test_database();
+        let mut connection = database.connect().expect("connect shared database");
+        ensure_mcp_server_schema(&mut connection).expect("initialize MCP schema");
+        connection
+            .execute_batch(
+                "ALTER TABLE mcp_servers
+                    ADD COLUMN host_note TEXT DEFAULT 'ON CONFLICT REPLACE';
+                 CREATE TABLE host_mcp_state (
+                    value TEXT UNIQUE ON CONFLICT IGNORE
+                 );
+                 CREATE INDEX host_mcp_name ON mcp_servers(name);
+                 CREATE TRIGGER host_mcp_insert AFTER INSERT ON mcp_servers BEGIN
+                    INSERT OR IGNORE INTO host_mcp_state VALUES (NEW.name);
+                 END;
+                 CREATE TABLE alternate_mcp_servers (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    server_config TEXT NOT NULL,
+                    description TEXT,
+                    homepage TEXT,
+                    docs TEXT,
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    enabled_claude BOOLEAN NOT NULL DEFAULT 0,
+                    enabled_codex BOOLEAN NOT NULL DEFAULT 0,
+                    enabled_gemini BOOLEAN NOT NULL DEFAULT 0,
+                    enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
+                    enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
+                    enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
+                    ON$ INTEGER,
+                    CONFLICT$ INTEGER,
+                    REPLACE$ INTEGER,
+                    -- ON CONFLICT REPLACE is still part of this comment\r
+                    CHECK (ON$ + CONFLICT$ + REPLACE$ >= 0)
+                 );",
+            )
+            .expect("add host extensions");
+
+        verify_mcp_server_write_contract(&connection).expect("accept compatible host extensions");
+
+        connection
+            .execute_batch(
+                "DROP TABLE mcp_servers;
+                 ALTER TABLE alternate_mcp_servers RENAME TO mcp_servers;",
+            )
+            .expect("install compatible lexical edge-case schema");
+        verify_mcp_server_write_contract(&connection)
+            .expect("ignore comments and complete bare identifiers");
+    }
+
+    #[test]
+    fn write_contract_rejects_non_abort_table_conflict_policies() {
+        for policy in ["ROLLBACK", "FAIL", "IGNORE", "REPLACE"] {
+            let connection = Connection::open_in_memory().expect("open database");
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE mcp_servers (
+                        id TEXT PRIMARY KEY ON CONFLICT {policy},
+                        name TEXT NOT NULL,
+                        server_config TEXT NOT NULL,
+                        description TEXT,
+                        homepage TEXT,
+                        docs TEXT,
+                        tags TEXT NOT NULL DEFAULT '[]',
+                        enabled_claude BOOLEAN NOT NULL DEFAULT 0,
+                        enabled_codex BOOLEAN NOT NULL DEFAULT 0,
+                        enabled_gemini BOOLEAN NOT NULL DEFAULT 0,
+                        enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
+                        enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
+                        enabled_hermes BOOLEAN NOT NULL DEFAULT 0
+                     );"
+                ))
+                .expect("create incompatible MCP table");
+
+            let error = verify_mcp_server_write_contract(&connection)
+                .expect_err("reject non-ABORT conflict policy");
+            assert!(matches!(
+                error,
+                SharedStoreError::InvalidDatabase(message)
+                    if message == "mcp_servers constraints must use ABORT conflict handling"
+            ));
+        }
+    }
+
+    #[test]
+    fn conflict_policy_scanner_handles_valid_sql_edges() {
+        assert!(!has_non_abort_conflict_policy(
+            "CREATE TABLE t (id TEXT PRIMARY KEY ON /* keep */ CONFLICT ABORT,
+             note TEXT DEFAULT 'ON CONFLICT REPLACE', \"ON CONFLICT FAIL\" TEXT)"
+        ));
+    }
+
+    #[test]
+    fn write_contract_rejects_corrupt_table_definition() {
+        let connection = Connection::open_in_memory().expect("open database");
+        connection
+            .execute_batch(CREATE_MCP_SERVERS_TABLE)
+            .expect("create canonical MCP table");
+        connection
+            .execute_batch(
+                "PRAGMA writable_schema = ON;
+                 UPDATE sqlite_schema
+                    SET sql = substr(sql, 1, length(sql) - 1)
+                  WHERE type = 'table' AND name = 'mcp_servers';
+                 PRAGMA writable_schema = OFF;",
+            )
+            .expect("corrupt stored table definition");
+
+        let error = verify_mcp_server_write_contract(&connection)
+            .expect_err("reject corrupt table definition");
+        assert!(matches!(
+            error,
+            SharedStoreError::InvalidDatabase(message)
+                if message == "mcp_servers table definition is invalid"
+        ));
     }
 }

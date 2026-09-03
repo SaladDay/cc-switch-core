@@ -21,8 +21,8 @@ use thiserror::Error;
 mod mcp;
 
 pub use mcp::{
-    ensure_mcp_server_schema, read_mcp_server_row, read_mcp_server_rows, McpServerRow,
-    MCP_SERVERS_TABLE,
+    ensure_mcp_server_schema, read_mcp_server_row, read_mcp_server_rows,
+    verify_mcp_server_write_contract, McpServerRow, MCP_SERVERS_TABLE,
 };
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
