@@ -661,7 +661,42 @@ pub fn insert_provider(
             provider.is_current,
             provider.in_failover_queue,
         ],
-        false,
+        ProviderWriteGuard::None,
+    )
+}
+
+/// Updates every canonical value of one provider while preserving host-owned
+/// extension columns and dependent rows. This full-row primitive also rejects
+/// updates that implicitly remove another provider through `REPLACE`.
+pub fn update_provider_row(
+    transaction: &mut Transaction<'_>,
+    provider: &ProviderInsert<'_>,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    execute_provider_write(
+        transaction,
+        "UPDATE main.providers SET
+            name = ?1, settings_config = ?2, website_url = ?3, category = ?4,
+            created_at = ?5, sort_index = ?6, notes = ?7, icon = ?8,
+            icon_color = ?9, meta = ?10, is_current = ?11,
+            in_failover_queue = ?12
+         WHERE id COLLATE BINARY = ?13 AND app_type COLLATE BINARY = ?14",
+        params![
+            provider.name,
+            provider.settings_config,
+            provider.website_url,
+            provider.category,
+            provider.created_at,
+            provider.sort_index,
+            provider.notes,
+            provider.icon,
+            provider.icon_color,
+            provider.meta,
+            provider.is_current,
+            provider.in_failover_queue,
+            provider.id,
+            provider.app_type,
+        ],
+        ProviderWriteGuard::SideEffectsAndProviderCount,
     )
 }
 
@@ -678,7 +713,7 @@ pub fn update_provider_configuration(
         "UPDATE main.providers SET name = ?1, settings_config = ?2
          WHERE id COLLATE BINARY = ?3 AND app_type COLLATE BINARY = ?4",
         params![name, settings_config, id, app_type],
-        true,
+        ProviderWriteGuard::SideEffects,
     )
 }
 
@@ -698,7 +733,7 @@ pub fn update_provider_details(
          SET name = ?1, settings_config = ?2, category = ?3, meta = ?4
          WHERE id COLLATE BINARY = ?5 AND app_type COLLATE BINARY = ?6",
         params![name, settings_config, category, meta, id, app_type],
-        true,
+        ProviderWriteGuard::SideEffects,
     )
 }
 
@@ -714,7 +749,7 @@ pub fn update_provider_metadata(
         "UPDATE main.providers SET meta = ?1
          WHERE id COLLATE BINARY = ?2 AND app_type COLLATE BINARY = ?3",
         params![meta, id, app_type],
-        true,
+        ProviderWriteGuard::SideEffects,
     )
 }
 
@@ -730,7 +765,7 @@ pub fn set_provider_current(
         "UPDATE main.providers SET is_current = ?1
          WHERE id COLLATE BINARY = ?2 AND app_type COLLATE BINARY = ?3",
         params![is_current, id, app_type],
-        true,
+        ProviderWriteGuard::SideEffects,
     )
 }
 
@@ -745,15 +780,22 @@ pub fn delete_provider(
         "DELETE FROM main.providers
          WHERE id COLLATE BINARY = ?1 AND app_type COLLATE BINARY = ?2",
         params![id, app_type],
-        false,
+        ProviderWriteGuard::None,
     )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderWriteGuard {
+    None,
+    SideEffects,
+    SideEffectsAndProviderCount,
 }
 
 fn execute_provider_write<P: Params>(
     transaction: &mut Transaction<'_>,
     sql: &str,
     params: P,
-    reject_side_effects: bool,
+    guard: ProviderWriteGuard,
 ) -> Result<ProviderWriteOutcome, SharedStoreError> {
     if transaction.is_autocommit() {
         return Err(SharedStoreError::ProviderWrite {
@@ -768,6 +810,12 @@ fn execute_provider_write<P: Params>(
         .savepoint()
         .map_err(|error| redact_provider_write_error(error, transaction_aborted))?;
     let result = (|| {
+        let provider_count_before = match guard {
+            ProviderWriteGuard::SideEffectsAndProviderCount => {
+                Some(provider_row_count(&savepoint)?)
+            }
+            ProviderWriteGuard::None | ProviderWriteGuard::SideEffects => None,
+        };
         let total_before = sqlite_total_changes(&savepoint);
         let changed = {
             let mut statement = savepoint.prepare(sql)?;
@@ -775,9 +823,17 @@ fn execute_provider_write<P: Params>(
             while rows.next()?.is_some() {}
             savepoint.changes() as usize
         };
-        Ok((changed, sqlite_total_changes(&savepoint) - total_before))
+        let provider_count_changed = provider_count_before
+            .map(|before| provider_row_count(&savepoint).map(|after| before != after))
+            .transpose()?
+            .unwrap_or(false);
+        Ok((
+            changed,
+            sqlite_total_changes(&savepoint) - total_before,
+            provider_count_changed,
+        ))
     })();
-    let (changed, total_changed) = match result {
+    let (changed, total_changed, provider_count_changed) = match result {
         Ok(result) => result,
         Err(error) => {
             let _ = savepoint.finish();
@@ -787,7 +843,9 @@ fn execute_provider_write<P: Params>(
             ));
         }
     };
-    if reject_side_effects && total_changed != changed as u64 {
+    if guard != ProviderWriteGuard::None
+        && (total_changed != changed as u64 || provider_count_changed)
+    {
         savepoint
             .finish()
             .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
@@ -809,6 +867,10 @@ fn execute_provider_write<P: Params>(
         .commit()
         .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
     Ok(outcome)
+}
+
+fn provider_row_count(connection: &Connection) -> rusqlite::Result<i64> {
+    connection.query_row("SELECT COUNT(*) FROM main.providers", [], |row| row.get(0))
 }
 
 fn sqlite_total_changes(connection: &Connection) -> u64 {
@@ -1317,6 +1379,21 @@ mod tests {
             insert_provider(&mut transaction, &provider).expect("insert provider"),
             ProviderWriteOutcome::Applied
         );
+        provider.name = "Full update";
+        provider.settings_config = "full-settings";
+        provider.website_url = Some("https://updated.example.com");
+        provider.category = Some("updated");
+        provider.created_at = Some(3);
+        provider.sort_index = Some(4);
+        provider.notes = Some("updated note");
+        provider.icon = Some("updated icon");
+        provider.icon_color = Some("#000");
+        provider.meta = "full-meta";
+        provider.is_current = 1;
+        assert_eq!(
+            update_provider_row(&mut transaction, &provider).expect("update complete provider"),
+            ProviderWriteOutcome::Applied
+        );
         assert_eq!(
             update_provider_configuration(&mut transaction, "provider", "claude", "Updated", "{}",)
                 .expect("update provider configuration"),
@@ -1359,6 +1436,15 @@ mod tests {
         assert_eq!(row.settings_config, "imported-settings");
         assert_eq!(row.category.as_deref(), Some("imported"));
         assert_eq!(row.meta, "imported-meta");
+        assert_eq!(
+            row.website_url.as_deref(),
+            Some("https://updated.example.com")
+        );
+        assert_eq!(row.created_at, Some(3));
+        assert_eq!(row.sort_index, Some(4));
+        assert_eq!(row.notes.as_deref(), Some("updated note"));
+        assert_eq!(row.icon.as_deref(), Some("updated icon"));
+        assert_eq!(row.icon_color.as_deref(), Some("#000"));
         assert_eq!(row.is_current, 0);
         assert_eq!(row.in_failover_queue, 1);
         assert_eq!(
@@ -1394,15 +1480,9 @@ mod tests {
             .expect("create extension-rewriting host trigger");
         let mut transaction = begin_immediate_transaction(&mut connection)
             .expect("begin extension-guarded transaction");
+        provider.name = "Rejected";
         assert_eq!(
-            update_provider_configuration(
-                &mut transaction,
-                "provider",
-                "claude",
-                "Rejected",
-                "rejected-settings",
-            )
-            .expect("guard provider extensions"),
+            update_provider_row(&mut transaction, &provider).expect("guard provider extensions"),
             ProviderWriteOutcome::NotApplied
         );
         transaction
@@ -1447,6 +1527,78 @@ mod tests {
             ProviderWriteOutcome::NotApplied
         );
         transaction.commit().expect("commit provider deletes");
+    }
+
+    #[test]
+    fn provider_updates_reject_replace_conflict_side_effects() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .connect()
+            .expect("connect shared database")
+            .execute_batch(
+                "CREATE TABLE providers (
+                    id TEXT NOT NULL,
+                    app_type TEXT NOT NULL,
+                    name TEXT NOT NULL UNIQUE ON CONFLICT REPLACE,
+                    settings_config TEXT NOT NULL,
+                    PRIMARY KEY (id, app_type)
+                );",
+            )
+            .expect("create host provider table");
+        database
+            .ensure_provider_schema()
+            .expect("upgrade provider schema");
+        let mut connection = database.connect().expect("connect upgraded database");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        let mut first = provider_insert("first", "{}", "{}");
+        first.name = "taken";
+        assert_eq!(
+            insert_provider(&mut transaction, &first).expect("insert first provider"),
+            ProviderWriteOutcome::Applied
+        );
+        let mut second = provider_insert("second", "{}", "{}");
+        second.name = "available";
+        assert_eq!(
+            insert_provider(&mut transaction, &second).expect("insert second provider"),
+            ProviderWriteOutcome::Applied
+        );
+
+        transaction
+            .execute_batch(
+                "CREATE TABLE host_values (value TEXT UNIQUE);
+                 INSERT INTO host_values VALUES ('taken');
+                 CREATE TRIGGER preserve_host_conflict_policy
+                 AFTER UPDATE OF name ON providers
+                 BEGIN
+                     INSERT OR IGNORE INTO host_values VALUES ('taken');
+                 END;",
+            )
+            .expect("create host conflict-policy trigger");
+        second.name = "available-updated";
+        assert_eq!(
+            update_provider_row(&mut transaction, &second)
+                .expect("preserve host trigger conflict policy"),
+            ProviderWriteOutcome::Applied
+        );
+
+        second.name = "taken";
+        assert_eq!(
+            update_provider_row(&mut transaction, &second).expect("guard replace conflict"),
+            ProviderWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit guarded transaction");
+
+        assert_eq!(
+            read_provider_rows(&connection, Some("claude"))
+                .expect("read providers")
+                .iter()
+                .map(|row| (row.id.as_str(), row.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("first", "taken"), ("second", "available-updated")]
+        );
     }
 
     #[test]
