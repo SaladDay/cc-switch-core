@@ -1,5 +1,5 @@
 use std::{
-    fmt,
+    fmt::{self, Write as _},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -379,10 +379,14 @@ impl SkillRowWriteGuard {
                 .map(|index| format!("target_{index}"))
                 .collect::<Vec<_>>()
         });
-        let target_definition = target_columns
-            .iter()
-            .map(|column| format!(", \"{column}\""))
-            .collect::<String>();
+        let target_definition =
+            target_columns
+                .iter()
+                .fold(String::new(), |mut definition, column| {
+                    write!(&mut definition, ", \"{column}\"")
+                        .expect("writing a String cannot fail");
+                    definition
+                });
         connection.execute_batch(&format!(
             "CREATE TEMP TABLE \"{table}\" (
                 writes INTEGER NOT NULL,
