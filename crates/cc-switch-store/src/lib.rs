@@ -659,6 +659,30 @@ pub fn insert_provider(
     transaction: &mut Transaction<'_>,
     provider: &ProviderInsert<'_>,
 ) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    insert_provider_with_guard(transaction, provider, ProviderWriteGuard::None)
+}
+
+/// Inserts one provider only when its identity is absent and no trigger or
+/// foreign-key write accompanies the insert.
+pub fn insert_provider_if_absent(
+    transaction: &mut Transaction<'_>,
+    provider: &ProviderInsert<'_>,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    if provider_exists_for_write(transaction, provider.id, provider.app_type)? {
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
+    insert_provider_with_guard(
+        transaction,
+        provider,
+        ProviderWriteGuard::Inserted(provider),
+    )
+}
+
+fn insert_provider_with_guard(
+    transaction: &mut Transaction<'_>,
+    provider: &ProviderInsert<'_>,
+    guard: ProviderWriteGuard<'_, '_>,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
     execute_provider_write(
         transaction,
         "INSERT INTO main.providers (
@@ -684,8 +708,28 @@ pub fn insert_provider(
             provider.is_current,
             provider.in_failover_queue,
         ],
-        ProviderWriteGuard::None,
+        guard,
     )
+}
+
+/// Updates every canonical value only when the complete source row is unchanged.
+///
+/// The fingerprint includes unknown host columns, while the update itself leaves
+/// those columns untouched.
+pub fn update_provider_row_if_unchanged(
+    transaction: &mut Transaction<'_>,
+    expected_fingerprint: &[u8; 32],
+    provider: &ProviderInsert<'_>,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    if !provider_fingerprint_matches(
+        transaction,
+        provider.id,
+        provider.app_type,
+        expected_fingerprint,
+    )? {
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
+    update_provider_row(transaction, provider)
 }
 
 /// Updates every canonical value of one provider while preserving host-owned
@@ -740,6 +784,21 @@ pub fn update_provider_configuration(
     )
 }
 
+/// Updates provider configuration only when the complete source row is unchanged.
+pub fn update_provider_configuration_if_unchanged(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    expected_fingerprint: &[u8; 32],
+    name: &str,
+    settings_config: &str,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    if !provider_fingerprint_matches(transaction, id, app_type, expected_fingerprint)? {
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
+    update_provider_configuration(transaction, id, app_type, name, settings_config)
+}
+
 /// Updates only the raw settings of one provider.
 pub fn update_provider_settings_config(
     transaction: &mut Transaction<'_>,
@@ -754,6 +813,20 @@ pub fn update_provider_settings_config(
         params![settings_config, id, app_type],
         ProviderWriteGuard::SideEffects,
     )
+}
+
+/// Updates raw provider settings only when the complete source row is unchanged.
+pub fn update_provider_settings_config_if_unchanged(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    expected_fingerprint: &[u8; 32],
+    settings_config: &str,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    if !provider_fingerprint_matches(transaction, id, app_type, expected_fingerprint)? {
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
+    update_provider_settings_config(transaction, id, app_type, settings_config)
 }
 
 /// Atomically updates the shared editable details of one provider.
@@ -776,6 +849,32 @@ pub fn update_provider_details(
     )
 }
 
+/// Updates shared provider details only when the complete source row is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn update_provider_details_if_unchanged(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    expected_fingerprint: &[u8; 32],
+    name: &str,
+    settings_config: &str,
+    category: Option<&str>,
+    meta: &str,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    if !provider_fingerprint_matches(transaction, id, app_type, expected_fingerprint)? {
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
+    update_provider_details(
+        transaction,
+        id,
+        app_type,
+        name,
+        settings_config,
+        category,
+        meta,
+    )
+}
+
 /// Updates the raw metadata JSON of one provider.
 pub fn update_provider_metadata(
     transaction: &mut Transaction<'_>,
@@ -790,6 +889,20 @@ pub fn update_provider_metadata(
         params![meta, id, app_type],
         ProviderWriteGuard::SideEffects,
     )
+}
+
+/// Updates provider metadata only when the complete source row is unchanged.
+pub fn update_provider_metadata_if_unchanged(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    expected_fingerprint: &[u8; 32],
+    meta: &str,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    if !provider_fingerprint_matches(transaction, id, app_type, expected_fingerprint)? {
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
+    update_provider_metadata(transaction, id, app_type, meta)
 }
 
 /// Changes the current flag on one provider.
@@ -808,6 +921,20 @@ pub fn set_provider_current(
     )
 }
 
+/// Changes the current flag only when the complete source row is unchanged.
+pub fn set_provider_current_if_unchanged(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    expected_fingerprint: &[u8; 32],
+    is_current: bool,
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    if !provider_fingerprint_matches(transaction, id, app_type, expected_fingerprint)? {
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
+    set_provider_current(transaction, id, app_type, is_current)
+}
+
 /// Deletes one provider by its composite identity.
 pub fn delete_provider(
     transaction: &mut Transaction<'_>,
@@ -823,11 +950,35 @@ pub fn delete_provider(
     )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ProviderWriteGuard<'value> {
+/// Deletes one provider only when the complete source row is unchanged.
+pub fn delete_provider_if_unchanged(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    expected_fingerprint: &[u8; 32],
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    if !provider_fingerprint_matches(transaction, id, app_type, expected_fingerprint)? {
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
+    execute_provider_write(
+        transaction,
+        "DELETE FROM main.providers
+         WHERE id COLLATE BINARY = ?1 AND app_type COLLATE BINARY = ?2",
+        params![id, app_type],
+        ProviderWriteGuard::StrictTargetAbsent { id, app_type },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ProviderWriteGuard<'guard, 'value> {
     None,
+    Inserted(&'guard ProviderInsert<'value>),
     SideEffects,
     TargetAbsent {
+        id: &'value str,
+        app_type: &'value str,
+    },
+    StrictTargetAbsent {
         id: &'value str,
         app_type: &'value str,
     },
@@ -837,7 +988,7 @@ fn execute_provider_write<P: Params>(
     transaction: &mut Transaction<'_>,
     sql: &str,
     params: P,
-    guard: ProviderWriteGuard<'_>,
+    guard: ProviderWriteGuard<'_, '_>,
 ) -> Result<ProviderWriteOutcome, SharedStoreError> {
     if transaction.is_autocommit() {
         return Err(SharedStoreError::ProviderWrite {
@@ -853,7 +1004,11 @@ fn execute_provider_write<P: Params>(
         .map_err(|error| redact_provider_write_error(error, transaction_aborted))?;
     let result = (|| {
         let provider_count_before = match guard {
-            ProviderWriteGuard::SideEffects => Some(provider_row_count(&savepoint)?),
+            ProviderWriteGuard::Inserted(_)
+            | ProviderWriteGuard::SideEffects
+            | ProviderWriteGuard::StrictTargetAbsent { .. } => {
+                Some(provider_row_count(&savepoint)?)
+            }
             ProviderWriteGuard::None | ProviderWriteGuard::TargetAbsent { .. } => None,
         };
         let total_before = sqlite_total_changes(&savepoint);
@@ -863,28 +1018,50 @@ fn execute_provider_write<P: Params>(
             while rows.next()?.is_some() {}
             savepoint.changes() as usize
         };
-        let provider_count_changed = provider_count_before
-            .map(|before| provider_row_count(&savepoint).map(|after| before != after))
-            .transpose()?
-            .unwrap_or(false);
+        let provider_count_after = provider_count_before
+            .map(|_| provider_row_count(&savepoint))
+            .transpose()?;
+        let inserted_matches = match guard {
+            ProviderWriteGuard::Inserted(provider) => {
+                read_provider_row(&savepoint, provider.id, provider.app_type)?
+                    .as_ref()
+                    .is_some_and(|row| provider_matches(row, provider))
+            }
+            ProviderWriteGuard::None
+            | ProviderWriteGuard::SideEffects
+            | ProviderWriteGuard::TargetAbsent { .. }
+            | ProviderWriteGuard::StrictTargetAbsent { .. } => true,
+        };
         let target_present = match guard {
-            ProviderWriteGuard::TargetAbsent { id, app_type } => {
+            ProviderWriteGuard::TargetAbsent { id, app_type }
+            | ProviderWriteGuard::StrictTargetAbsent { id, app_type } => {
                 provider_exists(&savepoint, id, app_type)?
             }
-            ProviderWriteGuard::None | ProviderWriteGuard::SideEffects => false,
+            ProviderWriteGuard::None
+            | ProviderWriteGuard::Inserted(_)
+            | ProviderWriteGuard::SideEffects => false,
         };
         Ok((
             changed,
             sqlite_total_changes(&savepoint) - total_before,
-            provider_count_changed,
+            provider_count_before,
+            provider_count_after,
+            inserted_matches,
             target_present,
         ))
     })();
-    let (changed, total_changed, provider_count_changed, target_present) = match result {
+    let (
+        changed,
+        total_changed,
+        provider_count_before,
+        provider_count_after,
+        inserted_matches,
+        target_present,
+    ) = match result {
         Ok(result) => result,
         Err(error) => {
             let _ = savepoint.finish();
-            return Err(redact_provider_write_error(
+            return Err(redact_provider_store_error(
                 error,
                 transaction.is_autocommit(),
             ));
@@ -896,9 +1073,23 @@ fn execute_provider_write<P: Params>(
             .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
         return Ok(ProviderWriteOutcome::NotApplied);
     }
-    if matches!(guard, ProviderWriteGuard::SideEffects)
-        && (total_changed != changed as u64 || provider_count_changed)
-    {
+    let provider_count_valid = match guard {
+        ProviderWriteGuard::Inserted(_) => provider_count_before
+            .zip(provider_count_after)
+            .is_some_and(|(before, after)| before.checked_add(1) == Some(after)),
+        ProviderWriteGuard::SideEffects => provider_count_before == provider_count_after,
+        ProviderWriteGuard::StrictTargetAbsent { .. } => provider_count_before
+            .zip(provider_count_after)
+            .is_some_and(|(before, after)| before.checked_sub(1) == Some(after)),
+        ProviderWriteGuard::None | ProviderWriteGuard::TargetAbsent { .. } => true,
+    };
+    let side_effects_valid = !matches!(
+        guard,
+        ProviderWriteGuard::Inserted(_)
+            | ProviderWriteGuard::SideEffects
+            | ProviderWriteGuard::StrictTargetAbsent { .. }
+    ) || total_changed == changed as u64;
+    if !provider_count_valid || !side_effects_valid || !inserted_matches {
         savepoint
             .finish()
             .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
@@ -925,6 +1116,60 @@ fn execute_provider_write<P: Params>(
         .commit()
         .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
     Ok(outcome)
+}
+
+fn provider_matches(row: &ProviderRow, provider: &ProviderInsert<'_>) -> bool {
+    row.id == provider.id
+        && row.app_type == provider.app_type
+        && row.name == provider.name
+        && row.settings_config == provider.settings_config
+        && row.website_url.as_deref() == provider.website_url
+        && row.category.as_deref() == provider.category
+        && row.created_at == provider.created_at
+        && row.sort_index == provider.sort_index
+        && row.notes.as_deref() == provider.notes
+        && row.icon.as_deref() == provider.icon
+        && row.icon_color.as_deref() == provider.icon_color
+        && row.meta == provider.meta
+        && row.is_current == provider.is_current
+        && row.in_failover_queue == provider.in_failover_queue
+}
+
+fn provider_fingerprint_matches(
+    transaction: &Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    expected: &[u8; 32],
+) -> Result<bool, SharedStoreError> {
+    if transaction.is_autocommit() {
+        return Err(SharedStoreError::ProviderWrite {
+            code: None,
+            extended_code: None,
+            transaction_aborted: true,
+        });
+    }
+    verify_provider_write_schema(transaction)?;
+    Ok(read_provider_row(transaction, id, app_type)
+        .map_err(|error| redact_provider_store_error(error, transaction.is_autocommit()))?
+        .as_ref()
+        .is_some_and(|row| row.source_fingerprint() == expected))
+}
+
+fn provider_exists_for_write(
+    transaction: &Transaction<'_>,
+    id: &str,
+    app_type: &str,
+) -> Result<bool, SharedStoreError> {
+    if transaction.is_autocommit() {
+        return Err(SharedStoreError::ProviderWrite {
+            code: None,
+            extended_code: None,
+            transaction_aborted: true,
+        });
+    }
+    verify_provider_write_schema(transaction)?;
+    provider_exists(transaction, id, app_type)
+        .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))
 }
 
 fn provider_row_count(connection: &Connection) -> rusqlite::Result<i64> {
@@ -960,6 +1205,18 @@ fn redact_provider_write_error(
         code: error.sqlite_error_code(),
         extended_code,
         transaction_aborted,
+    }
+}
+
+fn redact_provider_store_error(
+    error: SharedStoreError,
+    transaction_aborted: bool,
+) -> SharedStoreError {
+    match error {
+        SharedStoreError::Database(error) => {
+            redact_provider_write_error(error, transaction_aborted)
+        }
+        error => error,
     }
 }
 
@@ -1644,6 +1901,12 @@ mod tests {
             insert_provider(&mut transaction, &second).expect("insert second provider"),
             ProviderWriteOutcome::Applied
         );
+        let mut third = provider_insert("third", "{}", "{}");
+        third.name = "taken";
+        assert_eq!(
+            insert_provider_if_absent(&mut transaction, &third).expect("guard replace insert"),
+            ProviderWriteOutcome::NotApplied
+        );
 
         transaction
             .execute_batch(
@@ -1775,6 +2038,152 @@ mod tests {
     }
 
     #[test]
+    fn provider_strict_insert_rejects_same_value_replacement() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "ALTER TABLE providers ADD COLUMN host_value TEXT NOT NULL DEFAULT 'default';
+                 CREATE TRIGGER replace_inserted_provider AFTER INSERT ON providers
+                 BEGIN
+                     INSERT OR REPLACE INTO providers (
+                         id, app_type, name, settings_config, website_url,
+                         category, created_at, sort_index, notes, icon,
+                         icon_color, meta, is_current, in_failover_queue,
+                         host_value
+                     ) VALUES (
+                         NEW.id, NEW.app_type, NEW.name, NEW.settings_config,
+                         NEW.website_url, NEW.category, NEW.created_at,
+                         NEW.sort_index, NEW.notes, NEW.icon, NEW.icon_color,
+                         NEW.meta, NEW.is_current, NEW.in_failover_queue,
+                         NEW.host_value
+                     );
+                 END;",
+            )
+            .expect("create replacing host trigger");
+
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            insert_provider_if_absent(
+                &mut transaction,
+                &provider_insert("provider", "settings", "meta")
+            )
+            .expect("guard inserted provider"),
+            ProviderWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit guarded transaction");
+
+        assert!(read_provider_row(&connection, "provider", "claude")
+            .expect("read rejected provider")
+            .is_none());
+    }
+
+    #[test]
+    fn provider_compare_and_swap_covers_unknown_host_columns() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .pragma_update(None, "user_version", 43)
+            .expect("set host schema version");
+        connection
+            .execute_batch("ALTER TABLE providers ADD COLUMN host_value TEXT DEFAULT 'before'")
+            .expect("add host extension");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            insert_provider(
+                &mut transaction,
+                &provider_insert("provider", "settings", "meta")
+            )
+            .expect("insert provider"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit provider fixture");
+
+        let stale = read_provider_row(&connection, "provider", "claude")
+            .expect("read provider")
+            .expect("provider exists");
+        connection
+            .execute(
+                "UPDATE providers SET host_value = 'after'
+                 WHERE id = 'provider' AND app_type = 'claude'",
+                [],
+            )
+            .expect("change host extension");
+
+        let mut updated = provider_insert("provider", "updated", "meta");
+        updated.name = "Updated";
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin stale update");
+        assert_eq!(
+            update_provider_row_if_unchanged(
+                &mut transaction,
+                stale.source_fingerprint(),
+                &updated,
+            )
+            .expect("reject stale update"),
+            ProviderWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            delete_provider_if_unchanged(
+                &mut transaction,
+                "provider",
+                "claude",
+                stale.source_fingerprint(),
+            )
+            .expect("reject stale delete"),
+            ProviderWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit rejected writes");
+
+        let unchanged = read_provider_row(&connection, "provider", "claude")
+            .expect("read unchanged provider")
+            .expect("provider remains");
+        assert_eq!(unchanged.name, "Provider");
+        assert_eq!(unchanged.settings_config, "settings");
+
+        let current_fingerprint = *unchanged.source_fingerprint();
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin fresh update");
+        assert_eq!(
+            update_provider_row_if_unchanged(&mut transaction, &current_fingerprint, &updated,)
+                .expect("apply fresh update"),
+            ProviderWriteOutcome::Applied
+        );
+        let updated = read_provider_row(&transaction, "provider", "claude")
+            .expect("read updated provider")
+            .expect("provider remains");
+        assert_eq!(
+            delete_provider_if_unchanged(
+                &mut transaction,
+                "provider",
+                "claude",
+                updated.source_fingerprint(),
+            )
+            .expect("apply fresh delete"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit fresh writes");
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("read host schema version"),
+            43
+        );
+    }
+
+    #[test]
     fn provider_delete_rejects_trigger_rewrites() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
@@ -1864,6 +2273,64 @@ mod tests {
                 .expect("read delete effect"),
             0
         );
+
+        connection
+            .execute_batch(
+                "DROP TRIGGER remove_provider_before_delete;
+                 INSERT INTO providers (id, app_type, name, settings_config)
+                 VALUES ('other', 'claude', 'Other', 'other');
+                 CREATE TRIGGER replace_other_after_delete AFTER DELETE ON providers
+                 WHEN OLD.id = 'provider' AND OLD.app_type = 'claude'
+                 BEGIN
+                     INSERT OR REPLACE INTO providers (
+                         id, app_type, name, settings_config, website_url,
+                         category, created_at, sort_index, notes, icon,
+                         icon_color, meta, is_current, in_failover_queue
+                     ) SELECT
+                         id, app_type, name, settings_config, website_url,
+                         category, created_at, sort_index, notes, icon,
+                         icon_color, meta, is_current, in_failover_queue
+                     FROM providers
+                     WHERE id = 'other' AND app_type = 'claude';
+                 END;",
+            )
+            .expect("create other-provider replacement trigger");
+        let original_other_rowid = connection
+            .query_row(
+                "SELECT rowid FROM providers WHERE id = 'other' AND app_type = 'claude'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read other provider rowid");
+        let provider = read_provider_row(&connection, "provider", "claude")
+            .expect("read delete target")
+            .expect("delete target exists");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin strict delete");
+        assert_eq!(
+            delete_provider_if_unchanged(
+                &mut transaction,
+                "provider",
+                "claude",
+                provider.source_fingerprint(),
+            )
+            .expect("reject other-provider replacement"),
+            ProviderWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit rejected strict delete");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT rowid FROM providers WHERE id = 'other' AND app_type = 'claude'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read preserved other provider rowid"),
+            original_other_rowid
+        );
+        assert!(read_provider_row(&connection, "provider", "claude")
+            .expect("read preserved delete target")
+            .is_some());
     }
 
     #[test]

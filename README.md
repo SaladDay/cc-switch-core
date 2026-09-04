@@ -54,6 +54,13 @@ can run product migrations before opting into those contracts. The crate does
 not own product CRUD policy, host extension tables, product schema versions, or
 database path discovery.
 
+Provider rows expose a fingerprint covering canonical and unknown host columns.
+The `*_if_unchanged` writes use it for compare-and-swap updates while preserving
+host fields. `insert_provider_if_absent` and strict deletes additionally reject
+trigger or foreign-key side effects, including same-value row replacement. The
+original insert and delete primitives remain available for hosts whose
+compatibility contract requires dependent-row cleanup.
+
 The MCP catalog has a narrower opt-in write contract. Hosts may add columns,
 indexes, and triggers, but table constraints must retain SQLite's default
 `ABORT` conflict handling. Trigger bodies keep their own conflict policies and
