@@ -1,9 +1,19 @@
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
-use cc_switch_core::builtin_app_registry;
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use cc_switch_core::{builtin_app_registry, McpCatalogColumn};
+use rusqlite::{
+    params, Connection, DropBehavior, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 
-use crate::{mcp::has_non_abort_conflict_policy, SharedStoreError};
+use crate::{
+    mcp::{
+        delete_mcp_server, has_non_abort_conflict_policy, insert_mcp_server_catalog_guarded,
+        read_mcp_server_row, read_mcp_server_rows, set_mcp_server_selection_guarded,
+        update_mcp_server_catalog_guarded, verify_mcp_server_write_contract,
+        McpServerCatalogValues, McpServerWriteOutcome,
+    },
+    source_fingerprint, SharedStoreError,
+};
 
 /// Canonical ownership and native-snapshot table shared by CC Switch products.
 pub const MCP_NATIVE_LINKS_TABLE: &str = "mcp_native_links";
@@ -53,6 +63,277 @@ impl fmt::Debug for McpNativeLinkRow {
             )
             .finish()
     }
+}
+
+#[derive(PartialEq, Eq)]
+struct ExpectedMcpDatabaseState {
+    catalog: BTreeMap<String, [u8; 32]>,
+    native_links: BTreeMap<(String, String), [u8; 32]>,
+}
+
+/// Owns an MCP transaction and verifies cross-table state when it commits.
+///
+/// Hosts perform catalog and native-link writes through this type. It captures
+/// both complete tables when it starts, rejects non-target changes before the
+/// next write, and verifies the complete final state as part of commit.
+pub struct McpTransactionGuard<'connection> {
+    transaction: Transaction<'connection>,
+    expected: ExpectedMcpDatabaseState,
+    failed: bool,
+}
+
+impl<'connection> McpTransactionGuard<'connection> {
+    /// Starts an immediate transaction and captures both MCP tables before any write.
+    pub fn begin(connection: &'connection mut Connection) -> Result<Self, SharedStoreError> {
+        let mut transaction =
+            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.set_drop_behavior(DropBehavior::Rollback);
+        verify_mcp_server_write_contract(&transaction)?;
+        verify_mcp_native_link_schema(&transaction)?;
+        verify_delete_trigger(&transaction)?;
+        let expected = read_expected_database_state(&transaction)?;
+        Ok(Self {
+            transaction,
+            expected,
+            failed: false,
+        })
+    }
+
+    /// Reads one catalog row from the guarded transaction.
+    pub fn read_server(
+        &mut self,
+        server_id: &str,
+    ) -> Result<Option<crate::McpServerRow>, SharedStoreError> {
+        match read_mcp_server_row(&self.transaction, server_id) {
+            Ok(row) => Ok(row),
+            Err(error) => self.poison(error),
+        }
+    }
+
+    /// Reads one native link from the guarded transaction.
+    pub fn read_native_link(
+        &mut self,
+        server_id: &str,
+        app_id: &str,
+    ) -> Result<Option<McpNativeLinkRow>, SharedStoreError> {
+        match read_mcp_native_link(&self.transaction, server_id, app_id) {
+            Ok(row) => Ok(row),
+            Err(error) => self.poison(error),
+        }
+    }
+
+    /// Inserts a Registry-complete catalog row through the guarded transaction.
+    pub fn insert_server_catalog(
+        &mut self,
+        server: &McpServerCatalogValues<'_>,
+    ) -> Result<(), SharedStoreError> {
+        let server_id = server.id();
+        self.prepare_write()?;
+        let result = insert_mcp_server_catalog_guarded(&mut self.transaction, server);
+        self.finish_catalog_write(server_id, result)
+    }
+
+    /// Updates Registry-owned catalog fields through the guarded transaction.
+    pub fn update_server_catalog(
+        &mut self,
+        expected_fingerprint: &[u8; 32],
+        server: &McpServerCatalogValues<'_>,
+    ) -> Result<(), SharedStoreError> {
+        let server_id = server.id();
+        self.prepare_write()?;
+        let result =
+            update_mcp_server_catalog_guarded(&mut self.transaction, expected_fingerprint, server);
+        self.finish_catalog_write(server_id, result)
+    }
+
+    /// Changes one Registry-declared application selection through the guard.
+    pub fn set_server_selection(
+        &mut self,
+        server_id: &str,
+        expected_fingerprint: &[u8; 32],
+        column: McpCatalogColumn,
+        enabled: bool,
+    ) -> Result<(), SharedStoreError> {
+        self.prepare_write()?;
+        let result = set_mcp_server_selection_guarded(
+            &mut self.transaction,
+            server_id,
+            expected_fingerprint,
+            column,
+            enabled,
+        );
+        self.finish_catalog_write(server_id, result)
+    }
+
+    /// Deletes one catalog row and its canonical cascading links through the guard.
+    pub fn delete_server(
+        &mut self,
+        server_id: &str,
+        expected_fingerprint: &[u8; 32],
+    ) -> Result<(), SharedStoreError> {
+        self.prepare_write()?;
+        let result = delete_mcp_server(&mut self.transaction, server_id, expected_fingerprint);
+        match result {
+            Ok(McpServerWriteOutcome::Applied) => {
+                self.expected.catalog.remove(server_id);
+                self.expected
+                    .native_links
+                    .retain(|(candidate, _), _| candidate != server_id);
+                Ok(())
+            }
+            Ok(McpServerWriteOutcome::NotApplied) => {
+                self.poison(SharedStoreError::McpTransactionConflict)
+            }
+            Err(error) => self.poison(error),
+        }
+    }
+
+    /// Inserts or updates one native link through the guarded transaction.
+    pub fn upsert_native_link(
+        &mut self,
+        server_id: &str,
+        app_id: &str,
+        native_snapshot: Option<&str>,
+    ) -> Result<(), SharedStoreError> {
+        self.prepare_write()?;
+        let result = upsert_mcp_native_link_guarded(
+            &mut self.transaction,
+            server_id,
+            app_id,
+            native_snapshot,
+        );
+        if let Err(error) = result {
+            return self.poison(error);
+        }
+        match read_mcp_native_link(&self.transaction, server_id, app_id) {
+            Ok(Some(_)) => {
+                let fingerprint = match mcp_native_link_source_fingerprint(
+                    &self.transaction,
+                    server_id,
+                    app_id,
+                ) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(error) => return self.poison(error),
+                };
+                self.expected
+                    .native_links
+                    .insert((server_id.to_owned(), app_id.to_owned()), fingerprint);
+                Ok(())
+            }
+            Ok(None) => self.poison(SharedStoreError::McpTransactionConflict),
+            Err(error) => self.poison(error),
+        }
+    }
+
+    /// Removes every native link for one server through the guarded transaction.
+    pub fn delete_native_links(&mut self, server_id: &str) -> Result<(), SharedStoreError> {
+        self.prepare_write()?;
+        match delete_mcp_native_links(&mut self.transaction, server_id) {
+            Ok(()) => {
+                self.expected
+                    .native_links
+                    .retain(|(candidate, _), _| candidate != server_id);
+                Ok(())
+            }
+            Err(error) => self.poison(error),
+        }
+    }
+
+    /// Verifies all tracked rows and commits only when no cross-table drift remains.
+    pub fn commit(self) -> Result<(), SharedStoreError> {
+        let verification = if self.failed {
+            Err(SharedStoreError::McpTransactionConflict)
+        } else {
+            read_expected_database_state(&self.transaction).and_then(|actual| {
+                (actual == self.expected)
+                    .then_some(())
+                    .ok_or(SharedStoreError::McpTransactionConflict)
+            })
+        };
+        if let Err(error) = verification {
+            if !self.transaction.is_autocommit() {
+                self.transaction.rollback()?;
+            }
+            return Err(error);
+        }
+        self.transaction.commit().map_err(SharedStoreError::from)
+    }
+
+    /// Rolls back the guarded transaction explicitly.
+    pub fn rollback(self) -> Result<(), SharedStoreError> {
+        if self.transaction.is_autocommit() {
+            Ok(())
+        } else {
+            self.transaction.rollback().map_err(SharedStoreError::from)
+        }
+    }
+
+    fn prepare_write(&mut self) -> Result<(), SharedStoreError> {
+        if self.failed {
+            return Err(SharedStoreError::McpTransactionConflict);
+        }
+        match read_expected_database_state(&self.transaction) {
+            Ok(actual) if actual == self.expected => Ok(()),
+            Ok(_) => self.poison(SharedStoreError::McpTransactionConflict),
+            Err(error) => self.poison(error),
+        }
+    }
+
+    fn finish_catalog_write(
+        &mut self,
+        server_id: &str,
+        result: Result<McpServerWriteOutcome, SharedStoreError>,
+    ) -> Result<(), SharedStoreError> {
+        match result {
+            Ok(McpServerWriteOutcome::Applied) => {
+                match read_mcp_server_row(&self.transaction, server_id) {
+                    Ok(Some(row)) => {
+                        self.expected
+                            .catalog
+                            .insert(server_id.to_owned(), *row.source_fingerprint());
+                        Ok(())
+                    }
+                    Ok(None) => self.poison(SharedStoreError::McpTransactionConflict),
+                    Err(error) => self.poison(error),
+                }
+            }
+            Ok(McpServerWriteOutcome::NotApplied) => {
+                self.poison(SharedStoreError::McpTransactionConflict)
+            }
+            Err(error) => self.poison(error),
+        }
+    }
+
+    fn poison<T>(&mut self, error: SharedStoreError) -> Result<T, SharedStoreError> {
+        self.failed = true;
+        Err(error)
+    }
+}
+
+fn read_expected_database_state(
+    connection: &Connection,
+) -> Result<ExpectedMcpDatabaseState, SharedStoreError> {
+    let catalog = read_mcp_server_rows(connection)?
+        .into_iter()
+        .map(|row| (row.id.clone(), *row.source_fingerprint()))
+        .collect();
+    let mut statement = connection.prepare(
+        "SELECT server_id, app_id, mcp_native_links.*
+         FROM main.mcp_native_links AS mcp_native_links
+         ORDER BY server_id COLLATE BINARY, app_id COLLATE BINARY",
+    )?;
+    let native_links = statement
+        .query_map([], |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                source_fingerprint(row, 2)?,
+            ))
+        })?
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    Ok(ExpectedMcpDatabaseState {
+        catalog,
+        native_links,
+    })
 }
 
 /// Creates and validates the shared MCP native-link table.
@@ -147,7 +428,7 @@ pub fn read_mcp_native_link(
     connection
         .query_row(
             "SELECT server_id, app_id, native_snapshot
-               FROM main.mcp_native_links
+               FROM main.mcp_native_links AS mcp_native_links
               WHERE server_id COLLATE BINARY = ?1
                 AND app_id COLLATE BINARY = ?2",
             params![server_id, app_id],
@@ -167,7 +448,34 @@ pub fn upsert_mcp_native_link(
     app_id: &str,
     native_snapshot: Option<&str>,
 ) -> Result<(), SharedStoreError> {
+    upsert_mcp_native_link_inner(transaction, server_id, app_id, native_snapshot, false)
+}
+
+fn upsert_mcp_native_link_guarded(
+    transaction: &mut Transaction<'_>,
+    server_id: &str,
+    app_id: &str,
+    native_snapshot: Option<&str>,
+) -> Result<(), SharedStoreError> {
+    upsert_mcp_native_link_inner(transaction, server_id, app_id, native_snapshot, true)
+}
+
+fn upsert_mcp_native_link_inner(
+    transaction: &mut Transaction<'_>,
+    server_id: &str,
+    app_id: &str,
+    native_snapshot: Option<&str>,
+    strict: bool,
+) -> Result<(), SharedStoreError> {
     prepare_mcp_native_link_write(transaction)?;
+    let link_existed = if strict {
+        read_mcp_native_link(transaction, server_id, app_id)?.is_some()
+    } else {
+        false
+    };
+    let previous_host_fingerprint = link_existed
+        .then(|| mcp_native_link_host_fingerprint(transaction, server_id, app_id))
+        .transpose()?;
     let parent_exists = transaction.query_row(
         "SELECT EXISTS (
              SELECT 1 FROM main.mcp_servers WHERE id COLLATE BINARY = ?1
@@ -181,15 +489,57 @@ pub fn upsert_mcp_native_link(
         ));
     }
     execute_mcp_native_link_write(transaction, |connection| {
-        connection.execute(
-            "INSERT INTO main.mcp_native_links (server_id, app_id, native_snapshot)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(server_id, app_id) DO UPDATE
-                 SET native_snapshot = excluded.native_snapshot",
-            params![server_id, app_id, native_snapshot],
-        )?;
-        Ok(read_mcp_native_link(connection, server_id, app_id)?
-            .is_some_and(|row| row.native_snapshot.as_deref() == native_snapshot))
+        let sql = match (strict, link_existed) {
+            (true, true) => {
+                "UPDATE main.mcp_native_links SET native_snapshot = ?3
+                 WHERE server_id COLLATE BINARY = ?1 AND app_id COLLATE BINARY = ?2
+                 RETURNING *"
+            }
+            (true, false) => {
+                "INSERT INTO main.mcp_native_links (server_id, app_id, native_snapshot)
+                 VALUES (?1, ?2, ?3) RETURNING *"
+            }
+            (false, _) => {
+                "INSERT INTO main.mcp_native_links (server_id, app_id, native_snapshot)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(server_id, app_id) DO UPDATE
+                     SET native_snapshot = excluded.native_snapshot
+                 RETURNING *"
+            }
+        };
+        let mut statement = connection.prepare(sql)?;
+        let mut rows = statement.query(params![server_id, app_id, native_snapshot])?;
+        let returned_fingerprint = rows
+            .next()?
+            .map(|row| source_fingerprint(row, 0))
+            .transpose()?;
+        if rows.next()?.is_some() {
+            return Ok(false);
+        }
+        drop(rows);
+        drop(statement);
+        let source_matches = if strict && !link_existed {
+            match returned_fingerprint {
+                Some(returned) => {
+                    mcp_native_link_source_fingerprint(connection, server_id, app_id)? == returned
+                }
+                None => false,
+            }
+        } else {
+            true
+        };
+        let row_matches = source_matches
+            && read_mcp_native_link(connection, server_id, app_id)?
+                .is_some_and(|row| row.native_snapshot.as_deref() == native_snapshot);
+        if !row_matches {
+            return Ok(false);
+        }
+        match previous_host_fingerprint {
+            Some(before) => {
+                Ok(mcp_native_link_host_fingerprint(connection, server_id, app_id)? == before)
+            }
+            None => Ok(true),
+        }
     })
 }
 
@@ -222,6 +572,51 @@ fn mcp_native_link_from_row(row: &Row<'_>) -> Result<McpNativeLinkRow, rusqlite:
         app_id: row.get(1)?,
         native_snapshot: row.get(2)?,
     })
+}
+
+fn mcp_native_link_source_fingerprint(
+    connection: &Connection,
+    server_id: &str,
+    app_id: &str,
+) -> Result<[u8; 32], SharedStoreError> {
+    connection
+        .query_row(
+            "SELECT mcp_native_links.* FROM main.mcp_native_links AS mcp_native_links
+             WHERE server_id COLLATE BINARY = ?1 AND app_id COLLATE BINARY = ?2",
+            params![server_id, app_id],
+            |row| source_fingerprint(row, 0),
+        )
+        .map_err(SharedStoreError::from)
+}
+
+fn mcp_native_link_host_fingerprint(
+    connection: &Connection,
+    server_id: &str,
+    app_id: &str,
+) -> Result<[u8; 32], SharedStoreError> {
+    let columns = mcp_native_link_columns(connection)?
+        .into_iter()
+        .filter(|column| {
+            !matches!(
+                column.name.as_str(),
+                "server_id" | "app_id" | "native_snapshot"
+            )
+        })
+        .map(|column| format!("\"{}\"", column.name.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    if columns.is_empty() {
+        return Ok([0; 32]);
+    }
+    let sql = format!(
+        "SELECT {} FROM main.mcp_native_links
+         WHERE server_id COLLATE BINARY = ?1 AND app_id COLLATE BINARY = ?2",
+        columns.join(", ")
+    );
+    connection
+        .query_row(&sql, params![server_id, app_id], |row| {
+            source_fingerprint(row, 0)
+        })
+        .map_err(SharedStoreError::from)
 }
 
 fn prepare_mcp_native_link_write(transaction: &Transaction<'_>) -> Result<(), SharedStoreError> {
@@ -313,19 +708,7 @@ fn verify_mcp_native_link_schema(connection: &Connection) -> Result<(), SharedSt
         ));
     }
 
-    let mut statement = connection.prepare("PRAGMA main.table_xinfo(mcp_native_links)")?;
-    let columns = statement
-        .query_map([], |row| {
-            Ok(ExistingColumn {
-                name: row.get(1)?,
-                declared_type: row.get(2)?,
-                not_null: row.get::<_, i64>(3)? != 0,
-                default: row.get(4)?,
-                primary_key: row.get(5)?,
-                hidden: row.get(6)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let columns = mcp_native_link_columns(connection)?;
 
     for (name, not_null, primary_key) in [
         ("server_id", true, 1),
@@ -363,6 +746,26 @@ fn verify_mcp_native_link_schema(connection: &Connection) -> Result<(), SharedSt
         ));
     }
     verify_binary_primary_key(connection)
+}
+
+fn mcp_native_link_columns(
+    connection: &Connection,
+) -> Result<Vec<ExistingColumn>, SharedStoreError> {
+    let mut statement = connection.prepare("PRAGMA main.table_xinfo(mcp_native_links)")?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok(ExistingColumn {
+                name: row.get(1)?,
+                declared_type: row.get(2)?,
+                not_null: row.get::<_, i64>(3)? != 0,
+                default: row.get(4)?,
+                primary_key: row.get(5)?,
+                hidden: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(SharedStoreError::from)?;
+    Ok(columns)
 }
 
 fn ensure_delete_trigger(connection: &Connection) -> Result<(), SharedStoreError> {
@@ -471,6 +874,38 @@ mod tests {
         ensure_mcp_native_link_schema(&mut connection).expect("initialize native links");
         drop(connection);
         (directory, database)
+    }
+
+    fn mcp_column(app_id: &str) -> McpCatalogColumn {
+        builtin_app_registry()
+            .find(app_id)
+            .and_then(|descriptor| descriptor.mcp_contract())
+            .expect("registered MCP application")
+            .catalog_column()
+    }
+
+    #[test]
+    fn transaction_guard_rejects_an_incompatible_table_before_snapshotting() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "DROP TRIGGER cc_switch_mcp_native_links_after_server_delete;
+                 DROP TABLE mcp_native_links;
+                 CREATE TABLE mcp_native_links (
+                    server_id TEXT NOT NULL,
+                    app_id TEXT NOT NULL,
+                    native_snapshot TEXT
+                 );
+                 INSERT INTO mcp_native_links VALUES ('server', 'claude', NULL);
+                 INSERT INTO mcp_native_links VALUES ('server', 'claude', NULL);",
+            )
+            .expect("create incompatible native links");
+
+        assert!(matches!(
+            McpTransactionGuard::begin(&mut connection),
+            Err(SharedStoreError::InvalidDatabase(_))
+        ));
     }
 
     #[test]
@@ -646,6 +1081,532 @@ mod tests {
             Some("{\"token\":\"secret\"}")
         );
         assert!(!format!("{snapshotted:?}").contains("secret"));
+    }
+
+    #[test]
+    fn transaction_guard_accepts_coherent_catalog_and_link_changes() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        let server = guard
+            .read_server("server")
+            .expect("read server")
+            .expect("server exists");
+        guard
+            .upsert_native_link("server", "claude", Some("first"))
+            .expect("record native link");
+        guard
+            .upsert_native_link("server", "claude", Some("second"))
+            .expect("replace native link");
+        guard
+            .set_server_selection(
+                "server",
+                server.source_fingerprint(),
+                mcp_column("claude"),
+                true,
+            )
+            .expect("enable server");
+        guard.commit().expect("verify and commit");
+
+        assert_eq!(
+            read_mcp_native_link(&connection, "server", "claude")
+                .expect("read link")
+                .expect("link exists")
+                .native_snapshot
+                .as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn transaction_guard_detects_catalog_triggers_that_rewrite_unknown_link_fields() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        let mut setup = begin_immediate_transaction(&mut connection).expect("begin setup");
+        upsert_mcp_native_link(&mut setup, "server", "claude", None).expect("insert link");
+        setup.commit().expect("commit setup");
+        connection
+            .execute_batch(
+                "ALTER TABLE mcp_native_links ADD COLUMN host_note TEXT DEFAULT 'keep';
+                 CREATE TRIGGER rewrite_link_after_catalog_update
+                 AFTER UPDATE ON mcp_servers BEGIN
+                    UPDATE mcp_native_links SET host_note = 'tampered'
+                     WHERE server_id = NEW.id;
+                 END;",
+            )
+            .expect("create host trigger");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        let server = guard
+            .read_server("server")
+            .expect("read server")
+            .expect("server exists");
+        guard
+            .set_server_selection(
+                "server",
+                server.source_fingerprint(),
+                mcp_column("claude"),
+                true,
+            )
+            .expect("enable server");
+        assert!(matches!(
+            guard.commit(),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT host_note FROM mcp_native_links
+                     WHERE server_id = 'server' AND app_id = 'claude'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read host field"),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn transaction_guard_rejects_catalog_target_host_field_rewrites() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "ALTER TABLE mcp_servers ADD COLUMN host_note TEXT DEFAULT 'keep';
+                 CREATE TRIGGER rewrite_catalog_host_field
+                 AFTER UPDATE OF enabled_claude ON mcp_servers BEGIN
+                    UPDATE mcp_servers SET host_note = 'tampered' WHERE id = NEW.id;
+                 END;",
+            )
+            .expect("create host trigger");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        let server = guard
+            .read_server("server")
+            .expect("read server")
+            .expect("server exists");
+
+        assert!(matches!(
+            guard.set_server_selection(
+                "server",
+                server.source_fingerprint(),
+                mcp_column("claude"),
+                true,
+            ),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+        assert!(matches!(
+            guard.commit(),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT host_note FROM mcp_servers WHERE id = 'server'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read host field"),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn transaction_guard_rejects_generated_catalog_host_field_changes() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute(
+                "ALTER TABLE mcp_servers ADD COLUMN host_shadow INTEGER
+                 GENERATED ALWAYS AS (enabled_claude) VIRTUAL",
+                [],
+            )
+            .expect("add generated host column");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        let server = guard
+            .read_server("server")
+            .expect("read server")
+            .expect("server exists");
+
+        assert!(matches!(
+            guard.set_server_selection(
+                "server",
+                server.source_fingerprint(),
+                mcp_column("claude"),
+                true,
+            ),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+        assert!(matches!(
+            guard.commit(),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+        assert_eq!(
+            read_mcp_server_row(&connection, "server")
+                .expect("read server")
+                .expect("server exists")
+                .enabled_claude,
+            0
+        );
+    }
+
+    #[test]
+    fn transaction_guard_rejects_new_link_target_host_field_rewrites() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "ALTER TABLE mcp_native_links ADD COLUMN host_note TEXT DEFAULT 'keep';
+                 CREATE TRIGGER steal_new_link_before_insert
+                 BEFORE INSERT ON mcp_native_links BEGIN
+                    INSERT INTO mcp_native_links
+                        (server_id, app_id, native_snapshot, host_note)
+                    VALUES (NEW.server_id, NEW.app_id, NEW.native_snapshot, 'tampered');
+                 END;",
+            )
+            .expect("create host trigger");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+
+        assert!(guard.upsert_native_link("server", "claude", None).is_err());
+        assert!(matches!(
+            guard.commit(),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+        assert!(read_mcp_native_link(&connection, "server", "claude")
+            .expect("read rolled-back link")
+            .is_none());
+    }
+
+    #[test]
+    fn transaction_guard_accepts_existing_link_when_host_field_is_restored() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "ALTER TABLE mcp_native_links ADD COLUMN host_note TEXT DEFAULT 'keep';
+                 INSERT INTO mcp_native_links (server_id, app_id, native_snapshot)
+                 VALUES ('server', 'claude', 'old');
+                 CREATE TRIGGER temporarily_rewrite_link_before_update
+                 BEFORE UPDATE OF native_snapshot ON mcp_native_links BEGIN
+                    UPDATE mcp_native_links SET host_note = 'temporary'
+                     WHERE server_id = OLD.server_id AND app_id = OLD.app_id;
+                 END;
+                 CREATE TRIGGER restore_link_after_update
+                 AFTER UPDATE OF native_snapshot ON mcp_native_links BEGIN
+                    UPDATE mcp_native_links SET host_note = 'keep'
+                     WHERE server_id = NEW.server_id AND app_id = NEW.app_id;
+                 END;",
+            )
+            .expect("create restoring host triggers");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+
+        guard
+            .upsert_native_link("server", "claude", Some("new"))
+            .expect("update existing link");
+        guard.commit().expect("commit restored final state");
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT native_snapshot, host_note FROM mcp_native_links
+                     WHERE server_id = 'server' AND app_id = 'claude'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("read restored link"),
+            ("new".to_owned(), "keep".to_owned())
+        );
+    }
+
+    #[test]
+    fn transaction_guard_rejects_generated_native_link_host_field_changes() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "ALTER TABLE mcp_native_links ADD COLUMN host_shadow INTEGER
+                 GENERATED ALWAYS AS (length(native_snapshot)) VIRTUAL;
+                 INSERT INTO mcp_native_links (server_id, app_id, native_snapshot)
+                 VALUES ('server', 'claude', 'old');",
+            )
+            .expect("add generated host column");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+
+        assert!(guard
+            .upsert_native_link("server", "claude", Some("longer"))
+            .is_err());
+        assert!(matches!(
+            guard.commit(),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+        assert_eq!(
+            read_mcp_native_link(&connection, "server", "claude")
+                .expect("read link")
+                .expect("link exists")
+                .native_snapshot
+                .as_deref(),
+            Some("old")
+        );
+    }
+
+    #[test]
+    fn transaction_guard_does_not_launder_an_earlier_cross_table_rewrite() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER rewrite_catalog_after_link_insert
+                 AFTER INSERT ON mcp_native_links BEGIN
+                    UPDATE mcp_servers SET name = 'rewritten' WHERE id = NEW.server_id;
+                 END;",
+            )
+            .expect("create host trigger");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        guard
+            .upsert_native_link("server", "claude", None)
+            .expect("record native link");
+        let rewritten = guard
+            .read_server("server")
+            .expect("read rewritten server")
+            .expect("server exists");
+        let result = guard.set_server_selection(
+            "server",
+            rewritten.source_fingerprint(),
+            mcp_column("claude"),
+            true,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+        guard.rollback().expect("roll back conflict");
+        assert_eq!(
+            read_mcp_server_row(&connection, "server")
+                .expect("read server")
+                .expect("server exists")
+                .name,
+            "Server"
+        );
+    }
+
+    #[test]
+    fn transaction_guard_poison_rolls_back_an_ignored_failed_write() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER suppress_catalog_update
+                 BEFORE UPDATE ON mcp_servers BEGIN
+                    SELECT RAISE(IGNORE);
+                 END;",
+            )
+            .expect("create suppressing trigger");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        let server = guard
+            .read_server("server")
+            .expect("read server")
+            .expect("server exists");
+        guard
+            .upsert_native_link("server", "claude", None)
+            .expect("insert link");
+        assert!(matches!(
+            guard.set_server_selection(
+                "server",
+                server.source_fingerprint(),
+                mcp_column("claude"),
+                true,
+            ),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+        assert!(matches!(
+            guard.commit(),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+        assert!(read_mcp_native_link(&connection, "server", "claude")
+            .expect("read rolled-back link")
+            .is_none());
+    }
+
+    #[test]
+    fn transaction_guard_poison_rolls_back_after_an_ignored_failed_read() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute(
+                "INSERT INTO mcp_native_links (server_id, app_id, native_snapshot)
+                 VALUES ('server', 'claude', X'00')",
+                [],
+            )
+            .expect("insert malformed native snapshot");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        let server = guard
+            .read_server("server")
+            .expect("read server")
+            .expect("server exists");
+        guard
+            .set_server_selection(
+                "server",
+                server.source_fingerprint(),
+                mcp_column("claude"),
+                true,
+            )
+            .expect("enable server");
+
+        assert!(guard.read_native_link("server", "claude").is_err());
+        assert!(matches!(
+            guard.commit(),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+        assert_eq!(
+            read_mcp_server_row(&connection, "server")
+                .expect("read server")
+                .expect("server exists")
+                .enabled_claude,
+            0
+        );
+    }
+
+    #[test]
+    fn transaction_guard_keeps_conflict_after_sqlite_rolls_back_the_transaction() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER abort_catalog_update
+                 BEFORE UPDATE ON mcp_servers BEGIN
+                    SELECT RAISE(ROLLBACK, 'private trigger message');
+                 END;",
+            )
+            .expect("create aborting trigger");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        let server = guard
+            .read_server("server")
+            .expect("read server")
+            .expect("server exists");
+        let write_error = guard
+            .set_server_selection(
+                "server",
+                server.source_fingerprint(),
+                mcp_column("claude"),
+                true,
+            )
+            .expect_err("trigger aborts write");
+        assert!(!format!("{write_error:?}").contains("private trigger message"));
+        assert!(matches!(
+            guard.commit(),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+    }
+
+    #[test]
+    fn transaction_guard_detects_cross_table_writes_to_another_server() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "INSERT INTO mcp_servers (id, name, server_config)
+                 VALUES ('other', 'Other', '{}');
+                 CREATE TRIGGER add_other_link_after_catalog_update
+                 AFTER UPDATE ON mcp_servers WHEN NEW.id = 'server' BEGIN
+                    INSERT INTO mcp_native_links (server_id, app_id)
+                    VALUES ('other', 'claude');
+                 END;",
+            )
+            .expect("create cross-server trigger");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        let server = guard
+            .read_server("server")
+            .expect("read server")
+            .expect("server exists");
+        guard
+            .set_server_selection(
+                "server",
+                server.source_fingerprint(),
+                mcp_column("claude"),
+                true,
+            )
+            .expect("enable server");
+
+        assert!(matches!(
+            guard.commit(),
+            Err(SharedStoreError::McpTransactionConflict)
+        ));
+        assert!(read_mcp_native_link(&connection, "other", "claude")
+            .expect("read other link")
+            .is_none());
+    }
+
+    #[test]
+    fn transaction_guard_supports_new_and_deleted_servers() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        let values = McpServerCatalogValues::new(
+            crate::McpServerFields {
+                id: "new",
+                name: "New",
+                server_config: "{}",
+                description: None,
+                homepage: None,
+                docs: None,
+                tags: "[]",
+            },
+            |_| false,
+        );
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        guard.insert_server_catalog(&values).expect("insert server");
+        guard
+            .upsert_native_link("new", "claude", None)
+            .expect("insert link");
+        guard.commit().expect("commit insert");
+
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        let server = guard
+            .read_server("new")
+            .expect("read server")
+            .expect("server exists");
+        guard
+            .delete_server("new", server.source_fingerprint())
+            .expect("delete server");
+        guard.commit().expect("commit delete");
+
+        assert!(read_mcp_server_row(&connection, "new")
+            .expect("read deleted server")
+            .is_none());
+        assert!(read_mcp_native_link(&connection, "new", "claude")
+            .expect("read deleted link")
+            .is_none());
+    }
+
+    #[test]
+    fn transaction_guard_uses_binary_server_identity() {
+        let (_directory, database) = initialized_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute(
+                "INSERT INTO mcp_servers (id, name, server_config)
+                 VALUES ('Server', 'Upper', '{}')",
+                [],
+            )
+            .expect("insert case-distinct server");
+        let mut guard = McpTransactionGuard::begin(&mut connection).expect("guard transaction");
+        guard
+            .upsert_native_link("Server", "claude", Some("upper"))
+            .expect("insert upper link");
+        guard
+            .upsert_native_link("server", "claude", Some("lower"))
+            .expect("insert lower link");
+        guard.commit().expect("commit distinct links");
+
+        for (server_id, snapshot) in [("Server", "upper"), ("server", "lower")] {
+            assert_eq!(
+                read_mcp_native_link(&connection, server_id, "claude")
+                    .expect("read link")
+                    .expect("link exists")
+                    .native_snapshot
+                    .as_deref(),
+                Some(snapshot)
+            );
+        }
     }
 
     #[test]

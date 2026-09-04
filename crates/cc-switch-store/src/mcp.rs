@@ -317,6 +317,10 @@ impl<'a> McpServerCatalogValues<'a> {
         Self { fields, selections }
     }
 
+    pub(crate) fn id(&self) -> &str {
+        self.fields.id
+    }
+
     fn params(&self) -> Vec<&dyn ToSql> {
         let mut params: Vec<&dyn ToSql> = vec![
             &self.fields.id,
@@ -442,6 +446,21 @@ pub fn insert_mcp_server_catalog(
     transaction: &mut Transaction<'_>,
     server: &McpServerCatalogValues<'_>,
 ) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    insert_mcp_server_catalog_inner(transaction, server, false)
+}
+
+pub(crate) fn insert_mcp_server_catalog_guarded(
+    transaction: &mut Transaction<'_>,
+    server: &McpServerCatalogValues<'_>,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    insert_mcp_server_catalog_inner(transaction, server, true)
+}
+
+fn insert_mcp_server_catalog_inner(
+    transaction: &mut Transaction<'_>,
+    server: &McpServerCatalogValues<'_>,
+    strict: bool,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
     if mcp_server_for_write(transaction, server.fields.id)?.is_some() {
         return Ok(McpServerWriteOutcome::NotApplied);
     }
@@ -464,11 +483,19 @@ pub fn insert_mcp_server_catalog(
         columns.join(", ")
     );
     let params = server.params();
-    execute_mcp_server_write(transaction, &sql, params_from_iter(params), |connection| {
-        Ok(read_mcp_server_row(connection, server.fields.id)?
-            .as_ref()
-            .is_some_and(|row| mcp_server_catalog_matches(row, server)))
-    })
+    execute_mcp_server_write(
+        transaction,
+        &sql,
+        params_from_iter(params),
+        |connection, returned| {
+            Ok(read_mcp_server_row(connection, server.fields.id)?
+                .as_ref()
+                .is_some_and(|row| {
+                    mcp_server_catalog_matches(row, server)
+                        && (!strict || row.source_fingerprint() == returned)
+                }))
+        },
+    )
 }
 
 /// Replaces Registry-owned MCP fields after a full source fingerprint match.
@@ -477,9 +504,32 @@ pub fn update_mcp_server_catalog(
     expected_fingerprint: &[u8; 32],
     server: &McpServerCatalogValues<'_>,
 ) -> Result<McpServerWriteOutcome, SharedStoreError> {
-    if !mcp_server_fingerprint_matches(transaction, server.fields.id, expected_fingerprint)? {
+    update_mcp_server_catalog_inner(transaction, expected_fingerprint, server, false)
+}
+
+pub(crate) fn update_mcp_server_catalog_guarded(
+    transaction: &mut Transaction<'_>,
+    expected_fingerprint: &[u8; 32],
+    server: &McpServerCatalogValues<'_>,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    update_mcp_server_catalog_inner(transaction, expected_fingerprint, server, true)
+}
+
+fn update_mcp_server_catalog_inner(
+    transaction: &mut Transaction<'_>,
+    expected_fingerprint: &[u8; 32],
+    server: &McpServerCatalogValues<'_>,
+    strict: bool,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    let Some(before) = mcp_server_for_write(transaction, server.fields.id)? else {
+        return Ok(McpServerWriteOutcome::NotApplied);
+    };
+    if before.source_fingerprint() != expected_fingerprint {
         return Ok(McpServerWriteOutcome::NotApplied);
     }
+    let host_fingerprint = strict
+        .then(|| mcp_server_host_fingerprint(transaction, server.fields.id))
+        .transpose()?;
     let assignments = MCP_SERVER_BASE_FIELDS
         .iter()
         .skip(1)
@@ -496,11 +546,22 @@ pub fn update_mcp_server_catalog(
         .join(", ");
     let sql = format!("UPDATE main.mcp_servers SET {assignments} WHERE id COLLATE BINARY = ?1");
     let params = server.params();
-    execute_mcp_server_write(transaction, &sql, params_from_iter(params), |connection| {
-        Ok(read_mcp_server_row(connection, server.fields.id)?
-            .as_ref()
-            .is_some_and(|row| mcp_server_catalog_matches(row, server)))
-    })
+    execute_mcp_server_write(
+        transaction,
+        &sql,
+        params_from_iter(params),
+        |connection, _returned| {
+            Ok(read_mcp_server_row(connection, server.fields.id)?
+                .as_ref()
+                .is_some_and(|row| mcp_server_catalog_matches(row, server))
+                && match host_fingerprint {
+                    Some(before) => {
+                        mcp_server_host_fingerprint(connection, server.fields.id)? == before
+                    }
+                    None => true,
+                })
+        },
+    )
 }
 
 /// Inserts one MCP row only when its binary identifier is absent.
@@ -519,7 +580,7 @@ pub fn insert_mcp_server(
             enabled_opencode, enabled_hermes
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         server.params(),
-        |connection| {
+        |connection, _returned| {
             Ok(read_mcp_server_row(connection, server.id)?
                 .as_ref()
                 .is_some_and(|row| mcp_server_matches(row, server)))
@@ -546,7 +607,7 @@ pub fn update_mcp_server(
             enabled_opencode = ?12, enabled_hermes = ?13
          WHERE id COLLATE BINARY = ?1",
         server.params(),
-        |connection| {
+        |connection, _returned| {
             Ok(read_mcp_server_row(connection, server.id)?
                 .as_ref()
                 .is_some_and(|row| mcp_server_matches(row, server)))
@@ -568,6 +629,7 @@ pub fn set_mcp_server_enabled(
         expected_fingerprint,
         enabled_column(target),
         enabled,
+        false,
     )
 }
 
@@ -585,6 +647,24 @@ pub fn set_mcp_server_selection(
         expected_fingerprint,
         column.as_str(),
         enabled,
+        false,
+    )
+}
+
+pub(crate) fn set_mcp_server_selection_guarded(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    expected_fingerprint: &[u8; 32],
+    column: McpCatalogColumn,
+    enabled: bool,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    set_mcp_server_enabled_column(
+        transaction,
+        id,
+        expected_fingerprint,
+        column.as_str(),
+        enabled,
+        true,
     )
 }
 
@@ -594,6 +674,7 @@ fn set_mcp_server_enabled_column(
     expected_fingerprint: &[u8; 32],
     column: &str,
     enabled: bool,
+    strict: bool,
 ) -> Result<McpServerWriteOutcome, SharedStoreError> {
     let Some(before) = mcp_server_for_write(transaction, id)? else {
         return Ok(McpServerWriteOutcome::NotApplied);
@@ -601,15 +682,27 @@ fn set_mcp_server_enabled_column(
     if before.source_fingerprint() != expected_fingerprint {
         return Ok(McpServerWriteOutcome::NotApplied);
     }
+    let host_fingerprint = strict
+        .then(|| mcp_server_host_fingerprint(transaction, id))
+        .transpose()?;
     let sql = format!(
         "UPDATE main.mcp_servers SET {} = ?1 WHERE id COLLATE BINARY = ?2",
         quoted_mcp_column(column)
     );
-    execute_mcp_server_write(transaction, &sql, params![enabled, id], |connection| {
-        Ok(read_mcp_server_row(connection, id)?
-            .as_ref()
-            .is_some_and(|after| mcp_toggle_matches(&before, after, column, enabled)))
-    })
+    execute_mcp_server_write(
+        transaction,
+        &sql,
+        params![enabled, id],
+        |connection, _returned| {
+            Ok(read_mcp_server_row(connection, id)?
+                .as_ref()
+                .is_some_and(|after| mcp_toggle_matches(&before, after, column, enabled))
+                && match host_fingerprint {
+                    Some(before) => mcp_server_host_fingerprint(connection, id)? == before,
+                    None => true,
+                })
+        },
+    )
 }
 
 /// Deletes one MCP row when its full source fingerprint still matches.
@@ -625,7 +718,7 @@ pub fn delete_mcp_server(
         transaction,
         "DELETE FROM main.mcp_servers WHERE id COLLATE BINARY = ?1",
         [id],
-        |connection| Ok(read_mcp_server_row(connection, id)?.is_none()),
+        |connection, _returned| Ok(read_mcp_server_row(connection, id)?.is_none()),
     )
 }
 
@@ -723,6 +816,28 @@ fn mcp_server_fingerprint_matches(
         .is_some_and(|row| row.source_fingerprint() == expected))
 }
 
+fn mcp_server_host_fingerprint(
+    connection: &Connection,
+    id: &str,
+) -> Result<[u8; 32], SharedStoreError> {
+    let contract = mcp_server_contract_columns();
+    let columns = mcp_server_columns(connection)?
+        .into_iter()
+        .filter(|column| !contract.iter().any(|expected| expected.name == column.name))
+        .map(|column| quoted_mcp_column(&column.name))
+        .collect::<Vec<_>>();
+    if columns.is_empty() {
+        return Ok([0; 32]);
+    }
+    let sql = format!(
+        "SELECT {} FROM main.mcp_servers WHERE id COLLATE BINARY = ?1",
+        columns.join(", ")
+    );
+    connection
+        .query_row(&sql, [id], |row| source_fingerprint(row, 0))
+        .map_err(SharedStoreError::from)
+}
+
 fn prepare_mcp_server_write(transaction: &Transaction<'_>) -> Result<(), SharedStoreError> {
     if transaction.is_autocommit() {
         return Err(SharedStoreError::McpServerWrite {
@@ -743,20 +858,31 @@ fn execute_mcp_server_write<P, F>(
 ) -> Result<McpServerWriteOutcome, SharedStoreError>
 where
     P: Params,
-    F: FnOnce(&Connection) -> Result<bool, SharedStoreError>,
+    F: FnOnce(&Connection, &[u8; 32]) -> Result<bool, SharedStoreError>,
 {
     let transaction_aborted = transaction.is_autocommit();
     let savepoint = transaction
         .savepoint()
         .map_err(|error| redact_mcp_server_write_error(error, transaction_aborted))?;
     let result = (|| {
-        let changed = {
-            let mut statement = savepoint.prepare(sql)?;
+        let (changed, returned_fingerprint) = {
+            let returning_sql = format!("{sql} RETURNING *");
+            let mut statement = savepoint.prepare(&returning_sql)?;
             let mut rows = statement.query(params)?;
-            while rows.next()?.is_some() {}
-            savepoint.changes() as usize
+            let fingerprint = rows
+                .next()?
+                .map(|row| source_fingerprint(row, 0))
+                .transpose()?;
+            let returned_multiple = rows.next()?.is_some();
+            (
+                savepoint.changes() as usize,
+                (!returned_multiple).then_some(fingerprint).flatten(),
+            )
         };
-        let postcondition_matches = changed == 1 && postcondition(&savepoint)?;
+        let postcondition_matches = match (changed, returned_fingerprint.as_ref()) {
+            (1, Some(fingerprint)) => postcondition(&savepoint, fingerprint)?,
+            _ => false,
+        };
         Ok::<_, SharedStoreError>((changed, postcondition_matches))
     })();
     let (changed, postcondition_matches) = match result {

@@ -31,7 +31,7 @@ pub use mcp::{
 };
 pub use mcp_native_link::{
     delete_mcp_native_links, ensure_mcp_native_link_schema, read_mcp_native_link,
-    upsert_mcp_native_link, McpNativeLinkRow, MCP_NATIVE_LINKS_TABLE,
+    upsert_mcp_native_link, McpNativeLinkRow, McpTransactionGuard, MCP_NATIVE_LINKS_TABLE,
 };
 pub use skill::{
     apply_skill_catalog_plan, ensure_skill_schema, read_skill_catalog, read_skill_catalog_entry,
@@ -295,6 +295,8 @@ pub enum SharedStoreError {
         /// SQLite ended the host transaction while executing the write.
         transaction_aborted: bool,
     },
+    #[error("shared MCP transaction changed outside its requested writes")]
+    McpTransactionConflict,
     #[error("shared Skill catalog write failed")]
     SkillCatalogWrite {
         code: Option<rusqlite::ErrorCode>,
