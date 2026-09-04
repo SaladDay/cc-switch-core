@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod mcp;
+mod mcp_native_link;
 mod skill;
 
 pub use mcp::{
@@ -26,6 +27,10 @@ pub use mcp::{
     read_mcp_server_rows, set_mcp_server_enabled, update_mcp_server,
     verify_mcp_server_write_contract, McpServerRow, McpServerValues, McpServerWriteOutcome,
     MCP_SERVERS_TABLE,
+};
+pub use mcp_native_link::{
+    delete_mcp_native_links, ensure_mcp_native_link_schema, read_mcp_native_link,
+    upsert_mcp_native_link, McpNativeLinkRow, MCP_NATIVE_LINKS_TABLE,
 };
 pub use skill::{
     apply_skill_catalog_plan, ensure_skill_schema, read_skill_catalog, read_skill_catalog_entry,
@@ -282,6 +287,13 @@ pub enum SharedStoreError {
         /// SQLite ended the host transaction while executing the write.
         transaction_aborted: bool,
     },
+    #[error("shared MCP native-link write failed")]
+    McpNativeLinkWrite {
+        code: Option<rusqlite::ErrorCode>,
+        extended_code: Option<i32>,
+        /// SQLite ended the host transaction while executing the write.
+        transaction_aborted: bool,
+    },
     #[error("shared Skill catalog write failed")]
     SkillCatalogWrite {
         code: Option<rusqlite::ErrorCode>,
@@ -363,11 +375,19 @@ impl SharedDatabase {
 
     /// Creates or transactionally upgrades the shared `mcp_servers` contract.
     ///
-    /// Product migrations, live configuration state, and private MCP tables
-    /// remain owned by the host.
+    /// Product migrations and live configuration files remain owned by the host.
     pub fn ensure_mcp_server_schema(&self) -> Result<(), SharedStoreError> {
         let mut connection = self.connect()?;
         ensure_mcp_server_schema(&mut connection)
+    }
+
+    /// Creates and validates shared MCP application ownership state.
+    ///
+    /// The MCP catalog must already be initialized. Product migration versions
+    /// and live configuration files remain owned by the host.
+    pub fn ensure_mcp_native_link_schema(&self) -> Result<(), SharedStoreError> {
+        let mut connection = self.connect()?;
+        ensure_mcp_native_link_schema(&mut connection)
     }
 
     /// Creates or transactionally upgrades the shared installed Skill catalog.

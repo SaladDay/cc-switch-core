@@ -279,7 +279,7 @@ pub enum McpServerWriteOutcome {
 /// Creates or transactionally upgrades the shared `mcp_servers` table.
 ///
 /// Unknown tables, columns, rows, indexes, and triggers are retained. Product
-/// migration versions and private MCP state remain owned by the host.
+/// migration versions remain owned by the host.
 pub fn ensure_mcp_server_schema(connection: &mut Connection) -> Result<(), SharedStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute(CREATE_MCP_SERVERS_TABLE, [])?;
@@ -635,7 +635,7 @@ fn mcp_toggle_matches(
     expected == *after
 }
 
-fn has_non_abort_conflict_policy(sql: &str) -> bool {
+pub(crate) fn has_non_abort_conflict_policy(sql: &str) -> bool {
     let Some(tokens) = sql_tokens(sql.as_bytes()) else {
         return true;
     };

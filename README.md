@@ -47,9 +47,10 @@ network model discovery, proxying, and plugin installation.
 
 The workspace also contains `cc-switch-store`. This separate crate owns the
 shared SQLite connection and explicit contracts for the canonical `providers`,
-`mcp_servers`, and installed `skills` tables. Hosts can run product migrations
-before opting into those contracts. The crate does not own product CRUD policy,
-host extension tables, product schema versions, or database path discovery.
+`mcp_servers`, MCP native ownership links, and installed `skills` tables. Hosts
+can run product migrations before opting into those contracts. The crate does
+not own product CRUD policy, host extension tables, product schema versions, or
+database path discovery.
 
 The MCP catalog has a narrower opt-in write contract. Hosts may add columns,
 indexes, and triggers, but table constraints must retain SQLite's default
@@ -58,8 +59,12 @@ may maintain host columns or host-owned tables. They must not replace a target
 row or mutate other MCP catalog rows. Shared writes detect and roll back a
 suppressed write or a changed public target state; a same-value replacement is
 not observable and therefore remains a host contract violation. Callers own an
-immediate transaction and product-specific MCP state. Read-only consumers do
-not need to opt into this write contract.
+immediate transaction and any other product-specific MCP state. Read-only
+consumers do not need to opt into this write contract.
+
+MCP native links record which application owns a catalog entry and retain an
+optional lossless import snapshot. Core validates the link table and installs a
+single cleanup trigger so deleting a catalog row cannot leave a stale snapshot.
 
 Skill catalog writes accept only the catalog part of a Core `SkillSwitchPlan`.
 They compare-and-swap one registry-declared selection while leaving product
