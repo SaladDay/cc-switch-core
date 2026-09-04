@@ -60,6 +60,18 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
         crate::mcp_server_exists(self.descriptor().app(), contents, id)
     }
 
+    /// Captures target-owned fields for one removable native MCP entry.
+    ///
+    /// The entry may have invalid connection fields; ownership recovery still
+    /// needs to preserve its application-private fields before a write.
+    fn capture_mcp_native_snapshot(
+        &self,
+        contents: Option<&[u8]>,
+        id: &str,
+    ) -> Result<Option<crate::McpNativeSnapshot>, McpConfigError> {
+        crate::capture_mcp_native_snapshot(self.descriptor().app(), contents, id)
+    }
+
     /// Projects one MCP state change into the complete live document.
     fn project_mcp_server(
         &self,

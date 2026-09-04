@@ -58,11 +58,17 @@ impl fmt::Debug for McpNativeLinkRow {
 ///
 /// Unknown columns, indexes, and triggers are retained. Links whose shared
 /// catalog row no longer exists are removed without changing `user_version`.
+/// When the table is first introduced, enabled legacy catalog rows are claimed
+/// so an upgrade does not silently stop managing their live entries.
 pub fn ensure_mcp_native_link_schema(connection: &mut Connection) -> Result<(), SharedStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let table_existed = native_link_table_exists(&transaction)?;
     transaction.execute(CREATE_MCP_NATIVE_LINKS_TABLE, [])?;
     verify_mcp_native_link_schema(&transaction)?;
     ensure_delete_trigger(&transaction)?;
+    if !table_existed {
+        claim_enabled_legacy_links(&transaction)?;
+    }
     transaction
         .execute(
             "DELETE FROM main.mcp_native_links
@@ -90,6 +96,42 @@ pub fn ensure_mcp_native_link_schema(connection: &mut Connection) -> Result<(), 
         ));
     }
     transaction.commit()?;
+    Ok(())
+}
+
+fn native_link_table_exists(connection: &Connection) -> Result<bool, SharedStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM main.sqlite_master
+                  WHERE type = 'table' AND name = ?1
+             )",
+            [MCP_NATIVE_LINKS_TABLE],
+            |row| row.get(0),
+        )
+        .map_err(SharedStoreError::from)
+}
+
+fn claim_enabled_legacy_links(connection: &Connection) -> Result<(), SharedStoreError> {
+    const ENABLED_APPS: &[(&str, &str)] = &[
+        ("claude", "enabled_claude"),
+        ("codex", "enabled_codex"),
+        ("gemini", "enabled_gemini"),
+        ("grokbuild", "enabled_grokbuild"),
+        ("opencode", "enabled_opencode"),
+        ("hermes", "enabled_hermes"),
+    ];
+    for (app_id, column) in ENABLED_APPS {
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO main.mcp_native_links (server_id, app_id, native_snapshot)
+                     SELECT id, ?1, NULL FROM main.mcp_servers WHERE {column} <> 0"
+                ),
+                [app_id],
+            )
+            .map_err(|error| redact_native_link_write_error(error, connection.is_autocommit()))?;
+    }
     Ok(())
 }
 
@@ -458,6 +500,64 @@ mod tests {
                 .expect("read product version"),
             31
         );
+    }
+
+    #[test]
+    fn first_install_claims_enabled_legacy_catalog_rows() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        let mut connection = database.connect().expect("connect shared database");
+        ensure_mcp_server_schema(&mut connection).expect("initialize MCP catalog");
+        connection
+            .execute_batch(
+                "INSERT INTO mcp_servers (
+                    id, name, server_config, enabled_claude, enabled_codex
+                 ) VALUES ('enabled', 'Enabled', '{}', 1, 1);
+                 INSERT INTO mcp_servers (
+                    id, name, server_config, enabled_claude, enabled_codex
+                 ) VALUES ('disabled', 'Disabled', '{}', 0, 0);",
+            )
+            .expect("insert legacy MCP rows");
+
+        ensure_mcp_native_link_schema(&mut connection).expect("initialize native links");
+
+        assert!(read_mcp_native_link(&connection, "enabled", "claude")
+            .unwrap()
+            .is_some());
+        assert!(read_mcp_native_link(&connection, "enabled", "codex")
+            .unwrap()
+            .is_some());
+        assert!(read_mcp_native_link(&connection, "disabled", "claude")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn an_existing_link_table_does_not_claim_unowned_rows() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        let mut connection = database.connect().expect("connect shared database");
+        ensure_mcp_server_schema(&mut connection).expect("initialize MCP catalog");
+        connection
+            .execute_batch(
+                "INSERT INTO mcp_servers (id, name, server_config, enabled_claude)
+                 VALUES ('unowned', 'Unowned', '{}', 1);
+                 CREATE TABLE mcp_native_links (
+                    server_id TEXT NOT NULL,
+                    app_id TEXT NOT NULL,
+                    native_snapshot TEXT,
+                    PRIMARY KEY (server_id, app_id)
+                 );",
+            )
+            .expect("create existing ownership schema");
+
+        ensure_mcp_native_link_schema(&mut connection).expect("validate native links");
+
+        assert!(read_mcp_native_link(&connection, "unowned", "claude")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

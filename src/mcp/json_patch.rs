@@ -1,6 +1,6 @@
-use std::ops::Range;
+use std::{collections::HashSet, ops::Range};
 
-use serde_json::Value;
+use serde_json::{value::RawValue, Map, Value};
 
 struct Entry {
     key: String,
@@ -35,6 +35,164 @@ pub(super) fn replace_top_level_value(
         output.insert_str(root_close, &insertion);
     }
     Ok(output)
+}
+
+pub(super) fn is_object(value: &str) -> bool {
+    validate_object(value).is_ok()
+}
+
+pub(super) fn validate_object(value: &str) -> Result<(), String> {
+    validate_json(value)?;
+    root_entries(value).map(|_| ())
+}
+
+pub(super) fn object_entry(object: &str, key: &str) -> Result<Option<String>, String> {
+    validate_object(object)?;
+    let (entries, _) = root_entries(object)?;
+    let matching = entries
+        .iter()
+        .filter(|entry| entry.key == key)
+        .collect::<Vec<_>>();
+    if matching.len() > 1 {
+        return Err(format!("contains duplicate '{key}' fields"));
+    }
+    Ok(matching
+        .first()
+        .map(|entry| object[entry.value.clone()].to_owned()))
+}
+
+pub(super) fn replace_nested_object_entry(
+    original: &str,
+    section: &str,
+    key: &str,
+    replacement: Option<&str>,
+) -> Result<Option<String>, String> {
+    validate_object(original)?;
+    let section_value = object_entry(original, section)?;
+    let section_source = section_value.as_deref().unwrap_or("{}");
+    let Some(next_section) = patch_object_entry(section_source, key, replacement)? else {
+        return Ok(None);
+    };
+    replace_top_level_raw(original, section, &next_section).map(Some)
+}
+
+pub(super) fn merge_object_fields(
+    original: Option<&str>,
+    clear_fields: &[&str],
+    desired: &Map<String, Value>,
+) -> Result<String, String> {
+    let original = original.unwrap_or("{}");
+    validate_object(original)?;
+    let (entries, _) = root_entries(original)?;
+    let clear = clear_fields.iter().copied().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut fields = Vec::new();
+    for entry in entries {
+        if !seen.insert(entry.key.clone()) {
+            return Err(format!("contains duplicate '{}' fields", entry.key));
+        }
+        if let Some(value) = desired.get(&entry.key) {
+            fields.push((entry.key, serde_json::to_string(value).map_err(json_error)?));
+        } else if !clear.contains(entry.key.as_str()) {
+            fields.push((entry.key, original[entry.value].to_owned()));
+        }
+    }
+    for (key, value) in desired {
+        if seen.insert(key.clone()) {
+            fields.push((
+                key.clone(),
+                serde_json::to_string(value).map_err(json_error)?,
+            ));
+        }
+    }
+    render_object(fields)
+}
+
+fn patch_object_entry(
+    original: &str,
+    key: &str,
+    replacement: Option<&str>,
+) -> Result<Option<String>, String> {
+    validate_object(original)?;
+    if let Some(replacement) = replacement {
+        validate_json(replacement)?;
+    }
+    let (entries, _) = root_entries(original)?;
+    let matching = entries.iter().filter(|entry| entry.key == key).count();
+    if matching > 1 {
+        return Err(format!("contains duplicate '{key}' fields"));
+    }
+    if matching == 0 && replacement.is_none() {
+        return Ok(None);
+    }
+    let mut fields = Vec::with_capacity(entries.len() + usize::from(matching == 0));
+    let mut inserted = false;
+    for entry in entries {
+        if entry.key == key {
+            if let Some(replacement) = replacement {
+                fields.push((entry.key, replacement.to_owned()));
+                inserted = true;
+            }
+        } else {
+            fields.push((entry.key, original[entry.value].to_owned()));
+        }
+    }
+    if !inserted {
+        if let Some(replacement) = replacement {
+            fields.push((key.to_owned(), replacement.to_owned()));
+        }
+    }
+    render_object(fields).map(Some)
+}
+
+fn replace_top_level_raw(original: &str, key: &str, value: &str) -> Result<String, String> {
+    validate_json(value)?;
+    let (entries, root_close) = root_entries(original)?;
+    let matching = entries
+        .iter()
+        .filter(|entry| entry.key == key)
+        .collect::<Vec<_>>();
+    if matching.len() > 1 {
+        return Err(format!("contains duplicate '{key}' fields"));
+    }
+    let mut output = original.to_owned();
+    if let Some(entry) = matching.first() {
+        output.replace_range(entry.value.clone(), value);
+        return Ok(output);
+    }
+    let rendered_key = serde_json::to_string(key).map_err(json_error)?;
+    let insertion = format!("{rendered_key}:{value}");
+    if let Some(last) = entries.last() {
+        output.insert_str(last.value.end, &format!(",{insertion}"));
+    } else {
+        output.insert_str(root_close, &insertion);
+    }
+    Ok(output)
+}
+
+fn render_object(fields: Vec<(String, String)>) -> Result<String, String> {
+    let mut output = String::from("{");
+    for (index, (key, value)) in fields.into_iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str(&serde_json::to_string(&key).map_err(json_error)?);
+        output.push(':');
+        output.push_str(&value);
+    }
+    output.push('}');
+    validate_json(&output)?;
+    Ok(output)
+}
+
+fn validate_json(value: &str) -> Result<(), String> {
+    RawValue::from_string(value.to_owned())
+        .map(|_| ())
+        .map_err(|_| "JSON could not be parsed".to_owned())
+}
+
+fn json_error(error: serde_json::Error) -> String {
+    error.to_string()
 }
 
 fn root_entries(text: &str) -> Result<(Vec<Entry>, usize), String> {

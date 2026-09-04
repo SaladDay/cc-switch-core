@@ -113,7 +113,29 @@ pub(crate) const HERMES_MCP: McpAppContract = McpAppContract {
 #[serde(rename_all = "camelCase")]
 pub struct McpNativeSnapshot {
     target: McpConfigTarget,
-    entry: Value,
+    #[serde(rename = "entry", with = "raw_snapshot_entry")]
+    entry_json: String,
+}
+
+mod raw_snapshot_entry {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::value::RawValue;
+
+    pub fn serialize<S>(entry: &str, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        RawValue::from_string(entry.to_owned())
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Box::<RawValue>::deserialize(deserializer).map(|entry| entry.get().to_owned())
+    }
 }
 
 impl fmt::Debug for McpNativeSnapshot {
@@ -366,6 +388,29 @@ pub fn mcp_server_exists(
     }
 }
 
+/// Captures the raw native entry used to restore application-owned fields.
+///
+/// Only applications whose disabled state removes the native entry need a
+/// snapshot. The selected entry must be an object, but its managed connection
+/// fields are deliberately not validated.
+pub fn capture_mcp_native_snapshot(
+    app: &AppType,
+    contents: Option<&[u8]>,
+    id: &str,
+) -> Result<Option<McpNativeSnapshot>, McpConfigError> {
+    validate_id(id)?;
+    let target = require_target(app)?;
+    validate_document_size(app, contents)?;
+    match target {
+        McpConfigTarget::Claude => capture_json_snapshot(app, contents, "mcpServers", id, target),
+        McpConfigTarget::Gemini => capture_json_snapshot(app, contents, "mcpServers", id, target),
+        McpConfigTarget::Codex
+        | McpConfigTarget::GrokBuild
+        | McpConfigTarget::OpenCode
+        | McpConfigTarget::Hermes => Ok(None),
+    }
+}
+
 /// Projects one application link state into a complete document.
 ///
 /// `Ok(None)` means the live document does not need to be written.
@@ -507,7 +552,7 @@ fn validate_snapshot(
             "this application does not use removable native snapshots".to_owned(),
         ));
     }
-    if !snapshot.entry.is_object() {
+    if !json_patch::is_object(&snapshot.entry_json) {
         return Err(McpConfigError::InvalidServer(
             "native MCP snapshot must contain an object".to_owned(),
         ));
@@ -702,13 +747,35 @@ fn import_json_section(
                     server,
                     enabled,
                     native_snapshot: match flavor {
-                        JsonFlavor::Claude => Some(McpNativeSnapshot {
-                            target: McpConfigTarget::Claude,
-                            entry: value.clone(),
+                        JsonFlavor::Claude => capture_json_snapshot(
+                            app,
+                            contents,
+                            section,
+                            id,
+                            McpConfigTarget::Claude,
+                        )
+                        .ok()
+                        .flatten()
+                        .or_else(|| {
+                            Some(McpNativeSnapshot {
+                                target: McpConfigTarget::Claude,
+                                entry_json: value.to_string(),
+                            })
                         }),
-                        JsonFlavor::Gemini => Some(McpNativeSnapshot {
-                            target: McpConfigTarget::Gemini,
-                            entry: value.clone(),
+                        JsonFlavor::Gemini => capture_json_snapshot(
+                            app,
+                            contents,
+                            section,
+                            id,
+                            McpConfigTarget::Gemini,
+                        )
+                        .ok()
+                        .flatten()
+                        .or_else(|| {
+                            Some(McpNativeSnapshot {
+                                target: McpConfigTarget::Gemini,
+                                entry_json: value.to_string(),
+                            })
                         }),
                         JsonFlavor::OpenCode => None,
                     },
@@ -723,6 +790,16 @@ fn json_section_contains(
     section: &str,
     id: &str,
 ) -> Result<bool, McpConfigError> {
+    if let Some(contents) = contents {
+        let text = std::str::from_utf8(contents).map_err(|_| invalid_document(app, "not UTF-8"))?;
+        if let Ok(section) = json_patch::object_entry(text, section) {
+            return section
+                .map(|section| json_patch::object_entry(&section, id).map(|entry| entry.is_some()))
+                .transpose()
+                .map(Option::unwrap_or_default)
+                .map_err(|message| invalid_document(app, &message));
+        }
+    }
     let root = parse_json_root(app, contents)?;
     let Some(entries) = root.get(section) else {
         return Ok(false);
@@ -731,6 +808,31 @@ fn json_section_contains(
         .as_object()
         .map(|entries| entries.contains_key(id))
         .ok_or_else(|| invalid_document(app, &format!("'{section}' must be an object")))
+}
+
+fn capture_json_snapshot(
+    app: &AppType,
+    contents: Option<&[u8]>,
+    section: &str,
+    id: &str,
+    target: McpConfigTarget,
+) -> Result<Option<McpNativeSnapshot>, McpConfigError> {
+    let Some(contents) = contents else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(contents).map_err(|_| invalid_document(app, "not UTF-8"))?;
+    let Some(entries) = json_patch::object_entry(text, section)
+        .map_err(|message| invalid_document(app, &message))?
+    else {
+        return Ok(None);
+    };
+    let Some(entry_json) = json_patch::object_entry(&entries, id)
+        .map_err(|message| invalid_document(app, &message))?
+    else {
+        return Ok(None);
+    };
+    json_patch::validate_object(&entry_json).map_err(|message| invalid_document(app, &message))?;
+    Ok(Some(McpNativeSnapshot { target, entry_json }))
 }
 
 fn project_json_section(
@@ -742,84 +844,123 @@ fn project_json_section(
     flavor: JsonFlavor,
 ) -> Result<Option<String>, McpConfigError> {
     ensure_lossless_json_projection(app, contents)?;
-    let mut root = parse_json_root(app, contents)?;
-    let root_object = root.as_object_mut().expect("validated JSON root");
-    let existing_entry = root_object
-        .get(section)
-        .and_then(Value::as_object)
-        .and_then(|entries| entries.get(id))
-        .cloned();
+    let original = contents
+        .map(|contents| std::str::from_utf8(contents))
+        .transpose()
+        .map_err(|_| invalid_document(app, "not UTF-8"))?
+        .unwrap_or("{}");
+    let existing_entry = json_patch::object_entry(original, section)
+        .map_err(|message| invalid_document(app, &message))?
+        .map(|entries| {
+            json_patch::object_entry(&entries, id)
+                .map_err(|message| invalid_document(app, &message))
+        })
+        .transpose()?
+        .flatten();
 
     let projected = match projection {
-        McpServerProjection::Enable(server) => {
-            Some(to_json_flavor(flavor, server, existing_entry.as_ref())?)
-        }
-        McpServerProjection::Restore { server, snapshot } => Some(to_json_flavor(
+        McpServerProjection::Enable(server) => Some(project_json_entry(
             flavor,
             server,
-            existing_entry.as_ref().or(Some(&snapshot.entry)),
+            existing_entry.as_deref(),
+        )?),
+        McpServerProjection::Restore { server, snapshot } => Some(project_json_entry(
+            flavor,
+            server,
+            existing_entry
+                .as_deref()
+                .or(Some(snapshot.entry_json.as_str())),
         )?),
         McpServerProjection::Disable(server) if matches!(flavor, JsonFlavor::OpenCode) => {
-            let Some(existing) = existing_entry.as_ref() else {
+            let Some(existing) = existing_entry.as_deref() else {
                 return Ok(None);
             };
-            let mut projected = to_json_flavor(flavor, server, Some(existing))?;
-            projected
+            let mut desired = to_json_flavor(flavor, server, None)?;
+            desired
                 .as_object_mut()
                 .expect("OpenCode projection is an object")
                 .insert("enabled".to_owned(), Value::Bool(false));
-            if &projected == existing {
-                return Ok(None);
-            }
-            Some(projected)
+            Some(merge_json_entry(flavor, server, Some(existing), desired)?)
         }
         McpServerProjection::Disable(_) | McpServerProjection::Remove => None,
     };
+    json_patch::replace_nested_object_entry(original, section, id, projected.as_deref())
+        .map_err(|message| invalid_document(app, &message))
+}
 
-    if let Some(projected) = projected {
-        match root_object.get(section) {
-            Some(value) if !value.is_object() => {
-                return Err(invalid_document(
-                    app,
-                    &format!("'{section}' must be an object"),
-                ));
-            }
-            None => {
-                root_object.insert(section.to_owned(), Value::Object(Map::new()));
-            }
-            Some(_) => {}
-        }
-        root_object
-            .get_mut(section)
-            .and_then(Value::as_object_mut)
-            .expect("MCP section initialized")
-            .insert(id.to_owned(), projected);
-    } else {
-        let Some(entries) = root_object.get_mut(section) else {
-            return Ok(None);
-        };
-        let entries = entries
-            .as_object_mut()
-            .ok_or_else(|| invalid_document(app, &format!("'{section}' must be an object")))?;
-        if entries.remove(id).is_none() {
-            return Ok(None);
-        }
-    }
+fn project_json_entry(
+    flavor: JsonFlavor,
+    server: &Value,
+    existing: Option<&str>,
+) -> Result<String, McpConfigError> {
+    let desired = to_json_flavor(flavor, server, None)?;
+    merge_json_entry(flavor, server, existing, desired)
+}
 
-    if let Some(original) = contents {
-        let original =
-            std::str::from_utf8(original).map_err(|_| invalid_document(app, "not UTF-8"))?;
-        let section_value = root
-            .get(section)
-            .expect("a changed JSON document contains its MCP section");
-        json_patch::replace_top_level_value(original, section, section_value)
-            .map(Some)
-            .map_err(|message| invalid_document(app, &message))
-    } else {
-        pretty_json(root)
-            .map(Some)
-            .map_err(|message| invalid_document(app, &message))
-    }
+fn merge_json_entry(
+    flavor: JsonFlavor,
+    server: &Value,
+    existing: Option<&str>,
+    mut desired: Value,
+) -> Result<String, McpConfigError> {
+    let desired = desired
+        .as_object_mut()
+        .expect("native JSON projection is an object");
+    let clear_fields: &[&str] = match flavor {
+        JsonFlavor::Claude => MANAGED_SERVER_FIELDS,
+        JsonFlavor::Gemini => {
+            let configured_timeout = server.as_object().is_some_and(|server| {
+                GEMINI_TIMEOUT_FIELDS
+                    .iter()
+                    .any(|field| server.contains_key(*field))
+            });
+            if !configured_timeout && existing.is_some() {
+                desired.remove("timeout");
+                &[
+                    "type",
+                    "command",
+                    "args",
+                    "env",
+                    "cwd",
+                    "url",
+                    "httpUrl",
+                    "headers",
+                    "startup_timeout_sec",
+                    "startup_timeout_ms",
+                    "tool_timeout_sec",
+                    "tool_timeout_ms",
+                ]
+            } else {
+                &[
+                    "type",
+                    "command",
+                    "args",
+                    "env",
+                    "cwd",
+                    "url",
+                    "httpUrl",
+                    "headers",
+                    "timeout",
+                    "startup_timeout_sec",
+                    "startup_timeout_ms",
+                    "tool_timeout_sec",
+                    "tool_timeout_ms",
+                ]
+            }
+        }
+        JsonFlavor::OpenCode => &[
+            "type",
+            "command",
+            "args",
+            "env",
+            "environment",
+            "cwd",
+            "url",
+            "headers",
+        ],
+    };
+    json_patch::merge_object_fields(existing, clear_fields, desired)
+        .map_err(McpConfigError::InvalidServer)
 }
 
 fn replace_json_section(
@@ -866,7 +1007,7 @@ fn ensure_lossless_json_projection(
     let Some(contents) = contents else {
         return Ok(());
     };
-    serde_json::from_slice::<Value>(contents).map_err(|_| {
+    serde_json::from_slice::<Box<serde_json::value::RawValue>>(contents).map_err(|_| {
         invalid_document(
             app,
             "JSON5 syntax cannot be edited without losing comments or formatting",
@@ -2035,6 +2176,57 @@ mod tests {
                 "same"
             )
             .unwrap());
+    }
+
+    #[test]
+    fn native_snapshot_capture_keeps_private_fields_from_an_invalid_connection() {
+        let snapshot = capture_mcp_native_snapshot(
+            &AppType::Claude,
+            Some(
+                br#"{"mcpServers":{"owned":{"command":42,"trust":"latest","exact":9007199254740993.0},"bad":18446744073709551617}}"#,
+            ),
+            "owned",
+        )
+        .expect("capture raw owned entry")
+        .expect("Claude entry has a snapshot");
+        let encoded = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        assert!(encoded.contains(r#""entry":{"#));
+        assert!(!encoded.contains("entryJson"));
+        assert!(encoded.contains("9007199254740993.0"));
+        let snapshot: McpNativeSnapshot =
+            serde_json::from_str(&encoded).expect("deserialize snapshot");
+
+        let restored = project_mcp_server(
+            &AppType::Claude,
+            Some(br#"{"mcpServers":{}}"#),
+            "owned",
+            McpServerProjection::Restore {
+                server: &json!({"command":"npx"}),
+                snapshot: &snapshot,
+            },
+        )
+        .expect("restore captured snapshot")
+        .expect("document changes");
+        assert!(restored.contains(r#""trust":"latest""#));
+        assert!(restored.contains(r#""command":"npx""#));
+        assert!(restored.contains("9007199254740993.0"));
+    }
+
+    #[test]
+    fn native_snapshot_capture_rejects_only_an_invalid_selected_shape() {
+        assert!(capture_mcp_native_snapshot(
+            &AppType::Gemini,
+            Some(br#"{"mcpServers":{"owned":false}}"#),
+            "owned",
+        )
+        .is_err());
+        assert!(capture_mcp_native_snapshot(
+            &AppType::Codex,
+            Some(b"mcp_servers = { bad = 1 }"),
+            "bad",
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
