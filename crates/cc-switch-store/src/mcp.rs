@@ -507,6 +507,18 @@ pub fn update_mcp_server_catalog(
     update_mcp_server_catalog_inner(transaction, expected_fingerprint, server, false)
 }
 
+/// Replaces Registry-owned MCP fields only when host extension fields remain unchanged.
+///
+/// This variant rolls back and returns [`McpServerWriteOutcome::NotApplied`]
+/// when a trigger changes any non-Registry field on the target row.
+pub fn update_mcp_server_catalog_preserving_host_fields(
+    transaction: &mut Transaction<'_>,
+    expected_fingerprint: &[u8; 32],
+    server: &McpServerCatalogValues<'_>,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    update_mcp_server_catalog_inner(transaction, expected_fingerprint, server, true)
+}
+
 pub(crate) fn update_mcp_server_catalog_guarded(
     transaction: &mut Transaction<'_>,
     expected_fingerprint: &[u8; 32],
@@ -1530,6 +1542,63 @@ mod tests {
             before
         );
         transaction.commit().expect("commit empty transaction");
+    }
+
+    #[test]
+    fn strict_catalog_update_rejects_host_field_rewrites() {
+        let (_directory, database) = test_database();
+        let mut connection = database.connect().expect("connect shared database");
+        ensure_mcp_server_schema(&mut connection).expect("initialize MCP schema");
+        connection
+            .execute_batch("ALTER TABLE mcp_servers ADD COLUMN host_note TEXT DEFAULT 'keep';")
+            .expect("add host extension");
+        let initial = catalog_values("server", "Server", "{}", &[]);
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("transaction");
+        assert_eq!(
+            insert_mcp_server_catalog(&mut transaction, &initial).expect("insert catalog row"),
+            McpServerWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit initial row");
+        let before = read_mcp_server_row(&connection, "server")
+            .expect("read initial row")
+            .expect("initial row exists");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER rewrite_host_field AFTER UPDATE OF name ON mcp_servers BEGIN
+                    UPDATE mcp_servers SET host_note = 'rewritten' WHERE id = NEW.id;
+                 END;",
+            )
+            .expect("create host rewrite trigger");
+
+        let updated = catalog_values("server", "Updated", "{}", &[]);
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("transaction");
+        assert_eq!(
+            update_mcp_server_catalog_preserving_host_fields(
+                &mut transaction,
+                before.source_fingerprint(),
+                &updated,
+            )
+            .expect("reject host field rewrite"),
+            McpServerWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit empty transaction");
+
+        assert_eq!(
+            read_mcp_server_row(&connection, "server")
+                .expect("read preserved row")
+                .expect("preserved row exists"),
+            before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT host_note FROM mcp_servers WHERE id = 'server'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read host extension"),
+            "keep"
+        );
     }
 
     #[test]
