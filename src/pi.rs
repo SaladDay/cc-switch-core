@@ -9,7 +9,8 @@ use crate::{
     projection::{self, NativeContextRequirement, NativeProjectionBehavior},
     registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
     simple_provider::{self, SimpleProviderBehavior, PI_FORM},
-    AppType, LogicalTarget, NativeResourcePath, ProviderEntry, SkillAppContract, SkillDiscovery,
+    AppType, LogicalTarget, NativeConfigRoot, NativeResourcePath, ProviderEntry, SkillAppContract,
+    SkillDiscovery,
 };
 
 const CAPABILITIES: &[AppCapability] = &[
@@ -29,6 +30,7 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         CAPABILITIES,
         &[],
     )
+    .with_config_root(NativeConfigRoot::home_relative(".pi/agent"))
     .with_skills(SkillAppContract::catalog(
         "enabled_pi",
         SkillDiscovery::NativeAndUnified,

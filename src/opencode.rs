@@ -10,7 +10,8 @@ use crate::{
     projection::{self, NativeContextRequirement, NativeProjectionBehavior},
     registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
     simple_provider::{self, SimpleProviderBehavior, OPENCODE_FORM},
-    AppType, LogicalTarget, NativeResourcePath, ProviderEntry, SkillAppContract, SkillDiscovery,
+    AppType, LogicalTarget, NativeConfigRoot, NativeResourcePath, ProviderEntry, SkillAppContract,
+    SkillDiscovery,
 };
 
 const CAPABILITIES: &[AppCapability] = &[
@@ -31,6 +32,7 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         CAPABILITIES,
         &[],
     )
+    .with_config_root(NativeConfigRoot::home_relative(".config/opencode"))
     .with_mcp(&OPENCODE_MCP)
     .with_skills(SkillAppContract::catalog(
         "enabled_opencode",

@@ -12,8 +12,8 @@ use crate::{
     projection::{self, NativeContextRequirement, NativeProjectionBehavior},
     registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
     simple_provider::{self, SimpleProviderBehavior, GEMINI_FORM},
-    AppType, LogicalTarget, NativeResourcePath, SkillAppContract, SkillConfigTarget,
-    SkillDiscovery,
+    AppType, LogicalTarget, NativeConfigRoot, NativeResourcePath, SkillAppContract,
+    SkillConfigTarget, SkillDiscovery,
 };
 
 const CAPABILITIES: &[AppCapability] = &[
@@ -36,6 +36,7 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         CAPABILITIES,
         &[],
     )
+    .with_config_root(NativeConfigRoot::home_relative(".gemini"))
     .with_mcp(&GEMINI_MCP)
     .with_skills(SkillAppContract::catalog(
         "enabled_gemini",

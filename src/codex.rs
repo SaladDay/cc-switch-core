@@ -14,7 +14,7 @@ use crate::{
     projection::{self, NativeContextRequirement, NativePolicyBehavior, NativeProjectionBehavior},
     registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
     simple_provider::{self, SimpleProviderBehavior, CODEX_FORM},
-    AppType, LogicalTarget, NativeResourcePath, SkillAppContract, SkillDiscovery,
+    AppType, LogicalTarget, NativeConfigRoot, NativeResourcePath, SkillAppContract, SkillDiscovery,
 };
 
 const CAPABILITIES: &[AppCapability] = &[
@@ -37,6 +37,7 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         CAPABILITIES,
         &[],
     )
+    .with_config_root(NativeConfigRoot::home_relative(".codex"))
     .with_mcp(&CODEX_MCP)
     .with_skills(SkillAppContract::catalog(
         "enabled_codex",

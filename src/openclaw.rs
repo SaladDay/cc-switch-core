@@ -9,7 +9,7 @@ use crate::{
     projection::{self, NativeContextRequirement, NativeProjectionBehavior},
     registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
     simple_provider::{self, SimpleProviderBehavior, OPENCLAW_FORM},
-    AppType, LogicalTarget, ProviderEntry,
+    AppType, LogicalTarget, NativeConfigRoot, ProviderEntry,
 };
 
 const CAPABILITIES: &[AppCapability] = &[
@@ -27,7 +27,8 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         ProviderConfigurationMode::Additive,
         CAPABILITIES,
         &[],
-    ),
+    )
+    .with_config_root(NativeConfigRoot::home_relative(".openclaw")),
     &[LogicalTarget::OpenClawConfig],
     &OPENCLAW_FORM,
     SimpleProviderBehavior::new(

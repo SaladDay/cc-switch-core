@@ -11,7 +11,7 @@ use crate::{
     projection::{self, NativeContextRequirement, NativeProjectionBehavior},
     registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
     simple_provider::{self, SimpleProviderBehavior, CLAUDE_FORM},
-    AppType, LogicalTarget, NativeResourcePath, SkillAppContract, SkillDiscovery,
+    AppType, LogicalTarget, NativeConfigRoot, NativeResourcePath, SkillAppContract, SkillDiscovery,
 };
 
 const CAPABILITIES: &[AppCapability] = &[
@@ -34,6 +34,7 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         CAPABILITIES,
         &[],
     )
+    .with_config_root(NativeConfigRoot::home_relative(".claude"))
     .with_mcp(&CLAUDE_MCP)
     .with_skills(SkillAppContract::catalog(
         "enabled_claude",

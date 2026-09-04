@@ -72,7 +72,7 @@ pub use registry::{
     builtin_app_registry, AppCapability, AppDescriptor, BuiltinAppRegistry,
     ProviderConfigurationMode,
 };
-pub use resource::NativeResourcePath;
+pub use resource::{NativeConfigRoot, NativeResourcePath};
 pub use simple_provider::{
     builtin_simple_provider_forms, extract_simple_provider_values,
     project_simple_provider_settings, simple_provider_form, SimpleProviderError,

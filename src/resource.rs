@@ -4,6 +4,32 @@
 //! config root. Hosts retain all settings, environment, platform-path, and I/O
 //! behavior so existing products do not have to change path semantics.
 
+/// Default location of an application's native configuration root.
+///
+/// Hosts retain settings and environment-variable precedence. `HomeRelative`
+/// only declares the common default below the resolved user home directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NativeConfigRoot {
+    HomeRelative { path: &'static str },
+    HostDefined,
+}
+
+impl NativeConfigRoot {
+    pub(crate) const fn home_relative(path: &'static str) -> Self {
+        Self::HomeRelative { path }
+    }
+
+    /// Returns the common path relative to the user home directory, when one
+    /// exists. Platform-specific roots remain host-defined.
+    pub const fn home_relative_path(self) -> Option<&'static str> {
+        match self {
+            Self::HomeRelative { path } => Some(path),
+            Self::HostDefined => None,
+        }
+    }
+}
+
 /// Location of one native configuration document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]

@@ -13,8 +13,8 @@ use crate::{
     projection::{self, NativeContextRequirement, NativeProjectionBehavior},
     registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
     simple_provider::{self, SimpleProviderBehavior, GROKBUILD_FORM},
-    AppType, LogicalTarget, NativeResourcePath, SkillAppContract, SkillConfigTarget,
-    SkillDiscovery,
+    AppType, LogicalTarget, NativeConfigRoot, NativeResourcePath, SkillAppContract,
+    SkillConfigTarget, SkillDiscovery,
 };
 
 const CAPABILITIES: &[AppCapability] = &[
@@ -36,6 +36,7 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         CAPABILITIES,
         &["grok-build", "grok_build", "grok"],
     )
+    .with_config_root(NativeConfigRoot::home_relative(".grok"))
     .with_mcp(&GROKBUILD_MCP)
     .with_skills(SkillAppContract::catalog(
         "enabled_grokbuild",

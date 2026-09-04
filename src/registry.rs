@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::{
     integration::{builtin_app_integration, builtin_app_integrations},
-    AppType, McpAppContract, SkillAppContract,
+    AppType, McpAppContract, NativeConfigRoot, SkillAppContract,
 };
 
 /// A product-facing capability declared by an application.
@@ -46,6 +46,8 @@ pub struct AppDescriptor {
     id: &'static str,
     display_name: &'static str,
     brand_key: &'static str,
+    #[serde(skip_serializing)]
+    config_root: NativeConfigRoot,
     configuration_mode: ProviderConfigurationMode,
     capabilities: &'static [AppCapability],
     #[serde(skip_serializing)]
@@ -71,6 +73,7 @@ impl AppDescriptor {
             id,
             display_name,
             brand_key,
+            config_root: NativeConfigRoot::HostDefined,
             configuration_mode,
             capabilities,
             mcp_contract: None,
@@ -81,6 +84,11 @@ impl AppDescriptor {
 
     pub(crate) const fn with_mcp(mut self, contract: &'static McpAppContract) -> Self {
         self.mcp_contract = Some(contract);
+        self
+    }
+
+    pub(crate) const fn with_config_root(mut self, root: NativeConfigRoot) -> Self {
+        self.config_root = root;
         self
     }
 
@@ -107,6 +115,11 @@ impl AppDescriptor {
     /// Returns the stable key used to select product-owned brand assets.
     pub fn brand_key(&self) -> &'static str {
         self.brand_key
+    }
+
+    /// Returns the common default configuration-root declaration.
+    pub const fn config_root(&self) -> NativeConfigRoot {
+        self.config_root
     }
 
     /// Returns the provider activation mode.
@@ -263,6 +276,33 @@ mod tests {
         for descriptor in registry.descriptors() {
             assert_eq!(registry.for_app(descriptor.app()), descriptor);
         }
+    }
+
+    #[test]
+    fn config_root_matrix_is_stable_and_safe() {
+        let expected = [
+            ("claude", Some(".claude")),
+            ("claude-desktop", None),
+            ("codex", Some(".codex")),
+            ("gemini", Some(".gemini")),
+            ("grokbuild", Some(".grok")),
+            ("opencode", Some(".config/opencode")),
+            ("openclaw", Some(".openclaw")),
+            ("hermes", None),
+            ("pi", Some(".pi/agent")),
+        ];
+        let actual = builtin_app_registry()
+            .descriptors()
+            .map(|descriptor| {
+                let path = descriptor.config_root().home_relative_path();
+                if let Some(path) = path {
+                    assert!(is_safe_relative_path(path), "{}", descriptor.id());
+                }
+                (descriptor.id(), path)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
