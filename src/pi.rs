@@ -3,7 +3,53 @@
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::ProviderEntry;
+use crate::{
+    integration::AppIntegration,
+    native_import::{self, NativeImportBehavior},
+    projection::{self, NativeContextRequirement, NativeProjectionBehavior},
+    registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
+    simple_provider::{self, SimpleProviderBehavior, PI_FORM},
+    AppType, LogicalTarget, NativeResourcePath, ProviderEntry, SkillAppContract, SkillDiscovery,
+};
+
+const CAPABILITIES: &[AppCapability] = &[
+    AppCapability::ProviderManagement,
+    AppCapability::LiveConfiguration,
+    AppCapability::Prompts,
+    AppCapability::Skills,
+];
+
+pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
+    AppDescriptor::new(
+        AppType::Pi,
+        "pi",
+        "Pi",
+        "pi",
+        ProviderConfigurationMode::Additive,
+        CAPABILITIES,
+        &[],
+    )
+    .with_skills(SkillAppContract::catalog(
+        "enabled_pi",
+        SkillDiscovery::NativeAndUnified,
+        None,
+        NativeResourcePath::relative("skills"),
+    )),
+    &[LogicalTarget::PiModels],
+    &PI_FORM,
+    SimpleProviderBehavior::new(
+        simple_provider::extract_openai_array_provider,
+        simple_provider::project_pi,
+        false,
+    ),
+    NativeImportBehavior::new(native_import::import_pi),
+    NativeProjectionBehavior::new(
+        projection::pi_plan,
+        Some(projection::remove_pi),
+        projection::declared_native_targets,
+        NativeContextRequirement::Standard,
+    ),
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PrepareProviderEntryError {
