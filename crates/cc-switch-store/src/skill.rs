@@ -24,14 +24,7 @@ const CREATE_SKILLS_TABLE: &str = "CREATE TABLE IF NOT EXISTS main.skills (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT,
-    directory TEXT NOT NULL,
-    repo_owner TEXT,
-    repo_name TEXT,
-    repo_branch TEXT DEFAULT 'main',
-    readme_url TEXT,
-    installed_at INTEGER NOT NULL DEFAULT 0,
-    content_hash TEXT,
-    updated_at INTEGER NOT NULL DEFAULT 0
+    directory TEXT NOT NULL
 )";
 
 const BASE_SKILL_COLUMNS: &[SkillColumn] = &[
@@ -114,6 +107,19 @@ impl RawSqlValue {
             Self::Blob(_) => "blob",
         }
     }
+
+    fn from_owned(value: Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Integer(value) => Self::Integer(value),
+            Value::Real(value) => {
+                let canonical = if value == 0.0 { 0.0 } else { value };
+                Self::Real(canonical.to_bits())
+            }
+            Value::Text(value) => Self::Text(value.into_bytes()),
+            Value::Blob(value) => Self::Blob(value),
+        }
+    }
 }
 
 impl ToSql for RawSqlValue {
@@ -186,14 +192,29 @@ impl SkillCatalogRow {
             .map(|selections| selections.iter().copied())
     }
 
-    /// Returns one registry selection when the selection set is valid.
+    /// Returns one registry selection when that individual value is valid.
+    ///
+    /// A malformed value in another application's column does not hide this
+    /// one, which lets hosts repair rows without clearing valid selections
+    /// they do not expose.
     pub fn selected_for(&self, app: &AppType) -> Option<bool> {
         let column = builtin_app_registry()
             .for_app(app)
             .skill_contract()?
             .catalog_column();
-        self.selections()?
-            .find_map(|(candidate, selected)| (candidate == column).then_some(selected))
+        let index = self
+            .source_columns
+            .iter()
+            .position(|candidate| candidate == column.as_str())?;
+        match self.source_values.get(index)? {
+            RawSqlValue::Integer(0) => Some(false),
+            RawSqlValue::Integer(1) => Some(true),
+            RawSqlValue::Null
+            | RawSqlValue::Integer(_)
+            | RawSqlValue::Real(_)
+            | RawSqlValue::Text(_)
+            | RawSqlValue::Blob(_) => None,
+        }
     }
 
     /// Returns the identifier when that individual value is valid UTF-8 text.
@@ -578,8 +599,9 @@ pub enum SkillCatalogWriteOutcome {
 
 /// Creates or transactionally upgrades the shared installed Skill catalog.
 ///
-/// Core-declared selection columns are added in registry order. Existing rows,
-/// product metadata columns, unknown columns, indexes, and triggers are kept.
+/// A new table contains only the shared base fields and Core-declared
+/// selection columns. Existing host columns, rows, indexes, and triggers are
+/// kept; each product owns creation and migration of its metadata columns.
 pub fn ensure_skill_schema(connection: &mut Connection) -> Result<(), SharedStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute(CREATE_SKILLS_TABLE, [])?;
@@ -660,7 +682,7 @@ pub fn read_skill_catalog_row(
 
 /// Inserts one complete registry-owned Skill catalog row when its binary
 /// identifier is absent. Identity and directory strings are stored without
-/// product-level path validation; product metadata columns retain defaults.
+/// product-level path validation; host metadata columns retain their defaults.
 pub fn insert_skill_catalog_if_absent(
     transaction: &mut Transaction<'_>,
     id: &str,
@@ -823,6 +845,105 @@ pub fn update_skill_catalog_if_unchanged(
                 current,
                 &replacement,
             ))
+        },
+    )
+}
+
+/// Updates product-owned columns on one unchanged Skill row.
+///
+/// Column names must resolve to host extensions outside Core's base fields and
+/// registry selections. The guarded write rejects suppression, row
+/// replacement, changes to any unlisted target column, and writes to another
+/// Skill row. This lets a host compose its metadata update with Core catalog
+/// writes in one outer transaction without teaching Core the host schema.
+pub fn update_skill_host_fields_if_unchanged(
+    transaction: &mut Transaction<'_>,
+    current: &SkillCatalogRow,
+    replacements: impl IntoIterator<Item = (String, Value)>,
+) -> Result<SkillCatalogWriteOutcome, SharedStoreError> {
+    prepare_skill_catalog_write(transaction)?;
+    if !skill_snapshot_is_current(transaction, current)
+        .map_err(|error| redact_skill_catalog_store_error(error, transaction.is_autocommit()))?
+    {
+        return Ok(SkillCatalogWriteOutcome::NotApplied);
+    }
+
+    let host_offset = 4 + skill_catalog_columns().count();
+    let mut desired = Vec::new();
+    for (column, value) in replacements {
+        let Some(index) = current
+            .source_columns
+            .iter()
+            .position(|candidate| candidate == &column)
+        else {
+            return Err(SharedStoreError::InvalidDatabase(
+                "Skill host update references an absent column".to_owned(),
+            ));
+        };
+        if index < host_offset || desired.iter().any(|(candidate, _)| *candidate == index) {
+            return Err(SharedStoreError::InvalidDatabase(
+                "Skill host updates must name distinct product-owned columns".to_owned(),
+            ));
+        }
+        desired.push((index, RawSqlValue::from_owned(value)));
+    }
+
+    let changes = desired
+        .into_iter()
+        .filter(|(index, value)| current.source_values[*index] != *value)
+        .collect::<Vec<_>>();
+    if changes.is_empty() {
+        return Ok(SkillCatalogWriteOutcome::Applied);
+    }
+
+    let before = read_skill_catalog_rows(transaction)
+        .map_err(|error| redact_skill_catalog_store_error(error, transaction.is_autocommit()))?;
+    let assignments = changes
+        .iter()
+        .enumerate()
+        .map(|(offset, (index, _))| {
+            format!(
+                "{} = ?{}",
+                quoted_identifier(&current.source_columns[*index]),
+                offset + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let snapshot_predicate = skill_snapshot_predicate(current, changes.len() + 1);
+    let sql = format!("UPDATE main.skills SET {assignments} WHERE {snapshot_predicate}");
+    let mut parameters = changes
+        .iter()
+        .map(|(_, value)| value as &dyn ToSql)
+        .collect::<Vec<_>>();
+    parameters.extend(
+        current
+            .source_values
+            .iter()
+            .map(|value| value as &dyn ToSql),
+    );
+    let mut expected_values = current.source_values.clone();
+    for (index, value) in &changes {
+        expected_values[*index] = value.clone();
+    }
+
+    execute_skill_catalog_write(
+        transaction,
+        &sql,
+        params_from_iter(parameters),
+        |connection| {
+            let after = read_skill_catalog_rows(connection)?;
+            let candidates = after
+                .iter()
+                .filter(|row| {
+                    row.source_columns == current.source_columns
+                        && row.source_values == expected_values
+                })
+                .collect::<Vec<_>>();
+            Ok(candidates.len() == 1
+                && rows_without(&before, current)
+                    .zip(rows_without(&after, candidates[0]))
+                    .is_some_and(|(before, after)| rows_match_unordered(&before, &after)))
         },
     )
 }
@@ -1710,13 +1831,13 @@ mod tests {
     }
 
     #[test]
-    fn creates_registry_catalog_with_compatible_product_metadata_columns() {
+    fn creates_minimal_registry_catalog_without_product_metadata_columns() {
         let (_directory, database) = test_database();
         database.ensure_skill_schema().expect("initialize skills");
         let connection = database.connect().expect("connect shared database");
         let columns = skill_columns(&connection).expect("read skill columns");
 
-        for required in [
+        for host_column in [
             "repo_owner",
             "repo_name",
             "repo_branch",
@@ -1725,7 +1846,7 @@ mod tests {
             "content_hash",
             "updated_at",
         ] {
-            assert!(columns.iter().any(|column| column.name == required));
+            assert!(!columns.iter().any(|column| column.name == host_column));
         }
         for selection in skill_catalog_columns() {
             assert!(columns
@@ -1938,8 +2059,11 @@ mod tests {
         database.ensure_skill_schema().expect("initialize skills");
         let mut connection = database.connect().expect("connect shared database");
         connection
-            .execute("ALTER TABLE skills ADD COLUMN host_note TEXT", [])
-            .expect("add host column");
+            .execute_batch(
+                "ALTER TABLE skills ADD COLUMN repo_owner TEXT;
+                 ALTER TABLE skills ADD COLUMN host_note TEXT;",
+            )
+            .expect("add host columns");
         let entry = catalog_entry("demo", "Demo", "demo", &["enabled_grokbuild", "enabled_pi"]);
 
         connection
@@ -2040,6 +2164,89 @@ mod tests {
     }
 
     #[test]
+    fn host_field_update_is_guarded_without_owning_host_schema() {
+        let (_directory, database) = test_database();
+        database.ensure_skill_schema().expect("initialize skills");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "ALTER TABLE skills ADD COLUMN host_note TEXT;
+                 ALTER TABLE skills ADD COLUMN host_extension TEXT DEFAULT 'keep';",
+            )
+            .expect("add host columns");
+        let entry = catalog_entry("demo", "Demo", "demo", &[]);
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin insert");
+        assert_eq!(
+            insert_catalog_entry(&mut transaction, &entry).expect("insert catalog row"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit insert");
+
+        let current = read_skill_catalog_row(&connection, "demo")
+            .expect("read current row")
+            .expect("row exists");
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin host update");
+        assert_eq!(
+            update_skill_host_fields_if_unchanged(
+                &mut transaction,
+                &current,
+                [("host_note".to_owned(), Value::Text("owner".to_owned()))],
+            )
+            .expect("update host field"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit host update");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT host_note, host_extension FROM skills WHERE id = 'demo'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("read host fields"),
+            ("owner".to_owned(), "keep".to_owned())
+        );
+
+        connection
+            .execute_batch(
+                "CREATE TRIGGER rewrite_unknown_host_field
+                 AFTER UPDATE OF host_note ON skills
+                 WHEN NEW.id = 'demo'
+                 BEGIN
+                    UPDATE skills SET host_extension = 'rewritten' WHERE id = NEW.id;
+                 END;",
+            )
+            .expect("create hostile trigger");
+        let current = read_skill_catalog_row(&connection, "demo")
+            .expect("read guarded row")
+            .expect("row exists");
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin rejected update");
+        assert_eq!(
+            update_skill_host_fields_if_unchanged(
+                &mut transaction,
+                &current,
+                [("host_note".to_owned(), Value::Text("next".to_owned()))],
+            )
+            .expect("reject trigger rewrite"),
+            SkillCatalogWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit rolled-back savepoint");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT host_note, host_extension FROM skills WHERE id = 'demo'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("read preserved host fields"),
+            ("owner".to_owned(), "keep".to_owned())
+        );
+    }
+
+    #[test]
     fn raw_catalog_rows_keep_host_paths_and_null_id_removable() {
         let (_directory, database) = test_database();
         database.ensure_skill_schema().expect("initialize skills");
@@ -2117,6 +2324,12 @@ mod tests {
             .expect("malformed display row exists");
         assert!(bad_name.values().is_none());
         assert_eq!(bad_name.selected_for(&AppType::GrokBuild), Some(true));
+        let bad_selection = read_skill_catalog_row(&connection, "bad-selection")
+            .expect("read malformed selection row")
+            .expect("malformed selection row exists");
+        assert!(bad_selection.values().is_none());
+        assert_eq!(bad_selection.selected_for(&AppType::Claude), None);
+        assert_eq!(bad_selection.selected_for(&AppType::GrokBuild), Some(false));
 
         let host = read_skill_catalog_row(&connection, "host-skill")
             .expect("read host row beside malformed rows")
@@ -2605,8 +2818,11 @@ mod tests {
         database.ensure_skill_schema().expect("initialize skills");
         let mut connection = database.connect().expect("connect shared database");
         connection
-            .execute("ALTER TABLE skills ADD COLUMN host_note TEXT", [])
-            .expect("add host column");
+            .execute_batch(
+                "ALTER TABLE skills ADD COLUMN repo_owner TEXT;
+                 ALTER TABLE skills ADD COLUMN host_note TEXT;",
+            )
+            .expect("add host columns");
         insert_skill(&connection, "demo", "Demo", "demo");
         insert_skill(&connection, "other", "Other", "other");
         connection
@@ -2669,15 +2885,12 @@ mod tests {
                  AFTER UPDATE OF enabled_claude ON skills BEGIN
                     DELETE FROM skills WHERE id = NEW.id;
                     INSERT INTO skills (
-                        id, name, description, directory, repo_owner, repo_name,
-                        repo_branch, readme_url, installed_at, content_hash, updated_at,
+                        id, name, description, directory, repo_owner,
                         enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild,
                         enabled_opencode, enabled_hermes, enabled_pi, host_note
                     ) VALUES (
                         NEW.id, NEW.name, NEW.description, NEW.directory, NEW.repo_owner,
-                        NEW.repo_name, NEW.repo_branch, NEW.readme_url, NEW.installed_at,
-                        NEW.content_hash, NEW.updated_at, NEW.enabled_claude,
-                        NEW.enabled_codex, NEW.enabled_gemini, NEW.enabled_grokbuild,
+                        NEW.enabled_claude, NEW.enabled_codex, NEW.enabled_gemini, NEW.enabled_grokbuild,
                         NEW.enabled_opencode, NEW.enabled_hermes, NEW.enabled_pi, NEW.host_note
                     );
                  END;",

@@ -96,7 +96,11 @@ catalog rows, replace selections with a complete-row compare-and-swap, and
 delete rows while allowing host cleanup outside the Skill catalog. These APIs
 keep raw snapshots opaque and expose typed values only for storage-valid rows,
 so malformed legacy data remains removable without leaking host fields through
-`Debug`. They do not own paths, copy/symlink policy, or filesystem rollback.
+`Debug`. A newly created catalog contains only shared base and registry columns;
+each product owns its metadata schema. The guarded host-field update primitive
+accepts those product-owned columns without embedding them in Core and rejects
+trigger rewrites outside the requested row and fields. These APIs do not own
+paths, copy/symlink policy, or filesystem rollback.
 
 The live-operation layer does not own paths, raw-plan syntax validation,
 concrete file I/O, locks, business state, databases, UI, OAuth flows, proxy

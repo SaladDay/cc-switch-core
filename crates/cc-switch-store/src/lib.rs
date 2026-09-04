@@ -38,7 +38,8 @@ pub use skill::{
     apply_skill_catalog_plan, delete_skill_catalog_if_unchanged, ensure_skill_schema,
     insert_skill_catalog_if_absent, read_skill_catalog, read_skill_catalog_entry,
     read_skill_catalog_row, read_skill_catalog_rows, update_skill_catalog_if_unchanged,
-    SkillCatalogRow, SkillCatalogValues, SkillCatalogWriteOutcome, SKILLS_TABLE,
+    update_skill_host_fields_if_unchanged, SkillCatalogRow, SkillCatalogValues,
+    SkillCatalogWriteOutcome, SKILLS_TABLE,
 };
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
