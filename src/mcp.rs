@@ -863,6 +863,7 @@ fn project_json_section(
             flavor,
             server,
             existing_entry.as_deref(),
+            false,
         )?),
         McpServerProjection::Restore { server, snapshot } => Some(project_json_entry(
             flavor,
@@ -870,6 +871,7 @@ fn project_json_section(
             existing_entry
                 .as_deref()
                 .or(Some(snapshot.entry_json.as_str())),
+            true,
         )?),
         McpServerProjection::Disable(server) if matches!(flavor, JsonFlavor::OpenCode) => {
             let Some(existing) = existing_entry.as_deref() else {
@@ -880,7 +882,13 @@ fn project_json_section(
                 .as_object_mut()
                 .expect("OpenCode projection is an object")
                 .insert("enabled".to_owned(), Value::Bool(false));
-            Some(merge_json_entry(flavor, server, Some(existing), desired)?)
+            Some(merge_json_entry(
+                flavor,
+                server,
+                Some(existing),
+                desired,
+                false,
+            )?)
         }
         McpServerProjection::Disable(_) | McpServerProjection::Remove => None,
     };
@@ -892,9 +900,16 @@ fn project_json_entry(
     flavor: JsonFlavor,
     server: &Value,
     existing: Option<&str>,
+    preserve_existing_extensions: bool,
 ) -> Result<String, McpConfigError> {
     let desired = to_json_flavor(flavor, server, None)?;
-    merge_json_entry(flavor, server, existing, desired)
+    merge_json_entry(
+        flavor,
+        server,
+        existing,
+        desired,
+        preserve_existing_extensions,
+    )
 }
 
 fn merge_json_entry(
@@ -902,6 +917,7 @@ fn merge_json_entry(
     server: &Value,
     existing: Option<&str>,
     mut desired: Value,
+    preserve_existing_extensions: bool,
 ) -> Result<String, McpConfigError> {
     let desired = desired
         .as_object_mut()
@@ -914,7 +930,11 @@ fn merge_json_entry(
                     .iter()
                     .any(|field| server.contains_key(*field))
             });
-            if !configured_timeout && existing.is_some() {
+            if preserve_existing_extensions {
+                &[
+                    "type", "command", "args", "env", "cwd", "url", "httpUrl", "headers",
+                ]
+            } else if !configured_timeout && existing.is_some() {
                 desired.remove("timeout");
                 &[
                     "type",
@@ -959,6 +979,23 @@ fn merge_json_entry(
             "headers",
         ],
     };
+    if preserve_existing_extensions {
+        if let Some(existing) = existing {
+            let extension_keys = desired
+                .keys()
+                .filter(|key| !clear_fields.contains(&key.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in extension_keys {
+                if json_patch::object_entry(existing, &key)
+                    .map_err(McpConfigError::InvalidServer)?
+                    .is_some()
+                {
+                    desired.remove(&key);
+                }
+            }
+        }
+    }
     json_patch::merge_object_fields(existing, clear_fields, desired)
         .map_err(McpConfigError::InvalidServer)
 }
@@ -2526,7 +2563,7 @@ mod tests {
             Some(disabled.as_bytes()),
             "server",
             McpServerProjection::Restore {
-                server: &json!({"command":"uvx"}),
+                server: &json!({"command":"uvx","trust":false,"fresh":"shared"}),
                 snapshot,
             },
         )
@@ -2536,6 +2573,57 @@ mod tests {
         assert_eq!(restored["mcpServers"]["server"]["command"], "uvx");
         assert_eq!(restored["mcpServers"]["server"]["timeout"], 30);
         assert_eq!(restored["mcpServers"]["server"]["trust"], true);
+        assert_eq!(restored["mcpServers"]["server"]["fresh"], "shared");
+    }
+
+    #[test]
+    fn gemini_restore_keeps_raw_native_timeouts_and_adds_missing_shared_timeout() {
+        let original = br#"{"mcpServers":{"server":{"command":"npx","timeout":9007199254740993.0,"startup_timeout_ms":18446744073709551617}}}"#;
+        let snapshot = capture_mcp_native_snapshot(&AppType::Gemini, Some(original), "server")
+            .unwrap()
+            .unwrap();
+        let restored = project_mcp_server(
+            &AppType::Gemini,
+            Some(b"{}"),
+            "server",
+            McpServerProjection::Restore {
+                server: &json!({
+                    "command":"uvx",
+                    "timeout":1,
+                    "startup_timeout_ms":2,
+                    "fresh":"shared"
+                }),
+                snapshot: &snapshot,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(restored.contains("9007199254740993.0"));
+        assert!(restored.contains("18446744073709551617"));
+        let restored_value: Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(restored_value["mcpServers"]["server"]["command"], "uvx");
+        assert_eq!(restored_value["mcpServers"]["server"]["fresh"], "shared");
+
+        let snapshot = capture_mcp_native_snapshot(
+            &AppType::Gemini,
+            Some(br#"{"mcpServers":{"server":{"command":"npx","trust":true}}}"#),
+            "server",
+        )
+        .unwrap()
+        .unwrap();
+        let restored = project_mcp_server(
+            &AppType::Gemini,
+            Some(b"{}"),
+            "server",
+            McpServerProjection::Restore {
+                server: &json!({"command":"uvx","startup_timeout_ms":120_000}),
+                snapshot: &snapshot,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let restored: Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(restored["mcpServers"]["server"]["timeout"], 120_000);
     }
 
     #[test]
