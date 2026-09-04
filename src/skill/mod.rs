@@ -12,7 +12,7 @@ mod read;
 mod reference;
 mod write;
 
-use crate::LogicalTarget;
+use crate::{LogicalTarget, NativeResourcePath};
 
 pub use catalog::{skill_catalog_columns, SkillCatalogEntry, SkillCatalogEntryError};
 pub use read::{
@@ -96,6 +96,7 @@ pub struct SkillAppContract {
     catalog_column: SkillCatalogColumn,
     discovery: SkillDiscovery,
     config_target: Option<SkillConfigTarget>,
+    native_resource: NativeResourcePath,
 }
 
 impl SkillAppContract {
@@ -103,11 +104,13 @@ impl SkillAppContract {
         column: &'static str,
         discovery: SkillDiscovery,
         config_target: Option<SkillConfigTarget>,
+        native_resource: NativeResourcePath,
     ) -> Self {
         Self {
             catalog_column: SkillCatalogColumn::new(column),
             discovery,
             config_target,
+            native_resource,
         }
     }
 
@@ -119,6 +122,11 @@ impl SkillAppContract {
     /// Returns how this application discovers installed Skills.
     pub const fn discovery(self) -> SkillDiscovery {
         self.discovery
+    }
+
+    /// Returns the application's native Skill resource declaration.
+    pub const fn native_resource(self) -> NativeResourcePath {
+        self.native_resource
     }
 
     /// Returns the native per-Skill control, when one is supported.
@@ -133,8 +141,12 @@ mod tests {
 
     #[test]
     fn every_contract_has_a_catalog_selection() {
-        let contract =
-            SkillAppContract::catalog("enabled_test", SkillDiscovery::NativeAndUnified, None);
+        let contract = SkillAppContract::catalog(
+            "enabled_test",
+            SkillDiscovery::NativeAndUnified,
+            None,
+            NativeResourcePath::relative("skills"),
+        );
 
         assert_eq!(contract.catalog_column().as_str(), "enabled_test");
     }

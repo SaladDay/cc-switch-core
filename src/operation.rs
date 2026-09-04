@@ -14,7 +14,7 @@ use serde::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{builtin_app_adapter, builtin_app_registry, AppType};
+use crate::{builtin_app_adapter, builtin_app_registry, AppType, NativeResourcePath};
 
 /// Current major version of the serialized operation-plan contract.
 pub const OPERATION_CONTRACT_MAJOR: u32 = 1;
@@ -88,6 +88,32 @@ impl LogicalTarget {
             Self::OpenClawConfig => AppType::OpenClaw,
             Self::HermesConfig => AppType::Hermes,
             Self::PiModels => AppType::Pi,
+        }
+    }
+
+    /// Returns the document location relative to its application's resolved
+    /// configuration root, or `HostDefined` for platform-specific resources.
+    pub const fn resource_path(self) -> NativeResourcePath {
+        match self {
+            Self::ClaudeSettings => {
+                NativeResourcePath::relative_with_fallbacks("settings.json", &["claude.json"])
+            }
+            Self::ClaudeDesktopNormalConfig
+            | Self::ClaudeDesktopThreepConfig
+            | Self::ClaudeDesktopProfile
+            | Self::ClaudeDesktopMeta => NativeResourcePath::HostDefined,
+            Self::CodexAuth => NativeResourcePath::relative("auth.json"),
+            Self::CodexConfig => NativeResourcePath::relative("config.toml"),
+            Self::CodexModelCatalog => {
+                NativeResourcePath::relative(crate::codex::MODEL_CATALOG_FILENAME)
+            }
+            Self::GeminiEnv => NativeResourcePath::relative(".env"),
+            Self::GeminiSettings => NativeResourcePath::relative("settings.json"),
+            Self::GrokConfig => NativeResourcePath::relative("config.toml"),
+            Self::OpenCodeConfig => NativeResourcePath::relative("opencode.json"),
+            Self::OpenClawConfig => NativeResourcePath::relative("openclaw.json"),
+            Self::HermesConfig => NativeResourcePath::relative("config.yaml"),
+            Self::PiModels => NativeResourcePath::relative("models.json"),
         }
     }
 

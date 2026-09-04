@@ -33,11 +33,12 @@ copying native settings templates.
 
 ## Dependency direction
 
-Core owns product-neutral contracts and pure transformations. Native hosts
-discover application config paths and apply user settings, environment
-variables, platform directories, and installation checks. Core may
-canonicalize and validate paths supplied to its Skill and filesystem
-contracts. Shared SQLite schema and migrations should live in a separate
+Core owns product-neutral contracts and pure transformations. The app registry
+declares whether native resources are relative to a host-supplied app config
+root or need host-defined platform handling. Native hosts read settings and
+environment variables, resolve home and platform directories, check
+installations, and perform file I/O. Core may canonicalize and validate paths
+supplied to its Skill and filesystem contracts. Shared SQLite schema and migrations should live in a separate
 storage crate that depends on Core, so desktop and CLI products can share
 persistence without making Core database-specific. Core may expose stable
 display-name fallbacks, brand keys, simple forms, presets, and authentication

@@ -185,9 +185,61 @@ mod tests {
 
     use super::*;
     use crate::{
+        builtin_app_adapter, LogicalTarget, McpConfigResource, NativeResourcePath,
         SkillConfigTarget::{GeminiSettings, GrokConfig, HermesConfig},
         SkillDiscovery::{NativeAndUnified, NativeOnly},
     };
+
+    fn is_safe_relative_path(path: &str) -> bool {
+        path.is_ascii()
+            && !path
+                .chars()
+                .any(|character| matches!(character, ':' | '<' | '>' | '"' | '|' | '?' | '*'))
+            && path.split(['/', '\\']).all(|part| {
+                !part.is_empty()
+                    && part != "."
+                    && part != ".."
+                    && !part.ends_with('.')
+                    && !part.ends_with(' ')
+                    && !is_windows_device_name(part)
+                    && !part.bytes().any(|byte| byte.is_ascii_control())
+            })
+    }
+
+    fn is_windows_device_name(part: &str) -> bool {
+        let stem = part.split('.').next().unwrap_or_default();
+        matches!(
+            stem.to_ascii_uppercase().as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "CONIN$"
+                | "CONOUT$"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        )
+    }
+
+    fn path_identity(path: &str) -> String {
+        path.replace('\\', "/").to_ascii_lowercase()
+    }
 
     #[test]
     fn registry_keeps_stable_order_and_identifiers() {
@@ -240,6 +292,133 @@ mod tests {
             Some("claude-desktop")
         );
         assert!(registry.find("unknown").is_none());
+    }
+
+    #[test]
+    fn registry_declares_complete_host_resource_contracts() {
+        fn assert_safe_resource(resource: NativeResourcePath, app_id: &str) {
+            match resource {
+                NativeResourcePath::ConfigRootRelative {
+                    preferred,
+                    fallbacks,
+                } => {
+                    assert!(is_safe_relative_path(preferred), "{app_id}");
+                    let mut paths = HashSet::from([path_identity(preferred)]);
+                    assert!(
+                        fallbacks
+                            .iter()
+                            .all(|path| is_safe_relative_path(path)
+                                && paths.insert(path_identity(path))),
+                        "{app_id}"
+                    );
+                }
+                NativeResourcePath::HostDefined => {}
+            }
+        }
+
+        for descriptor in builtin_app_registry().descriptors() {
+            let adapter = builtin_app_adapter(descriptor.app());
+            for target in adapter.targets() {
+                assert_safe_resource(target.resource_path(), descriptor.id());
+            }
+            if let Some(contract) = descriptor.skill_contract() {
+                assert_safe_resource(contract.native_resource(), descriptor.id());
+            }
+
+            if let Some(McpConfigResource::LogicalTarget(target)) = descriptor
+                .mcp_contract()
+                .map(|contract| contract.resource())
+            {
+                assert_eq!(target.app(), descriptor.app().clone());
+                assert!(adapter.targets().contains(&target));
+            }
+        }
+    }
+
+    #[test]
+    fn resource_paths_reject_cross_platform_aliases() {
+        for path in [
+            "../outside",
+            "/absolute",
+            r"C:\absolute",
+            "NUL.json",
+            "nested/COM1.log",
+            "trailing. ",
+            "unicode-配置.json",
+        ] {
+            assert!(!is_safe_relative_path(path), "{path}");
+        }
+        for path in ["settings.json", ".env", ".config/opencode/config.json"] {
+            assert!(is_safe_relative_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn native_resource_matrix_is_stable() {
+        let relative = NativeResourcePath::relative;
+        let host_defined = NativeResourcePath::HostDefined;
+        let mut checked = Vec::new();
+        macro_rules! check {
+            ($target:expr, $resource:expr) => {{
+                checked.push($target);
+                assert_eq!($target.resource_path(), $resource);
+            }};
+        }
+        check!(
+            LogicalTarget::ClaudeSettings,
+            NativeResourcePath::relative_with_fallbacks("settings.json", &["claude.json"])
+        );
+        check!(LogicalTarget::ClaudeDesktopNormalConfig, host_defined);
+        check!(LogicalTarget::ClaudeDesktopThreepConfig, host_defined);
+        check!(LogicalTarget::ClaudeDesktopProfile, host_defined);
+        check!(LogicalTarget::ClaudeDesktopMeta, host_defined);
+        check!(LogicalTarget::CodexAuth, relative("auth.json"));
+        check!(LogicalTarget::CodexConfig, relative("config.toml"));
+        check!(
+            LogicalTarget::CodexModelCatalog,
+            relative(crate::codex::MODEL_CATALOG_FILENAME)
+        );
+        check!(LogicalTarget::GeminiEnv, relative(".env"));
+        check!(LogicalTarget::GeminiSettings, relative("settings.json"));
+        check!(LogicalTarget::GrokConfig, relative("config.toml"));
+        check!(LogicalTarget::OpenCodeConfig, relative("opencode.json"));
+        check!(LogicalTarget::OpenClawConfig, relative("openclaw.json"));
+        check!(LogicalTarget::HermesConfig, relative("config.yaml"));
+        check!(LogicalTarget::PiModels, relative("models.json"));
+        assert_eq!(checked, LogicalTarget::ALL);
+    }
+
+    #[test]
+    fn mcp_resource_matrix_is_stable() {
+        fn resource(id: &str) -> McpConfigResource {
+            builtin_app_registry()
+                .find(id)
+                .and_then(AppDescriptor::mcp_contract)
+                .map(|contract| contract.resource())
+                .expect("registered MCP resource")
+        }
+        let target = McpConfigResource::LogicalTarget;
+        let mut checked = Vec::new();
+        macro_rules! check {
+            ($app:literal, $resource:expr) => {{
+                checked.push($app);
+                assert_eq!(resource($app), $resource);
+            }};
+        }
+        check!("claude", McpConfigResource::HostDefined);
+        check!("codex", target(LogicalTarget::CodexConfig));
+        check!("gemini", target(LogicalTarget::GeminiSettings));
+        check!("grokbuild", target(LogicalTarget::GrokConfig));
+        check!("opencode", target(LogicalTarget::OpenCodeConfig));
+        check!("hermes", target(LogicalTarget::HermesConfig));
+        assert_eq!(
+            checked,
+            builtin_app_registry()
+                .descriptors()
+                .filter(|descriptor| descriptor.mcp_contract().is_some())
+                .map(AppDescriptor::id)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -422,6 +601,7 @@ mod tests {
                         contract.catalog_column(),
                         contract.discovery(),
                         contract.config_target(),
+                        contract.native_resource(),
                     )
                 })
             })
@@ -430,33 +610,55 @@ mod tests {
         assert_eq!(
             actual,
             [
-                ("claude", catalog("enabled_claude"), NativeOnly, None),
-                ("codex", catalog("enabled_codex"), NativeAndUnified, None,),
+                (
+                    "claude",
+                    catalog("enabled_claude"),
+                    NativeOnly,
+                    None,
+                    NativeResourcePath::relative("skills")
+                ),
+                (
+                    "codex",
+                    catalog("enabled_codex"),
+                    NativeAndUnified,
+                    None,
+                    NativeResourcePath::relative("skills")
+                ),
                 (
                     "gemini",
                     catalog("enabled_gemini"),
                     NativeAndUnified,
                     Some(GeminiSettings),
+                    NativeResourcePath::relative("skills"),
                 ),
                 (
                     "grokbuild",
                     catalog("enabled_grokbuild"),
                     NativeAndUnified,
                     Some(GrokConfig),
+                    NativeResourcePath::relative("skills"),
                 ),
                 (
                     "opencode",
                     catalog("enabled_opencode"),
                     NativeAndUnified,
                     None,
+                    NativeResourcePath::relative("skills"),
                 ),
                 (
                     "hermes",
                     catalog("enabled_hermes"),
                     NativeOnly,
                     Some(HermesConfig),
+                    NativeResourcePath::relative("skills"),
                 ),
-                ("pi", catalog("enabled_pi"), NativeAndUnified, None),
+                (
+                    "pi",
+                    catalog("enabled_pi"),
+                    NativeAndUnified,
+                    None,
+                    NativeResourcePath::relative("skills")
+                ),
             ]
         );
     }

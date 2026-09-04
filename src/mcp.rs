@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike};
 
-use crate::{AppType, MAX_OPERATION_CONTENT_BYTES};
+use crate::{AppType, LogicalTarget, MAX_OPERATION_CONTENT_BYTES};
 
 mod json_patch;
 
@@ -52,11 +52,22 @@ pub enum McpConfigTarget {
     Hermes,
 }
 
+/// Native document that stores one application's MCP configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum McpConfigResource {
+    /// MCP shares an existing native configuration target.
+    LogicalTarget(LogicalTarget),
+    /// MCP uses a host-resolved resource outside the app's native targets.
+    HostDefined,
+}
+
 /// MCP behavior that a host must honor for one application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct McpAppContract {
     catalog_column: McpCatalogColumn,
     target: McpConfigTarget,
+    resource: McpConfigResource,
     preserves_disabled_entry: bool,
     supports_cwd: bool,
 }
@@ -70,6 +81,11 @@ impl McpAppContract {
     /// Returns the application-owned MCP document target.
     pub const fn target(self) -> McpConfigTarget {
         self.target
+    }
+
+    /// Returns the native document that stores this application's MCP section.
+    pub const fn resource(self) -> McpConfigResource {
+        self.resource
     }
 
     /// Returns whether disabling keeps a native entry that can later be restored in place.
@@ -108,36 +124,42 @@ impl McpCatalogColumn {
 pub(crate) const CLAUDE_MCP: McpAppContract = McpAppContract {
     catalog_column: McpCatalogColumn::new("enabled_claude"),
     target: McpConfigTarget::Claude,
+    resource: McpConfigResource::HostDefined,
     preserves_disabled_entry: false,
     supports_cwd: true,
 };
 pub(crate) const CODEX_MCP: McpAppContract = McpAppContract {
     catalog_column: McpCatalogColumn::new("enabled_codex"),
     target: McpConfigTarget::Codex,
+    resource: McpConfigResource::LogicalTarget(LogicalTarget::CodexConfig),
     preserves_disabled_entry: true,
     supports_cwd: true,
 };
 pub(crate) const GEMINI_MCP: McpAppContract = McpAppContract {
     catalog_column: McpCatalogColumn::new("enabled_gemini"),
     target: McpConfigTarget::Gemini,
+    resource: McpConfigResource::LogicalTarget(LogicalTarget::GeminiSettings),
     preserves_disabled_entry: false,
     supports_cwd: true,
 };
 pub(crate) const GROKBUILD_MCP: McpAppContract = McpAppContract {
     catalog_column: McpCatalogColumn::new("enabled_grokbuild"),
     target: McpConfigTarget::GrokBuild,
+    resource: McpConfigResource::LogicalTarget(LogicalTarget::GrokConfig),
     preserves_disabled_entry: true,
     supports_cwd: true,
 };
 pub(crate) const OPENCODE_MCP: McpAppContract = McpAppContract {
     catalog_column: McpCatalogColumn::new("enabled_opencode"),
     target: McpConfigTarget::OpenCode,
+    resource: McpConfigResource::LogicalTarget(LogicalTarget::OpenCodeConfig),
     preserves_disabled_entry: true,
     supports_cwd: false,
 };
 pub(crate) const HERMES_MCP: McpAppContract = McpAppContract {
     catalog_column: McpCatalogColumn::new("enabled_hermes"),
     target: McpConfigTarget::Hermes,
+    resource: McpConfigResource::LogicalTarget(LogicalTarget::HermesConfig),
     preserves_disabled_entry: true,
     supports_cwd: false,
 };

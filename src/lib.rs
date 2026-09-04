@@ -33,6 +33,7 @@ pub mod pi;
 mod projection;
 mod provider;
 mod registry;
+mod resource;
 mod simple_provider;
 mod skill;
 mod yaml_patch;
@@ -49,8 +50,8 @@ pub use mcp::{
     capture_mcp_native_snapshot, import_mcp_servers, mcp_app_contract, mcp_catalog_columns,
     mcp_config_target, mcp_server_exists, mcp_servers_equivalent, project_mcp_server,
     project_mcp_servers, replace_mcp_servers, validate_mcp_server, validate_mcp_server_for_app,
-    McpAppContract, McpCatalogColumn, McpConfigError, McpConfigTarget, McpImport,
-    McpNativeSnapshot, McpServerProjection,
+    McpAppContract, McpCatalogColumn, McpConfigError, McpConfigResource, McpConfigTarget,
+    McpImport, McpNativeSnapshot, McpServerProjection,
 };
 pub use native_import::{
     HermesProviderSource, NativeImportCandidate, NativeImportContext, NativeImportError,
@@ -71,6 +72,7 @@ pub use registry::{
     builtin_app_registry, AppCapability, AppDescriptor, BuiltinAppRegistry,
     ProviderConfigurationMode,
 };
+pub use resource::NativeResourcePath;
 pub use simple_provider::{
     builtin_simple_provider_forms, extract_simple_provider_values,
     project_simple_provider_settings, simple_provider_form, SimpleProviderError,
