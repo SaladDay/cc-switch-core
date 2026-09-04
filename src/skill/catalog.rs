@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, fmt, path::Path};
 
 use thiserror::Error;
 
@@ -13,13 +13,23 @@ const MAX_SKILL_DESCRIPTION_BYTES: usize = 16 * 1024;
 ///
 /// Repository and update metadata remain host-owned because switching does not
 /// consume them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SkillCatalogEntry {
     id: String,
     name: String,
     description: Option<String>,
     directory: String,
     selections: Vec<(SkillCatalogColumn, bool)>,
+}
+
+impl fmt::Debug for SkillCatalogEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SkillCatalogEntry")
+            .field("selection_count", &self.selections.len())
+            .field("contents", &"[redacted]")
+            .finish()
+    }
 }
 
 impl SkillCatalogEntry {
@@ -186,12 +196,12 @@ fn is_windows_reserved_directory(directory: &str) -> bool {
 }
 
 /// A malformed shared-catalog row rejected before any path is joined.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SkillCatalogEntryError {
     #[error("invalid Skill catalog field: {field}")]
     InvalidText { field: &'static str },
-    #[error("invalid Skill directory: {directory:?}")]
+    #[error("invalid Skill directory")]
     InvalidDirectory { directory: String },
     #[error("duplicate Skill catalog column: {column}")]
     DuplicateColumn { column: &'static str },
@@ -199,6 +209,32 @@ pub enum SkillCatalogEntryError {
     MissingColumn { column: &'static str },
     #[error("Skill description exceeds the {limit}-byte limit")]
     DescriptionTooLarge { limit: usize },
+}
+
+impl fmt::Debug for SkillCatalogEntryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidText { field } => formatter
+                .debug_struct("InvalidText")
+                .field("field", field)
+                .finish(),
+            Self::InvalidDirectory { .. } => {
+                formatter.write_str("InvalidDirectory { directory: [redacted] }")
+            }
+            Self::DuplicateColumn { column } => formatter
+                .debug_struct("DuplicateColumn")
+                .field("column", column)
+                .finish(),
+            Self::MissingColumn { column } => formatter
+                .debug_struct("MissingColumn")
+                .field("column", column)
+                .finish(),
+            Self::DescriptionTooLarge { limit } => formatter
+                .debug_struct("DescriptionTooLarge")
+                .field("limit", limit)
+                .finish(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -297,5 +333,37 @@ mod tests {
                 Err(SkillCatalogEntryError::InvalidDirectory { .. })
             ));
         }
+    }
+
+    #[test]
+    fn catalog_debug_and_validation_errors_redact_contents() {
+        let entry = SkillCatalogEntry::try_new(
+            "private-id",
+            "private-name",
+            Some("private-description".to_owned()),
+            "private-directory",
+            selections(),
+        )
+        .expect("valid private catalog row");
+        let debug = format!("{entry:?}");
+        for secret in [
+            "private-id",
+            "private-name",
+            "private-description",
+            "private-directory",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+
+        let error = SkillCatalogEntry::try_new(
+            "id",
+            "name",
+            None,
+            "private/secret-directory",
+            selections(),
+        )
+        .expect_err("reject private directory");
+        assert!(!error.to_string().contains("private/secret-directory"));
+        assert!(!format!("{error:?}").contains("private/secret-directory"));
     }
 }

@@ -1,10 +1,17 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use cc_switch_core::{
-    skill_catalog_columns, SkillCatalogColumn, SkillCatalogEntry, SkillCatalogEntryError,
-    SkillSwitchPlan,
+    builtin_app_registry, skill_catalog_columns, AppType, SkillCatalogColumn, SkillCatalogEntry,
+    SkillCatalogEntryError, SkillSwitchPlan,
 };
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, params_from_iter,
+    types::{ToSqlOutput, Value, ValueRef},
+    Connection, OptionalExtension, Row, ToSql, Transaction, TransactionBehavior,
+};
 
 use crate::{source_fingerprint, ExistingColumn, SharedStoreError};
 
@@ -62,12 +69,63 @@ impl SkillColumn {
 }
 
 struct RawSkill {
-    id: String,
-    name: String,
-    description: Option<String>,
-    directory: String,
-    selections: Vec<i64>,
     host_fingerprint: [u8; 32],
+    source_fingerprint: [u8; 32],
+    source_columns: Vec<String>,
+    source_values: Vec<RawSqlValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RawSqlValue {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+impl RawSqlValue {
+    fn from_value(value: ValueRef<'_>) -> Self {
+        match value {
+            ValueRef::Null => Self::Null,
+            ValueRef::Integer(value) => Self::Integer(value),
+            ValueRef::Real(value) => {
+                let canonical = if value == 0.0 { 0.0 } else { value };
+                Self::Real(canonical.to_bits())
+            }
+            ValueRef::Text(value) => Self::Text(value.to_vec()),
+            ValueRef::Blob(value) => Self::Blob(value.to_vec()),
+        }
+    }
+
+    fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(value) => std::str::from_utf8(value).ok(),
+            Self::Null | Self::Integer(_) | Self::Real(_) | Self::Blob(_) => None,
+        }
+    }
+
+    fn sqlite_type(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Integer(_) => "integer",
+            Self::Real(_) => "real",
+            Self::Text(_) => "text",
+            Self::Blob(_) => "blob",
+        }
+    }
+}
+
+impl ToSql for RawSqlValue {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(match self {
+            Self::Null => ToSqlOutput::Owned(Value::Null),
+            Self::Integer(value) => ToSqlOutput::Owned(Value::Integer(*value)),
+            Self::Real(value) => ToSqlOutput::Owned(Value::Real(f64::from_bits(*value))),
+            Self::Text(value) => ToSqlOutput::Borrowed(ValueRef::Text(value)),
+            Self::Blob(value) => ToSqlOutput::Borrowed(ValueRef::Blob(value)),
+        })
+    }
 }
 
 struct StoredSkill {
@@ -75,8 +133,122 @@ struct StoredSkill {
     host_fingerprint: [u8; 32],
 }
 
+struct SkillCatalogReplacement<'value> {
+    id: &'value str,
+    name: &'value str,
+    description: Option<&'value str>,
+    directory: &'value str,
+    selections: &'value [(SkillCatalogColumn, bool)],
+}
+
+/// One unvalidated row from the shared installed-Skill catalog.
+///
+/// The raw source stays opaque so malformed legacy rows remain removable
+/// without exposing host data. [`SkillCatalogRow::values`] returns a typed
+/// view only when every shared field has its canonical SQLite storage type.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SkillCatalogRow {
+    values: Option<SkillCatalogValues>,
+    selections: Option<Vec<(SkillCatalogColumn, bool)>>,
+    host_fingerprint: [u8; 32],
+    source_fingerprint: [u8; 32],
+    source_columns: Vec<String>,
+    source_values: Vec<RawSqlValue>,
+}
+
+/// Typed shared fields from one raw Skill catalog row.
+///
+/// Values are storage-valid but deliberately not subject to product path or
+/// display-text policy.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SkillCatalogValues {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub directory: String,
+    selections: Vec<(SkillCatalogColumn, bool)>,
+}
+
+impl SkillCatalogRow {
+    /// Returns the typed shared fields, or `None` for a malformed legacy row.
+    pub fn values(&self) -> Option<&SkillCatalogValues> {
+        self.values.as_ref()
+    }
+
+    /// Returns registry selections when those individual values are valid.
+    pub fn selections(
+        &self,
+    ) -> Option<
+        impl ExactSizeIterator<Item = (SkillCatalogColumn, bool)> + DoubleEndedIterator + Clone + '_,
+    > {
+        self.selections
+            .as_ref()
+            .map(|selections| selections.iter().copied())
+    }
+
+    /// Returns one registry selection when the selection set is valid.
+    pub fn selected_for(&self, app: &AppType) -> Option<bool> {
+        let column = builtin_app_registry()
+            .for_app(app)
+            .skill_contract()?
+            .catalog_column();
+        self.selections()?
+            .find_map(|(candidate, selected)| (candidate == column).then_some(selected))
+    }
+
+    /// Returns the identifier when that individual value is valid UTF-8 text.
+    pub fn id(&self) -> Option<&str> {
+        self.source_values.first().and_then(RawSqlValue::text)
+    }
+
+    /// Identifies the complete source row, including unknown host columns,
+    /// without exposing their contents.
+    pub fn source_fingerprint(&self) -> &[u8; 32] {
+        &self.source_fingerprint
+    }
+}
+
+impl fmt::Debug for SkillCatalogRow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SkillCatalogRow")
+            .field("has_valid_values", &self.values.is_some())
+            .field("has_valid_selections", &self.selections.is_some())
+            .field("source", &"[redacted]")
+            .finish()
+    }
+}
+
+impl SkillCatalogValues {
+    /// Returns the complete set of registry-owned selections in registry order.
+    pub fn selections(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (SkillCatalogColumn, bool)> + DoubleEndedIterator + Clone + '_
+    {
+        self.selections.iter().copied()
+    }
+
+    /// Returns this row's selection for one registry application.
+    pub fn selected_for(&self, app: &AppType) -> Option<bool> {
+        let column = builtin_app_registry()
+            .for_app(app)
+            .skill_contract()?
+            .catalog_column();
+        self.selections
+            .iter()
+            .find_map(|(candidate, selected)| (*candidate == column).then_some(*selected))
+    }
+}
+
+impl fmt::Debug for SkillCatalogValues {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SkillCatalogValues { [redacted] }")
+    }
+}
+
 struct SkillProjection {
     selections: Vec<SkillCatalogColumn>,
+    columns: Vec<String>,
     select_list: String,
     host_offset: usize,
 }
@@ -143,6 +315,160 @@ impl SkillWriteGuard {
             &format!(
                 "SELECT updates = 1 AND violations = 0 FROM temp.\"{}\"",
                 self.table
+            ),
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    fn remove(self, connection: &Connection) -> rusqlite::Result<()> {
+        for trigger in self.triggers.into_iter().rev() {
+            connection.execute_batch(&format!("DROP TRIGGER temp.\"{trigger}\";"))?;
+        }
+        connection.execute_batch(&format!("DROP TABLE temp.\"{}\";", self.table))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SkillRowOperation {
+    Insert,
+    Delete,
+}
+
+struct SkillRowWriteGuard {
+    table: String,
+    triggers: Vec<String>,
+    duplicate_deletes_allowed: bool,
+}
+
+impl SkillRowWriteGuard {
+    fn install(
+        connection: &Connection,
+        operation: SkillRowOperation,
+        target: Option<&SkillCatalogRow>,
+    ) -> rusqlite::Result<Self> {
+        let id = NEXT_SKILL_WRITE_GUARD.fetch_add(1, Ordering::Relaxed);
+        let table = format!("cc_switch_skill_row_guard_{id}");
+        let target = match operation {
+            SkillRowOperation::Insert => None,
+            SkillRowOperation::Delete => Some(target.ok_or(rusqlite::Error::InvalidQuery)?),
+        };
+        let target_columns = target.map_or_else(Vec::new, |target| {
+            (0..target.source_values.len())
+                .map(|index| format!("target_{index}"))
+                .collect::<Vec<_>>()
+        });
+        let target_definition = target_columns
+            .iter()
+            .map(|column| format!(", \"{column}\""))
+            .collect::<String>();
+        connection.execute_batch(&format!(
+            "CREATE TEMP TABLE \"{table}\" (
+                writes INTEGER NOT NULL,
+                violations INTEGER NOT NULL
+                {target_definition}
+             );"
+        ))?;
+        let guard_sql = format!(
+            "INSERT INTO temp.\"{table}\" VALUES ({})",
+            (1..=2 + target_columns.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let zeroes = [Value::Integer(0), Value::Integer(0)];
+        let mut guard_parameters = zeroes
+            .iter()
+            .map(|value| value as &dyn ToSql)
+            .collect::<Vec<_>>();
+        if let Some(target) = target {
+            guard_parameters.extend(target.source_values.iter().map(|value| value as &dyn ToSql));
+        }
+        execute_statement_consuming_rows(
+            connection,
+            &guard_sql,
+            params_from_iter(guard_parameters),
+        )?;
+
+        let allowed = match operation {
+            SkillRowOperation::Insert => "INSERT",
+            SkillRowOperation::Delete => "DELETE",
+        };
+        let mut triggers = Vec::new();
+        let allowed_trigger = format!("cc_switch_skill_row_allow_{id}");
+        let guard_body = target.map_or_else(
+            || {
+                format!(
+                    "UPDATE \"{table}\"
+                        SET violations = violations + (writes != 0),
+                            writes = writes + (writes = 0);
+                     SELECT CASE WHEN (SELECT violations FROM \"{table}\") != 0
+                        THEN RAISE(IGNORE) END;"
+                )
+            },
+            |target| {
+                let target_matches = target
+                    .source_columns
+                    .iter()
+                    .zip(&target_columns)
+                    .map(|(source, target)| {
+                        format!(
+                            "typeof(OLD.{source}) = typeof((SELECT \"{target}\" FROM \"{table}\"))
+                             AND OLD.{source} COLLATE BINARY IS
+                                 (SELECT \"{target}\" FROM \"{table}\")",
+                            source = quoted_identifier(source),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                format!(
+                    "UPDATE \"{table}\"
+                        SET violations = violations + NOT ({target_matches}),
+                            writes = writes + ({target_matches});
+                     SELECT CASE
+                        WHEN (SELECT violations FROM \"{table}\") != 0
+                          OR (SELECT writes FROM \"{table}\") > 1
+                        THEN RAISE(IGNORE) END;"
+                )
+            },
+        );
+        connection.execute_batch(&format!(
+            "CREATE TEMP TRIGGER \"{allowed_trigger}\" BEFORE {allowed} ON main.skills BEGIN
+                {guard_body}
+             END;"
+        ))?;
+        triggers.push(allowed_trigger);
+
+        for blocked in ["INSERT", "UPDATE", "DELETE"] {
+            if blocked == allowed {
+                continue;
+            }
+            let trigger = format!("cc_switch_skill_row_block_{id}_{}", triggers.len());
+            connection.execute_batch(&format!(
+                "CREATE TEMP TRIGGER \"{trigger}\" BEFORE {blocked} ON main.skills BEGIN
+                    UPDATE \"{table}\" SET violations = violations + 1;
+                    SELECT RAISE(IGNORE);
+                 END;"
+            ))?;
+            triggers.push(trigger);
+        }
+        Ok(Self {
+            table,
+            triggers,
+            duplicate_deletes_allowed: target.is_some(),
+        })
+    }
+
+    fn accepted(&self, connection: &Connection) -> rusqlite::Result<bool> {
+        connection.query_row(
+            &format!(
+                "SELECT {} AND violations = 0 FROM temp.\"{}\"",
+                if self.duplicate_deletes_allowed {
+                    "writes >= 1"
+                } else {
+                    "writes = 1"
+                },
+                self.table,
             ),
             [],
             |row| row.get(0),
@@ -229,6 +555,17 @@ fn quoted_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+fn execute_statement_consuming_rows<P: rusqlite::Params>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(sql)?;
+    let mut rows = statement.query(params)?;
+    while rows.next()?.is_some() {}
+    Ok(())
+}
+
 /// Result of applying the catalog part of a Core Skill switch plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
@@ -270,7 +607,7 @@ pub fn read_skill_catalog(
     connection: &Connection,
 ) -> Result<Vec<SkillCatalogEntry>, SharedStoreError> {
     let projection = core_skill_projection();
-    Ok(read_skill_rows(connection, &projection)?
+    Ok(read_stored_skill_rows(connection, &projection)?
         .into_iter()
         .map(|skill| skill.entry)
         .collect())
@@ -291,6 +628,239 @@ pub fn read_skill_catalog_entry(
         .optional()?
         .map(|row| skill_from_raw(row, &projection.selections).map(|skill| skill.entry))
         .transpose()
+}
+
+/// Reads every shared catalog row without decoding failures from malformed
+/// legacy values. The schema and typed values still follow the Core registry.
+pub fn read_skill_catalog_rows(
+    connection: &Connection,
+) -> Result<Vec<SkillCatalogRow>, SharedStoreError> {
+    let projection = skill_write_projection(connection)?;
+    Ok(read_raw_skill_rows(connection, &projection)?
+        .into_iter()
+        .map(|row| skill_catalog_row_from_raw(row, &projection.selections))
+        .collect())
+}
+
+/// Reads one shared catalog row by its binary identifier.
+pub fn read_skill_catalog_row(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<SkillCatalogRow>, SharedStoreError> {
+    let projection = skill_write_projection(connection)?;
+    let sql = format!(
+        "SELECT {} FROM main.skills AS skills WHERE id COLLATE BINARY = ?1",
+        projection.select_list
+    );
+    Ok(connection
+        .query_row(&sql, [id], |row| raw_skill(row, &projection))
+        .optional()?
+        .map(|row| skill_catalog_row_from_raw(row, &projection.selections)))
+}
+
+/// Inserts one complete registry-owned Skill catalog row when its binary
+/// identifier is absent. Identity and directory strings are stored without
+/// product-level path validation; product metadata columns retain defaults.
+pub fn insert_skill_catalog_if_absent(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    name: &str,
+    description: Option<&str>,
+    directory: &str,
+    selections: impl IntoIterator<Item = (SkillCatalogColumn, bool)>,
+) -> Result<SkillCatalogWriteOutcome, SharedStoreError> {
+    prepare_skill_catalog_write(transaction)?;
+    if read_skill_catalog_row(transaction, id)
+        .map_err(|error| redact_skill_catalog_store_error(error, transaction.is_autocommit()))?
+        .is_some()
+    {
+        return Ok(SkillCatalogWriteOutcome::NotApplied);
+    }
+    let before = read_skill_catalog_rows(transaction)
+        .map_err(|error| redact_skill_catalog_store_error(error, transaction.is_autocommit()))?;
+    let selections = complete_skill_selections(selections)?;
+    let mut columns = vec!["id", "name", "description", "directory"];
+    columns.extend(selections.iter().map(|(column, _)| column.as_str()));
+    let placeholders = (1..=columns.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "INSERT INTO main.skills ({}) VALUES ({placeholders})",
+        columns
+            .into_iter()
+            .map(quoted_identifier)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut values = vec![
+        Value::Text(id.to_owned()),
+        Value::Text(name.to_owned()),
+        description.map_or(Value::Null, |value| Value::Text(value.to_owned())),
+        Value::Text(directory.to_owned()),
+    ];
+    values.extend(
+        selections
+            .iter()
+            .map(|(_, selected)| Value::Integer(i64::from(*selected))),
+    );
+    execute_skill_row_write(
+        transaction,
+        &sql,
+        params_from_iter(values.iter()),
+        SkillRowOperation::Insert,
+        None,
+        |connection| {
+            let after = read_skill_catalog_rows(connection)?;
+            let inserted = after.iter().find(|row| row.id() == Some(id));
+            Ok(after.len() == before.len() + 1
+                && inserted.is_some_and(|row| {
+                    row.values().is_some_and(|values| {
+                        values.name == name
+                            && values.description.as_deref() == description
+                            && values.directory == directory
+                            && values.selections().eq(selections.iter().copied())
+                    }) && rows_without(&after, row)
+                        .is_some_and(|remaining| rows_match_unordered(&remaining, &before))
+                }))
+        },
+    )
+}
+
+/// Replaces the shared base fields and registry-owned selections only when the
+/// supplied raw row is unchanged. Strings are not path-validated; product
+/// metadata and unknown columns are never assigned.
+pub fn update_skill_catalog_if_unchanged(
+    transaction: &mut Transaction<'_>,
+    current: &SkillCatalogRow,
+    id: &str,
+    name: &str,
+    description: Option<&str>,
+    directory: &str,
+    replacements: impl IntoIterator<Item = (SkillCatalogColumn, bool)>,
+) -> Result<SkillCatalogWriteOutcome, SharedStoreError> {
+    prepare_skill_catalog_write(transaction)?;
+    if !skill_snapshot_is_current(transaction, current)
+        .map_err(|error| redact_skill_catalog_store_error(error, transaction.is_autocommit()))?
+    {
+        return Ok(SkillCatalogWriteOutcome::NotApplied);
+    }
+    let replacements = complete_skill_selections(replacements)?;
+    let mut desired_values = vec![
+        RawSqlValue::Text(id.as_bytes().to_vec()),
+        RawSqlValue::Text(name.as_bytes().to_vec()),
+        description.map_or(RawSqlValue::Null, |value| {
+            RawSqlValue::Text(value.as_bytes().to_vec())
+        }),
+        RawSqlValue::Text(directory.as_bytes().to_vec()),
+    ];
+    desired_values.extend(
+        replacements
+            .iter()
+            .map(|(_, selected)| RawSqlValue::Integer(i64::from(*selected))),
+    );
+    let changes = current
+        .source_values
+        .iter()
+        .zip(desired_values.iter())
+        .zip(current.source_columns.iter())
+        .filter(|((current, desired), _)| current != desired)
+        .map(|((_, desired), column)| (column.clone(), desired.clone()))
+        .collect::<Vec<_>>();
+    if changes.is_empty() {
+        return Ok(SkillCatalogWriteOutcome::Applied);
+    }
+    for (column, _) in &changes {
+        if let Some((selection, _)) = replacements
+            .iter()
+            .find(|(selection, _)| selection.as_str() == column)
+        {
+            verify_skill_foreign_key_write_contract(transaction, *selection).map_err(|error| {
+                redact_skill_catalog_store_error(error, transaction.is_autocommit())
+            })?;
+        }
+    }
+
+    let before = read_skill_catalog_rows(transaction)
+        .map_err(|error| redact_skill_catalog_store_error(error, transaction.is_autocommit()))?;
+    let assignments = changes
+        .iter()
+        .enumerate()
+        .map(|(index, (column, _))| format!("{} = ?{}", quoted_identifier(column), index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let snapshot_predicate = skill_snapshot_predicate(current, changes.len() + 1);
+    let sql = format!(
+        "UPDATE main.skills SET {assignments}
+         WHERE {snapshot_predicate}"
+    );
+    let mut parameters = changes
+        .iter()
+        .map(|(_, value)| value as &dyn ToSql)
+        .collect::<Vec<_>>();
+    parameters.extend(
+        current
+            .source_values
+            .iter()
+            .map(|value| value as &dyn ToSql),
+    );
+    let replacement = SkillCatalogReplacement {
+        id,
+        name,
+        description,
+        directory,
+        selections: &replacements,
+    };
+    execute_skill_catalog_write(
+        transaction,
+        &sql,
+        params_from_iter(parameters),
+        |connection| {
+            let after = read_skill_catalog_rows(connection)?;
+            Ok(skill_rows_match_replacement(
+                &before,
+                &after,
+                current,
+                &replacement,
+            ))
+        },
+    )
+}
+
+/// Deletes one raw Skill catalog row only when it is unchanged. This includes
+/// legacy rows whose identifier is `NULL`. Host triggers and foreign keys may
+/// clean dependent rows, but they cannot mutate another Skill row.
+pub fn delete_skill_catalog_if_unchanged(
+    transaction: &mut Transaction<'_>,
+    current: &SkillCatalogRow,
+) -> Result<SkillCatalogWriteOutcome, SharedStoreError> {
+    prepare_skill_catalog_write(transaction)?;
+    if !skill_snapshot_is_current(transaction, current)
+        .map_err(|error| redact_skill_catalog_store_error(error, transaction.is_autocommit()))?
+    {
+        return Ok(SkillCatalogWriteOutcome::NotApplied);
+    }
+    let before = read_skill_catalog_rows(transaction)
+        .map_err(|error| redact_skill_catalog_store_error(error, transaction.is_autocommit()))?;
+    let snapshot_predicate = skill_snapshot_predicate(current, 1);
+    let sql = format!("DELETE FROM main.skills WHERE {snapshot_predicate}");
+    let parameters = current
+        .source_values
+        .iter()
+        .map(|value| value as &dyn ToSql)
+        .collect::<Vec<_>>();
+    execute_skill_row_write(
+        transaction,
+        &sql,
+        params_from_iter(parameters),
+        SkillRowOperation::Delete,
+        Some(current),
+        |connection| {
+            let after = read_skill_catalog_rows(connection)?;
+            Ok(rows_without(&before, current)
+                .is_some_and(|remaining| rows_match_unordered(&remaining, &after)))
+        },
+    )
 }
 
 /// Applies only the shared-catalog part of a Core Skill switch plan.
@@ -356,13 +926,23 @@ pub fn apply_skill_catalog_plan(
 
 fn read_skill_catalog_state(connection: &Connection) -> Result<Vec<StoredSkill>, SharedStoreError> {
     let projection = skill_write_projection(connection)?;
-    read_skill_rows(connection, &projection)
+    read_stored_skill_rows(connection, &projection)
 }
 
-fn read_skill_rows(
+fn read_stored_skill_rows(
     connection: &Connection,
     projection: &SkillProjection,
 ) -> Result<Vec<StoredSkill>, SharedStoreError> {
+    read_raw_skill_rows(connection, projection)?
+        .into_iter()
+        .map(|row| skill_from_raw(row, &projection.selections))
+        .collect()
+}
+
+fn read_raw_skill_rows(
+    connection: &Connection,
+    projection: &SkillProjection,
+) -> Result<Vec<RawSkill>, SharedStoreError> {
     let sql = format!(
         "SELECT {} FROM main.skills AS skills
          ORDER BY name COLLATE BINARY, id COLLATE BINARY",
@@ -370,27 +950,57 @@ fn read_skill_rows(
     );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map([], |row| raw_skill(row, projection))?;
-    rows.map(|row| skill_from_raw(row?, &projection.selections))
-        .collect()
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(SharedStoreError::from)
+}
+
+fn skill_snapshot_is_current(
+    connection: &Connection,
+    current: &SkillCatalogRow,
+) -> Result<bool, SharedStoreError> {
+    Ok(read_skill_catalog_rows(connection)?
+        .iter()
+        .any(|row| row == current))
+}
+
+fn skill_snapshot_predicate(current: &SkillCatalogRow, first_parameter: usize) -> String {
+    current
+        .source_columns
+        .iter()
+        .zip(&current.source_values)
+        .enumerate()
+        .map(|(offset, (column, value))| {
+            format!(
+                "typeof({}) = '{}' AND {} COLLATE BINARY IS ?{}",
+                quoted_identifier(column),
+                value.sqlite_type(),
+                quoted_identifier(column),
+                first_parameter + offset
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 fn core_skill_projection() -> SkillProjection {
     let selections = skill_catalog_columns().collect::<Vec<_>>();
-    let mut fields = vec![
+    let mut columns = vec![
         "id".to_owned(),
         "name".to_owned(),
         "description".to_owned(),
         "directory".to_owned(),
     ];
-    fields.extend(
-        selections
-            .iter()
-            .map(|column| quoted_skill_column(column.as_str())),
-    );
-    let host_offset = fields.len();
+    columns.extend(selections.iter().map(|column| column.as_str().to_owned()));
+    let host_offset = columns.len();
+    let select_list = columns
+        .iter()
+        .map(|column| quoted_skill_column(column))
+        .collect::<Vec<_>>()
+        .join(", ");
     SkillProjection {
         selections,
-        select_list: fields.join(", "),
+        columns,
+        select_list,
         host_offset,
     }
 }
@@ -408,11 +1018,18 @@ fn skill_write_projection(connection: &Connection) -> Result<SkillProjection, Sh
                     .iter()
                     .any(|selection| selection.as_str() == column.name)
         })
-        .map(|column| quoted_skill_column(&column.name))
+        .map(|column| column.name)
         .collect::<Vec<_>>();
     if !host_columns.is_empty() {
+        projection.columns.extend(host_columns);
         projection.select_list.push_str(", ");
-        projection.select_list.push_str(&host_columns.join(", "));
+        projection.select_list.push_str(
+            &projection.columns[projection.host_offset..]
+                .iter()
+                .map(|column| quoted_skill_column(column))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     }
     Ok(projection)
 }
@@ -422,46 +1039,123 @@ fn quoted_skill_column(column: &str) -> String {
 }
 
 fn raw_skill(row: &Row<'_>, projection: &SkillProjection) -> rusqlite::Result<RawSkill> {
-    let selections = (0..projection.selections.len())
-        .map(|offset| row.get(4 + offset))
-        .collect::<Result<Vec<i64>, _>>()?;
+    let source_values = (0..projection.columns.len())
+        .map(|index| row.get_ref(index).map(RawSqlValue::from_value))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(RawSkill {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        description: row.get(2)?,
-        directory: row.get(3)?,
-        selections,
         host_fingerprint: source_fingerprint(row, projection.host_offset)?,
+        source_fingerprint: source_fingerprint(row, 0)?,
+        source_columns: projection.columns.clone(),
+        source_values,
     })
+}
+
+fn skill_catalog_row_from_raw(row: RawSkill, selections: &[SkillCatalogColumn]) -> SkillCatalogRow {
+    let values = skill_catalog_values(&row.source_values, selections).ok();
+    let selections = typed_skill_selections(&row.source_values, selections).ok();
+    SkillCatalogRow {
+        values,
+        selections,
+        host_fingerprint: row.host_fingerprint,
+        source_fingerprint: row.source_fingerprint,
+        source_columns: row.source_columns,
+        source_values: row.source_values,
+    }
 }
 
 fn skill_from_raw(
     row: RawSkill,
     selections: &[SkillCatalogColumn],
 ) -> Result<StoredSkill, SharedStoreError> {
-    let selected_values = row
-        .selections
-        .into_iter()
-        .map(|selected| match selected {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(SharedStoreError::InvalidDatabase(
-                "skills selection must be 0 or 1".to_owned(),
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let values = skill_catalog_values(&row.source_values, selections)?;
     let entry = SkillCatalogEntry::try_new(
-        row.id,
-        row.name,
-        row.description,
-        row.directory,
-        selections.iter().copied().zip(selected_values),
+        values.id,
+        values.name,
+        values.description,
+        values.directory,
+        values.selections,
     )
     .map_err(invalid_skill_row)?;
     Ok(StoredSkill {
         entry,
         host_fingerprint: row.host_fingerprint,
     })
+}
+
+fn skill_catalog_values(
+    source_values: &[RawSqlValue],
+    selections: &[SkillCatalogColumn],
+) -> Result<SkillCatalogValues, SharedStoreError> {
+    if source_values.len() < 4 + selections.len() {
+        return Err(invalid_skill_storage_row());
+    }
+    let id = source_values[0]
+        .text()
+        .ok_or_else(invalid_skill_storage_row)?
+        .to_owned();
+    let name = source_values[1]
+        .text()
+        .ok_or_else(invalid_skill_storage_row)?
+        .to_owned();
+    let description = match &source_values[2] {
+        RawSqlValue::Null => None,
+        value => Some(
+            value
+                .text()
+                .ok_or_else(invalid_skill_storage_row)?
+                .to_owned(),
+        ),
+    };
+    let directory = source_values[3]
+        .text()
+        .ok_or_else(invalid_skill_storage_row)?
+        .to_owned();
+    let selections = typed_skill_selections(source_values, selections)?;
+    Ok(SkillCatalogValues {
+        id,
+        name,
+        description,
+        directory,
+        selections,
+    })
+}
+
+fn typed_skill_selections(
+    source_values: &[RawSqlValue],
+    selections: &[SkillCatalogColumn],
+) -> Result<Vec<(SkillCatalogColumn, bool)>, SharedStoreError> {
+    if source_values.len() < 4 + selections.len() {
+        return Err(invalid_skill_storage_row());
+    }
+    let selected_values = source_values[4..4 + selections.len()]
+        .iter()
+        .map(|value| match value {
+            RawSqlValue::Integer(0) => Ok(false),
+            RawSqlValue::Integer(1) => Ok(true),
+            _ => Err(SharedStoreError::InvalidDatabase(
+                "skills selection must be 0 or 1".to_owned(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(selections.iter().copied().zip(selected_values).collect())
+}
+
+fn invalid_skill_storage_row() -> SharedStoreError {
+    SharedStoreError::InvalidDatabase(
+        "skills row does not match the shared storage contract".to_owned(),
+    )
+}
+
+fn complete_skill_selections(
+    selections: impl IntoIterator<Item = (SkillCatalogColumn, bool)>,
+) -> Result<Vec<(SkillCatalogColumn, bool)>, SharedStoreError> {
+    let selections = selections.into_iter().collect::<Vec<_>>();
+    if !skill_catalog_columns().eq(selections.iter().map(|(column, _)| *column)) {
+        return Err(SharedStoreError::InvalidDatabase(
+            "Skill catalog selections must match the registry".to_owned(),
+        ));
+    }
+    Ok(selections)
 }
 
 fn skill_catalog_matches_change(
@@ -492,6 +1186,59 @@ fn skill_catalog_matches_change(
                     },
                 )
         })
+}
+
+fn rows_without(
+    rows: &[SkillCatalogRow],
+    removed: &SkillCatalogRow,
+) -> Option<Vec<SkillCatalogRow>> {
+    let index = rows.iter().position(|row| row == removed)?;
+    let mut remaining = rows.to_vec();
+    remaining.remove(index);
+    Some(remaining)
+}
+
+fn rows_match_unordered(left: &[SkillCatalogRow], right: &[SkillCatalogRow]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut unmatched = right.to_vec();
+    for row in left {
+        let Some(index) = unmatched.iter().position(|candidate| candidate == row) else {
+            return false;
+        };
+        unmatched.remove(index);
+    }
+    unmatched.is_empty()
+}
+
+fn skill_rows_match_replacement(
+    before: &[SkillCatalogRow],
+    after: &[SkillCatalogRow],
+    current: &SkillCatalogRow,
+    replacement: &SkillCatalogReplacement<'_>,
+) -> bool {
+    let candidates = after
+        .iter()
+        .filter(|row| {
+            row.source_values.first()
+                == Some(&RawSqlValue::Text(replacement.id.as_bytes().to_vec()))
+                && row.host_fingerprint == current.host_fingerprint
+                && row.values().is_some_and(|values| {
+                    values.id == replacement.id
+                        && values.name == replacement.name
+                        && values.description.as_deref() == replacement.description
+                        && values.directory == replacement.directory
+                        && values
+                            .selections()
+                            .eq(replacement.selections.iter().copied())
+                })
+        })
+        .collect::<Vec<_>>();
+    candidates.len() == 1
+        && rows_without(before, current)
+            .zip(rows_without(after, candidates[0]))
+            .is_some_and(|(before, after)| rows_match_unordered(&before, &after))
 }
 
 fn prepare_skill_catalog_write(transaction: &Transaction<'_>) -> Result<(), SharedStoreError> {
@@ -563,6 +1310,65 @@ where
         .map_err(|error| redact_skill_catalog_write_error(error, transaction_aborted))?;
     let result = (|| {
         let guard = SkillWriteGuard::install(&savepoint)?;
+        let changed = {
+            let mut statement = savepoint.prepare(sql)?;
+            let mut rows = statement.query(params)?;
+            while rows.next()?.is_some() {}
+            savepoint.changes() as usize
+        };
+        let postcondition_matches =
+            changed == 1 && guard.accepted(&savepoint)? && postcondition(&savepoint)?;
+        guard.remove(&savepoint)?;
+        Ok::<_, SharedStoreError>((changed, postcondition_matches))
+    })();
+    let (changed, postcondition_matches) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = savepoint.finish();
+            return Err(redact_skill_catalog_post_write_error(
+                error,
+                transaction.is_autocommit(),
+            ));
+        }
+    };
+    if changed > 1 {
+        savepoint.finish().map_err(|error| {
+            redact_skill_catalog_write_error(error, transaction.is_autocommit())
+        })?;
+        return Err(SharedStoreError::InvalidDatabase(
+            "Skill catalog write affected multiple rows".to_owned(),
+        ));
+    }
+    if !postcondition_matches {
+        savepoint.finish().map_err(|error| {
+            redact_skill_catalog_write_error(error, transaction.is_autocommit())
+        })?;
+        return Ok(SkillCatalogWriteOutcome::NotApplied);
+    }
+    savepoint
+        .commit()
+        .map_err(|error| redact_skill_catalog_write_error(error, transaction.is_autocommit()))?;
+    Ok(SkillCatalogWriteOutcome::Applied)
+}
+
+fn execute_skill_row_write<P, F>(
+    transaction: &mut Transaction<'_>,
+    sql: &str,
+    params: P,
+    operation: SkillRowOperation,
+    target: Option<&SkillCatalogRow>,
+    postcondition: F,
+) -> Result<SkillCatalogWriteOutcome, SharedStoreError>
+where
+    P: rusqlite::Params,
+    F: FnOnce(&Connection) -> Result<bool, SharedStoreError>,
+{
+    let transaction_aborted = transaction.is_autocommit();
+    let savepoint = transaction
+        .savepoint()
+        .map_err(|error| redact_skill_catalog_write_error(error, transaction_aborted))?;
+    let result = (|| {
+        let guard = SkillRowWriteGuard::install(&savepoint, operation, target)?;
         let changed = {
             let mut statement = savepoint.prepare(sql)?;
             let mut rows = statement.query(params)?;
@@ -862,6 +1668,47 @@ mod tests {
             .expect("selection column")
     }
 
+    fn catalog_values(row: &SkillCatalogRow) -> &SkillCatalogValues {
+        row.values().expect("storage-valid catalog row")
+    }
+
+    fn raw_text(row: &SkillCatalogRow, index: usize) -> Option<&str> {
+        row.source_values.get(index)?.text()
+    }
+
+    fn catalog_entry(
+        id: &str,
+        name: &str,
+        directory: &str,
+        selected_columns: &[&str],
+    ) -> SkillCatalogEntry {
+        SkillCatalogEntry::try_new(
+            id,
+            name,
+            None,
+            directory,
+            skill_catalog_columns().map(|column| {
+                let selected = selected_columns.contains(&column.as_str());
+                (column, selected)
+            }),
+        )
+        .expect("valid Skill catalog entry")
+    }
+
+    fn insert_catalog_entry(
+        transaction: &mut Transaction<'_>,
+        entry: &SkillCatalogEntry,
+    ) -> Result<SkillCatalogWriteOutcome, SharedStoreError> {
+        insert_skill_catalog_if_absent(
+            transaction,
+            entry.id(),
+            entry.name(),
+            entry.description(),
+            entry.directory(),
+            entry.selections(),
+        )
+    }
+
     #[test]
     fn creates_registry_catalog_with_compatible_product_metadata_columns() {
         let (_directory, database) = test_database();
@@ -1083,6 +1930,596 @@ mod tests {
             SharedStoreError::InvalidDatabase(message)
                 if message == "skills selection must be 0 or 1"
         ));
+    }
+
+    #[test]
+    fn catalog_crud_uses_registry_complete_values_and_full_row_cas() {
+        let (_directory, database) = test_database();
+        database.ensure_skill_schema().expect("initialize skills");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute("ALTER TABLE skills ADD COLUMN host_note TEXT", [])
+            .expect("add host column");
+        let entry = catalog_entry("demo", "Demo", "demo", &["enabled_grokbuild", "enabled_pi"]);
+
+        connection
+            .pragma_update(None, "count_changes", true)
+            .expect("enable count_changes");
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin insert");
+        assert_eq!(
+            insert_catalog_entry(&mut transaction, &entry).expect("insert catalog row"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit insert");
+        connection
+            .pragma_update(None, "count_changes", false)
+            .expect("disable count_changes");
+        let inserted = read_skill_catalog_row(&connection, "demo")
+            .expect("read inserted row")
+            .expect("row exists");
+        assert_eq!(
+            catalog_values(&inserted).selected_for(&AppType::GrokBuild),
+            Some(true)
+        );
+        assert_eq!(
+            catalog_values(&inserted).selected_for(&AppType::Pi),
+            Some(true)
+        );
+
+        connection
+            .execute(
+                "UPDATE skills SET host_note = 'changed' WHERE id = 'demo'",
+                [],
+            )
+            .expect("change host extension");
+        let replacement = catalog_entry(
+            "demo-updated",
+            "Demo Updated",
+            "demo-next",
+            &["enabled_claude", "enabled_grokbuild", "enabled_pi"],
+        );
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin stale update");
+        assert_eq!(
+            update_skill_catalog_if_unchanged(
+                &mut transaction,
+                &inserted,
+                replacement.id(),
+                replacement.name(),
+                replacement.description(),
+                replacement.directory(),
+                replacement.selections()
+            )
+            .expect("reject stale update"),
+            SkillCatalogWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit stale update");
+
+        let current = read_skill_catalog_row(&connection, "demo")
+            .expect("read current row")
+            .expect("row exists");
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin fresh update");
+        assert_eq!(
+            update_skill_catalog_if_unchanged(
+                &mut transaction,
+                &current,
+                replacement.id(),
+                replacement.name(),
+                replacement.description(),
+                replacement.directory(),
+                replacement.selections(),
+            )
+            .expect("apply fresh update"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit fresh update");
+        let updated = read_skill_catalog_row(&connection, "demo-updated")
+            .expect("read updated row")
+            .expect("row exists");
+        assert!(read_skill_catalog_row(&connection, "demo")
+            .expect("read old identity")
+            .is_none());
+        let updated_values = catalog_values(&updated);
+        assert_eq!(updated_values.selected_for(&AppType::Claude), Some(true));
+        assert_eq!(updated_values.selected_for(&AppType::GrokBuild), Some(true));
+        assert_eq!(updated_values.selected_for(&AppType::Pi), Some(true));
+        assert_eq!(updated_values.name, "Demo Updated");
+        assert_eq!(updated_values.directory, "demo-next");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT host_note FROM skills WHERE id = 'demo-updated'",
+                    [],
+                    |row| { row.get::<_, String>(0) }
+                )
+                .expect("read host extension"),
+            "changed"
+        );
+    }
+
+    #[test]
+    fn raw_catalog_rows_keep_host_paths_and_null_id_removable() {
+        let (_directory, database) = test_database();
+        database.ensure_skill_schema().expect("initialize skills");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "ALTER TABLE skills ADD COLUMN rowid INTEGER;
+                 ALTER TABLE skills ADD COLUMN host_dynamic;
+                 ALTER TABLE skills ADD COLUMN host_secret TEXT;",
+            )
+            .expect("add host extension columns");
+        let selections = skill_catalog_columns()
+            .map(|column| (column, false))
+            .collect::<Vec<_>>();
+
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin raw insert");
+        assert_eq!(
+            insert_skill_catalog_if_absent(
+                &mut transaction,
+                "host-skill",
+                "Host Skill",
+                Some("private description"),
+                "../.host-accepted",
+                selections.iter().copied(),
+            )
+            .expect("insert host path"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit raw insert");
+        connection
+            .execute(
+                "UPDATE skills SET host_secret = 'host-token-value'
+                 WHERE id = 'host-skill'",
+                [],
+            )
+            .expect("set private host extension");
+        let host_row = read_skill_catalog_row(&connection, "host-skill")
+            .expect("read host Skill")
+            .expect("host Skill exists");
+        for debug in [
+            format!("{host_row:?}"),
+            format!("{:?}", catalog_values(&host_row)),
+        ] {
+            assert!(!debug.contains("host-token-value"));
+            assert!(!debug.contains("private description"));
+            assert!(!debug.contains("../.host-accepted"));
+        }
+        assert_eq!(catalog_values(&host_row).directory, "../.host-accepted");
+
+        connection
+            .execute_batch(
+                "INSERT INTO skills (id, name, directory)
+                 VALUES (NULL, 'Legacy', 'legacy');
+                 INSERT INTO skills (id, name, directory)
+                 VALUES (x'80', 'Blob', 'blob');
+                 INSERT INTO skills (id, name, directory)
+                 VALUES (CAST(x'81' AS TEXT), 'Invalid UTF-8', 'invalid-utf8');
+                 INSERT INTO skills (
+                     id, name, description, directory, enabled_claude
+                 ) VALUES (
+                     'bad-description', 'Bad Description', x'82', 'bad-description', x'82'
+                 );
+                 INSERT INTO skills (id, name, directory, enabled_grokbuild)
+                 VALUES ('bad-name', CAST(x'83' AS TEXT), 'bad-name', 1);
+                 INSERT INTO skills (id, name, directory)
+                 VALUES ('bad-directory', 'Bad Directory', x'84');
+                 INSERT INTO skills (id, name, directory, enabled_claude)
+                 VALUES ('bad-selection', 'Bad Selection', 'bad-selection', x'85');
+                 PRAGMA count_changes = ON;",
+            )
+            .expect("insert malformed rows and enable count_changes");
+        let bad_name = read_skill_catalog_row(&connection, "bad-name")
+            .expect("read malformed display row")
+            .expect("malformed display row exists");
+        assert!(bad_name.values().is_none());
+        assert_eq!(bad_name.selected_for(&AppType::GrokBuild), Some(true));
+
+        let host = read_skill_catalog_row(&connection, "host-skill")
+            .expect("read host row beside malformed rows")
+            .expect("host row exists");
+        let host_values = catalog_values(&host);
+        let mut host_selections = host_values.selections().collect::<Vec<_>>();
+        host_selections
+            .iter_mut()
+            .find(|(column, _)| column.as_str() == "enabled_pi")
+            .expect("Pi selection")
+            .1 = true;
+        let mut transaction = crate::begin_immediate_transaction(&mut connection)
+            .expect("begin valid update beside malformed rows");
+        assert_eq!(
+            update_skill_catalog_if_unchanged(
+                &mut transaction,
+                &host,
+                host_values.id.as_str(),
+                &host_values.name,
+                host_values.description.as_deref(),
+                &host_values.directory,
+                host_selections,
+            )
+            .expect("update valid row beside malformed rows"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit valid update");
+
+        let mut transaction = crate::begin_immediate_transaction(&mut connection)
+            .expect("begin valid insert beside malformed rows");
+        assert_eq!(
+            insert_skill_catalog_if_absent(
+                &mut transaction,
+                "valid-beside-malformed",
+                "Valid",
+                None,
+                "valid",
+                selections.iter().copied(),
+            )
+            .expect("insert beside malformed rows"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit valid insert");
+        let valid = read_skill_catalog_row(&connection, "valid-beside-malformed")
+            .expect("read valid row")
+            .expect("valid row exists");
+        let mut transaction = crate::begin_immediate_transaction(&mut connection)
+            .expect("begin valid delete beside malformed rows");
+        assert_eq!(
+            delete_skill_catalog_if_unchanged(&mut transaction, &valid)
+                .expect("delete valid row beside malformed rows"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit valid delete");
+
+        let malformed = read_skill_catalog_row(&connection, "bad-description")
+            .expect("read repairable row")
+            .expect("repairable row exists");
+        assert!(malformed.values().is_none());
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin malformed repair");
+        assert_eq!(
+            update_skill_catalog_if_unchanged(
+                &mut transaction,
+                &malformed,
+                "bad-description",
+                "Bad Description",
+                None,
+                "bad-description",
+                selections.iter().copied(),
+            )
+            .expect("repair malformed shared fields"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit malformed repair");
+        assert!(read_skill_catalog_row(&connection, "bad-description")
+            .expect("read repaired row")
+            .expect("repaired row exists")
+            .values()
+            .is_some());
+
+        for id in [
+            "bad-description",
+            "bad-name",
+            "bad-directory",
+            "bad-selection",
+        ] {
+            let malformed = read_skill_catalog_row(&connection, id)
+                .expect("read malformed row")
+                .expect("malformed row exists");
+            let mut transaction = crate::begin_immediate_transaction(&mut connection)
+                .expect("begin malformed delete");
+            assert_eq!(
+                delete_skill_catalog_if_unchanged(&mut transaction, &malformed)
+                    .expect("delete malformed row"),
+                SkillCatalogWriteOutcome::Applied
+            );
+            transaction.commit().expect("commit malformed delete");
+        }
+        for _ in 0..3 {
+            let legacy = read_skill_catalog_rows(&connection)
+                .expect("read raw catalog")
+                .into_iter()
+                .find(|row| row.values().is_none())
+                .expect("legacy row exists");
+            assert!(legacy.id().is_none());
+            let mut transaction =
+                crate::begin_immediate_transaction(&mut connection).expect("begin legacy delete");
+            assert_eq!(
+                delete_skill_catalog_if_unchanged(&mut transaction, &legacy)
+                    .expect("delete legacy row"),
+                SkillCatalogWriteOutcome::Applied
+            );
+            transaction.commit().expect("commit legacy delete");
+        }
+        connection
+            .pragma_update(None, "count_changes", false)
+            .expect("disable count_changes");
+        let remaining = read_skill_catalog_rows(&connection).expect("read remaining catalog");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id(), Some("host-skill"));
+
+        connection
+            .execute_batch(
+                "INSERT INTO skills (id, name, directory) VALUES (NULL, 'Null A', 'null-a');
+                 INSERT INTO skills (id, name, directory) VALUES (NULL, 'Null B', 'null-b');",
+            )
+            .expect("insert ambiguous NULL identities");
+        let null_row = read_skill_catalog_rows(&connection)
+            .expect("read ambiguous rows")
+            .into_iter()
+            .find(|row| raw_text(row, 1) == Some("Null A"))
+            .expect("NULL row exists");
+        let host = read_skill_catalog_row(&connection, "host-skill")
+            .expect("read valid row beside NULL identities")
+            .expect("valid row exists");
+        let host_values = catalog_values(&host);
+        let mut replacements = host_values.selections().collect::<Vec<_>>();
+        replacements
+            .iter_mut()
+            .find(|(column, _)| column.as_str() == "enabled_claude")
+            .expect("Claude selection")
+            .1 = true;
+        let mut transaction = crate::begin_immediate_transaction(&mut connection)
+            .expect("begin valid update beside NULL identities");
+        assert_eq!(
+            update_skill_catalog_if_unchanged(
+                &mut transaction,
+                &host,
+                host.id().expect("valid host id"),
+                &host_values.name,
+                host_values.description.as_deref(),
+                &host_values.directory,
+                replacements,
+            )
+            .expect("update valid row"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit valid update");
+
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin ambiguous delete");
+        assert_eq!(
+            delete_skill_catalog_if_unchanged(&mut transaction, &null_row)
+                .expect("delete one NULL row by its complete snapshot"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit snapshot delete");
+        assert_eq!(
+            read_skill_catalog_rows(&connection)
+                .expect("read remaining NULL row")
+                .into_iter()
+                .filter(|row| row.values().is_none())
+                .count(),
+            1
+        );
+
+        connection
+            .execute(
+                "INSERT INTO skills (id, name, directory) VALUES (NULL, 'Null B', 'null-b')",
+                [],
+            )
+            .expect("insert physically indistinguishable NULL row");
+        let duplicate = read_skill_catalog_rows(&connection)
+            .expect("read duplicate NULL rows")
+            .into_iter()
+            .find(|row| raw_text(row, 1) == Some("Null B"))
+            .expect("duplicate snapshot exists");
+        let mut transaction = crate::begin_immediate_transaction(&mut connection)
+            .expect("begin duplicate snapshot delete");
+        assert_eq!(
+            delete_skill_catalog_if_unchanged(&mut transaction, &duplicate)
+                .expect("delete exactly one indistinguishable row"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit duplicate delete");
+        assert_eq!(
+            read_skill_catalog_rows(&connection)
+                .expect("read one remaining duplicate")
+                .into_iter()
+                .filter(|row| raw_text(row, 1) == Some("Null B"))
+                .count(),
+            1
+        );
+
+        connection
+            .execute_batch(
+                "INSERT INTO skills (id, name, directory, host_dynamic)
+                 VALUES (NULL, 'Dynamic', 'dynamic', 1);
+                 INSERT INTO skills (id, name, directory, host_dynamic)
+                 VALUES (NULL, 'Dynamic', 'dynamic', 1.0);",
+            )
+            .expect("insert rows distinguished by SQLite storage class");
+        let dynamic = read_skill_catalog_rows(&connection)
+            .expect("read storage-class rows")
+            .into_iter()
+            .find(|row| raw_text(row, 1) == Some("Dynamic"))
+            .expect("storage-class row exists");
+        let mut transaction = crate::begin_immediate_transaction(&mut connection)
+            .expect("begin storage-class delete");
+        assert_eq!(
+            delete_skill_catalog_if_unchanged(&mut transaction, &dynamic)
+                .expect("delete exactly one storage-class row"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit storage-class delete");
+        assert_eq!(
+            read_skill_catalog_rows(&connection)
+                .expect("read remaining storage-class row")
+                .into_iter()
+                .filter(|row| raw_text(row, 1) == Some("Dynamic"))
+                .count(),
+            1
+        );
+
+        connection
+            .execute_batch(
+                "INSERT INTO skills (id, name, directory, host_dynamic)
+                 VALUES (NULL, 'Signed Zero', 'signed-zero', -0.0);
+                 INSERT INTO skills (id, name, directory, host_dynamic)
+                 VALUES (NULL, 'Signed Zero', 'signed-zero', 0.0);",
+            )
+            .expect("insert SQLite-equivalent real rows");
+        let signed_zero = read_skill_catalog_rows(&connection)
+            .expect("read signed-zero rows")
+            .into_iter()
+            .filter(|row| raw_text(row, 1) == Some("Signed Zero"))
+            .nth(1)
+            .expect("second signed-zero row exists");
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin signed-zero delete");
+        assert_eq!(
+            delete_skill_catalog_if_unchanged(&mut transaction, &signed_zero)
+                .expect("delete one SQLite-equivalent real row"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit signed-zero delete");
+        assert_eq!(
+            read_skill_catalog_rows(&connection)
+                .expect("read remaining signed-zero row")
+                .into_iter()
+                .filter(|row| raw_text(row, 1) == Some("Signed Zero"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn raw_catalog_cas_uses_binary_comparison_with_nocase_columns() {
+        let (_directory, database) = test_database();
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "CREATE TABLE skills (
+                    id TEXT COLLATE NOCASE,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    directory TEXT NOT NULL,
+                    PRIMARY KEY (id COLLATE BINARY)
+                 );",
+            )
+            .expect("create host schema");
+        ensure_skill_schema(&mut connection).expect("upgrade host schema");
+        connection
+            .execute_batch(
+                "INSERT INTO skills (id, name, directory) VALUES ('A', 'Upper', 'upper');
+                 INSERT INTO skills (id, name, directory) VALUES ('a', 'Lower', 'lower');",
+            )
+            .expect("insert binary-distinct rows");
+
+        let upper = read_skill_catalog_row(&connection, "A")
+            .expect("read upper row")
+            .expect("upper row exists");
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin binary delete");
+        assert_eq!(
+            delete_skill_catalog_if_unchanged(&mut transaction, &upper)
+                .expect("delete exact binary row"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit binary delete");
+        assert!(read_skill_catalog_row(&connection, "A")
+            .expect("read removed upper row")
+            .is_none());
+        assert!(read_skill_catalog_row(&connection, "a")
+            .expect("read preserved lower row")
+            .is_some());
+    }
+
+    #[test]
+    fn catalog_delete_allows_host_cleanup_and_rejects_other_skill_writes() {
+        let (_directory, database) = test_database();
+        database.ensure_skill_schema().expect("initialize skills");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "CREATE TABLE host_skill_bindings (skill_id TEXT NOT NULL);
+                 CREATE TRIGGER clean_host_skill_binding AFTER DELETE ON skills BEGIN
+                    DELETE FROM host_skill_bindings WHERE skill_id = OLD.id;
+                 END;",
+            )
+            .expect("create cleanup contract");
+
+        for id in ["demo", "other"] {
+            let entry = catalog_entry(id, id, id, &[]);
+            let mut transaction =
+                crate::begin_immediate_transaction(&mut connection).expect("begin insert");
+            assert_eq!(
+                insert_catalog_entry(&mut transaction, &entry).expect("insert Skill"),
+                SkillCatalogWriteOutcome::Applied
+            );
+            transaction.commit().expect("commit insert");
+        }
+        connection
+            .execute("INSERT INTO host_skill_bindings VALUES ('demo')", [])
+            .expect("insert host binding");
+        let demo = read_skill_catalog_row(&connection, "demo")
+            .expect("read Skill")
+            .expect("Skill exists");
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin cleanup delete");
+        assert_eq!(
+            delete_skill_catalog_if_unchanged(&mut transaction, &demo).expect("delete Skill"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit cleanup delete");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM host_skill_bindings", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count host bindings"),
+            0
+        );
+
+        let entry = catalog_entry("demo", "demo", "demo", &[]);
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin reinsert");
+        assert_eq!(
+            insert_catalog_entry(&mut transaction, &entry).expect("reinsert Skill"),
+            SkillCatalogWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit reinsert");
+        connection
+            .execute_batch(
+                "INSERT INTO host_skill_bindings VALUES ('demo');
+                 CREATE TRIGGER rewrite_other_skill AFTER DELETE ON skills
+                 WHEN OLD.id = 'demo' BEGIN
+                    UPDATE skills SET name = 'rewritten' WHERE id = 'other';
+                 END;",
+            )
+            .expect("create invalid catalog trigger");
+        let demo = read_skill_catalog_row(&connection, "demo")
+            .expect("read Skill")
+            .expect("Skill exists");
+        let mut transaction =
+            crate::begin_immediate_transaction(&mut connection).expect("begin rejected delete");
+        assert_eq!(
+            delete_skill_catalog_if_unchanged(&mut transaction, &demo)
+                .expect("reject other-row rewrite"),
+            SkillCatalogWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit rejected delete");
+        assert!(read_skill_catalog_row(&connection, "demo")
+            .expect("read preserved Skill")
+            .is_some());
+        assert_eq!(
+            read_skill_catalog_row(&connection, "other")
+                .expect("read other Skill")
+                .expect("other Skill exists")
+                .values()
+                .expect("valid other Skill")
+                .name,
+            "other"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM host_skill_bindings", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count preserved bindings"),
+            1
+        );
     }
 
     #[test]

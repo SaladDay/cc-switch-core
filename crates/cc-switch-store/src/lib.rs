@@ -8,6 +8,7 @@ use std::{
     fmt,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -34,11 +35,14 @@ pub use mcp_native_link::{
     upsert_mcp_native_link, McpNativeLinkRow, McpTransactionGuard, MCP_NATIVE_LINKS_TABLE,
 };
 pub use skill::{
-    apply_skill_catalog_plan, ensure_skill_schema, read_skill_catalog, read_skill_catalog_entry,
-    SkillCatalogWriteOutcome, SKILLS_TABLE,
+    apply_skill_catalog_plan, delete_skill_catalog_if_unchanged, ensure_skill_schema,
+    insert_skill_catalog_if_absent, read_skill_catalog, read_skill_catalog_entry,
+    read_skill_catalog_row, read_skill_catalog_rows, update_skill_catalog_if_unchanged,
+    SkillCatalogRow, SkillCatalogValues, SkillCatalogWriteOutcome, SKILLS_TABLE,
 };
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+static NEXT_PROVIDER_HOST_CLEANUP_GUARD: AtomicU64 = AtomicU64::new(0);
 
 /// Canonical table shared by CC Switch products.
 pub const PROVIDERS_TABLE: &str = "providers";
@@ -969,6 +973,30 @@ pub fn delete_provider_if_unchanged(
     )
 }
 
+/// Deletes one unchanged provider while permitting cleanup outside the
+/// provider catalog.
+///
+/// Host triggers and foreign keys may remove dependent rows. Any attempt to
+/// insert, update, or delete another provider makes the write `NotApplied` and
+/// rolls the entire savepoint back.
+pub fn delete_provider_with_host_cleanup_if_unchanged(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    app_type: &str,
+    expected_fingerprint: &[u8; 32],
+) -> Result<ProviderWriteOutcome, SharedStoreError> {
+    if !provider_fingerprint_matches(transaction, id, app_type, expected_fingerprint)? {
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
+    execute_provider_write(
+        transaction,
+        "DELETE FROM main.providers
+         WHERE id COLLATE BINARY = ?1 AND app_type COLLATE BINARY = ?2",
+        params![id, app_type],
+        ProviderWriteGuard::TargetAbsentAllowHostCleanup { id, app_type },
+    )
+}
+
 #[derive(Clone, Copy)]
 enum ProviderWriteGuard<'guard, 'value> {
     None,
@@ -982,6 +1010,80 @@ enum ProviderWriteGuard<'guard, 'value> {
         id: &'value str,
         app_type: &'value str,
     },
+    TargetAbsentAllowHostCleanup {
+        id: &'value str,
+        app_type: &'value str,
+    },
+}
+
+struct ProviderHostCleanupGuard {
+    table: String,
+    triggers: Vec<String>,
+}
+
+impl ProviderHostCleanupGuard {
+    fn install(connection: &Connection, id: &str, app_type: &str) -> rusqlite::Result<Self> {
+        let guard_id = NEXT_PROVIDER_HOST_CLEANUP_GUARD.fetch_add(1, Ordering::Relaxed);
+        let table = format!("cc_switch_provider_cleanup_guard_{guard_id}");
+        connection.execute_batch(&format!(
+            "CREATE TEMP TABLE \"{table}\" (
+                target_id TEXT NOT NULL,
+                target_app_type TEXT NOT NULL,
+                violations INTEGER NOT NULL
+             );"
+        ))?;
+        let guard_sql = format!("INSERT INTO temp.\"{table}\" VALUES (?1, ?2, 0)");
+        let mut statement = connection.prepare(&guard_sql)?;
+        let mut rows = statement.query(params![id, app_type])?;
+        while rows.next()?.is_some() {}
+
+        let mut triggers = Vec::new();
+        for operation in ["INSERT", "UPDATE"] {
+            let trigger = format!(
+                "cc_switch_provider_cleanup_block_{}_{}",
+                guard_id,
+                triggers.len()
+            );
+            connection.execute_batch(&format!(
+                "CREATE TEMP TRIGGER \"{trigger}\" BEFORE {operation} ON main.providers BEGIN
+                    UPDATE \"{table}\" SET violations = violations + 1;
+                    SELECT RAISE(IGNORE);
+                 END;"
+            ))?;
+            triggers.push(trigger);
+        }
+        let trigger = format!(
+            "cc_switch_provider_cleanup_block_{}_{}",
+            guard_id,
+            triggers.len()
+        );
+        connection.execute_batch(&format!(
+            "CREATE TEMP TRIGGER \"{trigger}\" BEFORE DELETE ON main.providers
+             WHEN OLD.id COLLATE BINARY != (SELECT target_id FROM \"{table}\")
+               OR OLD.app_type COLLATE BINARY != (SELECT target_app_type FROM \"{table}\")
+             BEGIN
+                UPDATE \"{table}\" SET violations = violations + 1;
+                SELECT RAISE(IGNORE);
+             END;"
+        ))?;
+        triggers.push(trigger);
+        Ok(Self { table, triggers })
+    }
+
+    fn accepted(&self, connection: &Connection) -> rusqlite::Result<bool> {
+        connection.query_row(
+            &format!("SELECT violations = 0 FROM temp.\"{}\"", self.table),
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    fn remove(self, connection: &Connection) -> rusqlite::Result<()> {
+        for trigger in self.triggers.into_iter().rev() {
+            connection.execute_batch(&format!("DROP TRIGGER temp.\"{trigger}\";"))?;
+        }
+        connection.execute_batch(&format!("DROP TABLE temp.\"{}\";", self.table))
+    }
 }
 
 fn execute_provider_write<P: Params>(
@@ -1003,10 +1105,17 @@ fn execute_provider_write<P: Params>(
         .savepoint()
         .map_err(|error| redact_provider_write_error(error, transaction_aborted))?;
     let result = (|| {
+        let cleanup_guard = match guard {
+            ProviderWriteGuard::TargetAbsentAllowHostCleanup { id, app_type } => {
+                Some(ProviderHostCleanupGuard::install(&savepoint, id, app_type)?)
+            }
+            _ => None,
+        };
         let provider_count_before = match guard {
             ProviderWriteGuard::Inserted(_)
             | ProviderWriteGuard::SideEffects
-            | ProviderWriteGuard::StrictTargetAbsent { .. } => {
+            | ProviderWriteGuard::StrictTargetAbsent { .. }
+            | ProviderWriteGuard::TargetAbsentAllowHostCleanup { .. } => {
                 Some(provider_row_count(&savepoint)?)
             }
             ProviderWriteGuard::None | ProviderWriteGuard::TargetAbsent { .. } => None,
@@ -1030,17 +1139,27 @@ fn execute_provider_write<P: Params>(
             ProviderWriteGuard::None
             | ProviderWriteGuard::SideEffects
             | ProviderWriteGuard::TargetAbsent { .. }
-            | ProviderWriteGuard::StrictTargetAbsent { .. } => true,
+            | ProviderWriteGuard::StrictTargetAbsent { .. }
+            | ProviderWriteGuard::TargetAbsentAllowHostCleanup { .. } => true,
         };
         let target_present = match guard {
             ProviderWriteGuard::TargetAbsent { id, app_type }
-            | ProviderWriteGuard::StrictTargetAbsent { id, app_type } => {
+            | ProviderWriteGuard::StrictTargetAbsent { id, app_type }
+            | ProviderWriteGuard::TargetAbsentAllowHostCleanup { id, app_type } => {
                 provider_exists(&savepoint, id, app_type)?
             }
             ProviderWriteGuard::None
             | ProviderWriteGuard::Inserted(_)
             | ProviderWriteGuard::SideEffects => false,
         };
+        let cleanup_valid = cleanup_guard
+            .as_ref()
+            .map(|guard| guard.accepted(&savepoint))
+            .transpose()?
+            .unwrap_or(true);
+        if let Some(guard) = cleanup_guard {
+            guard.remove(&savepoint)?;
+        }
         Ok((
             changed,
             sqlite_total_changes(&savepoint) - total_before,
@@ -1048,6 +1167,7 @@ fn execute_provider_write<P: Params>(
             provider_count_after,
             inserted_matches,
             target_present,
+            cleanup_valid,
         ))
     })();
     let (
@@ -1057,6 +1177,7 @@ fn execute_provider_write<P: Params>(
         provider_count_after,
         inserted_matches,
         target_present,
+        cleanup_valid,
     ) = match result {
         Ok(result) => result,
         Err(error) => {
@@ -1078,7 +1199,8 @@ fn execute_provider_write<P: Params>(
             .zip(provider_count_after)
             .is_some_and(|(before, after)| before.checked_add(1) == Some(after)),
         ProviderWriteGuard::SideEffects => provider_count_before == provider_count_after,
-        ProviderWriteGuard::StrictTargetAbsent { .. } => provider_count_before
+        ProviderWriteGuard::StrictTargetAbsent { .. }
+        | ProviderWriteGuard::TargetAbsentAllowHostCleanup { .. } => provider_count_before
             .zip(provider_count_after)
             .is_some_and(|(before, after)| before.checked_sub(1) == Some(after)),
         ProviderWriteGuard::None | ProviderWriteGuard::TargetAbsent { .. } => true,
@@ -1089,7 +1211,7 @@ fn execute_provider_write<P: Params>(
             | ProviderWriteGuard::SideEffects
             | ProviderWriteGuard::StrictTargetAbsent { .. }
     ) || total_changed == changed as u64;
-    if !provider_count_valid || !side_effects_valid || !inserted_matches {
+    if !provider_count_valid || !side_effects_valid || !inserted_matches || !cleanup_valid {
         savepoint
             .finish()
             .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
@@ -1298,6 +1420,7 @@ pub(crate) fn source_fingerprint(
                 hasher.update(value.to_le_bytes());
             }
             ValueRef::Real(value) => {
+                let value = if value == 0.0 { 0.0 } else { value };
                 hasher.update([2]);
                 hasher.update(value.to_bits().to_le_bytes());
             }
@@ -2180,6 +2303,128 @@ mod tests {
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("read host schema version"),
             43
+        );
+    }
+
+    #[test]
+    fn provider_cleanup_delete_allows_dependents_but_rejects_catalog_rewrites() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "CREATE TABLE host_provider_bindings (
+                    provider_id TEXT NOT NULL,
+                    app_type TEXT NOT NULL,
+                    value TEXT NOT NULL
+                 );
+                 CREATE TRIGGER clean_host_provider_binding AFTER DELETE ON providers BEGIN
+                    DELETE FROM host_provider_bindings
+                    WHERE provider_id = OLD.id AND app_type = OLD.app_type;
+                 END;",
+            )
+            .expect("create host cleanup contract");
+
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            insert_provider(
+                &mut transaction,
+                &provider_insert("provider", "settings", "meta")
+            )
+            .expect("insert provider"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction
+            .execute(
+                "INSERT INTO host_provider_bindings VALUES ('provider', 'claude', 'keep')",
+                [],
+            )
+            .expect("insert host binding");
+        transaction.commit().expect("commit fixture");
+
+        let provider = read_provider_row(&connection, "provider", "claude")
+            .expect("read provider")
+            .expect("provider exists");
+        connection
+            .pragma_update(None, "count_changes", true)
+            .expect("enable count_changes");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin cleanup delete");
+        assert_eq!(
+            delete_provider_with_host_cleanup_if_unchanged(
+                &mut transaction,
+                "provider",
+                "claude",
+                provider.source_fingerprint(),
+            )
+            .expect("delete with host cleanup"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit cleanup delete");
+        connection
+            .pragma_update(None, "count_changes", false)
+            .expect("disable count_changes");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM host_provider_bindings", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count bindings"),
+            0
+        );
+
+        connection
+            .execute_batch(
+                "INSERT INTO providers (id, app_type, name, settings_config)
+                 VALUES ('provider', 'claude', 'Provider', 'settings'),
+                        ('other', 'claude', 'Other', 'other');
+                 INSERT INTO host_provider_bindings VALUES ('provider', 'claude', 'keep');
+                 CREATE TRIGGER rewrite_other_provider AFTER DELETE ON providers
+                 WHEN OLD.id = 'provider' AND OLD.app_type = 'claude'
+                 BEGIN
+                    UPDATE providers SET name = 'Rewritten'
+                    WHERE id = 'other' AND app_type = 'claude';
+                 END;",
+            )
+            .expect("create catalog rewrite");
+        let provider = read_provider_row(&connection, "provider", "claude")
+            .expect("read provider")
+            .expect("provider exists");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin rejected delete");
+        assert_eq!(
+            delete_provider_with_host_cleanup_if_unchanged(
+                &mut transaction,
+                "provider",
+                "claude",
+                provider.source_fingerprint(),
+            )
+            .expect("reject catalog rewrite"),
+            ProviderWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit rejected delete");
+        assert!(read_provider_row(&connection, "provider", "claude")
+            .expect("read preserved provider")
+            .is_some());
+        assert_eq!(
+            read_provider_row(&connection, "other", "claude")
+                .expect("read other provider")
+                .expect("other provider exists")
+                .name,
+            "Other"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM host_provider_bindings", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count preserved bindings"),
+            1
         );
     }
 
