@@ -1153,7 +1153,7 @@ fn import_toml_section(
         if let Some(headers) = object.remove("http_headers") {
             object.insert("headers".to_owned(), headers);
         }
-        if grok && !object.contains_key("type") && object.contains_key("url") {
+        if !object.contains_key("type") && object.contains_key("url") {
             object.insert("type".to_owned(), Value::String("http".to_owned()));
         } else {
             infer_transport(object);
@@ -2415,6 +2415,22 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(!grok_enabled.contains("\"remote\"]"));
+    }
+
+    #[test]
+    fn codex_imports_url_only_servers_as_http() {
+        let imported = import_mcp_servers(
+            &AppType::Codex,
+            Some(
+                b"[mcp_servers.remote]\nurl = \"https://example.com/mcp\"\n\
+                  [mcp_servers.invalid]\ntype = 1\nurl = \"https://invalid.example/mcp\"\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].id, "remote");
+        assert_eq!(imported[0].server["type"], "http");
     }
 
     #[test]
