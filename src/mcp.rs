@@ -344,6 +344,28 @@ pub fn import_mcp_servers(
     Ok(imports)
 }
 
+/// Reports whether an application live document contains an MCP entry with `id`.
+///
+/// This inspects the native collection directly, so malformed entries still count as
+/// existing and cannot be overwritten during an ownership claim.
+pub fn mcp_server_exists(
+    app: &AppType,
+    contents: Option<&[u8]>,
+    id: &str,
+) -> Result<bool, McpConfigError> {
+    validate_id(id)?;
+    let target = require_target(app)?;
+    validate_document_size(app, contents)?;
+    match target {
+        McpConfigTarget::Claude => json_section_contains(app, contents, "mcpServers", id),
+        McpConfigTarget::Gemini => json_section_contains(app, contents, "mcpServers", id),
+        McpConfigTarget::OpenCode => json_section_contains(app, contents, "mcp", id),
+        McpConfigTarget::Codex => toml_section_contains(app, contents, id, false),
+        McpConfigTarget::GrokBuild => toml_section_contains(app, contents, id, true),
+        McpConfigTarget::Hermes => hermes_section_contains(app, contents, id),
+    }
+}
+
 /// Projects one application link state into a complete document.
 ///
 /// `Ok(None)` means the live document does not need to be written.
@@ -693,6 +715,22 @@ fn import_json_section(
                 })
         })
         .collect())
+}
+
+fn json_section_contains(
+    app: &AppType,
+    contents: Option<&[u8]>,
+    section: &str,
+    id: &str,
+) -> Result<bool, McpConfigError> {
+    let root = parse_json_root(app, contents)?;
+    let Some(entries) = root.get(section) else {
+        return Ok(false);
+    };
+    entries
+        .as_object()
+        .map(|entries| entries.contains_key(id))
+        .ok_or_else(|| invalid_document(app, &format!("'{section}' must be an object")))
 }
 
 fn project_json_section(
@@ -1162,6 +1200,24 @@ fn import_toml_section(
     Ok(imports)
 }
 
+fn toml_section_contains(
+    app: &AppType,
+    contents: Option<&[u8]>,
+    id: &str,
+    grok: bool,
+) -> Result<bool, McpConfigError> {
+    let document = parse_toml(app, contents)?;
+    if let Some(entries) = document.get("mcp_servers") {
+        let entries = entries
+            .as_table_like()
+            .ok_or_else(|| invalid_document(app, "'mcp_servers' must be a table"))?;
+        if entries.contains_key(id) {
+            return Ok(true);
+        }
+    }
+    Ok(!grok && legacy_toml_entry(&document, id).is_some())
+}
+
 fn append_toml_imports(
     app: &AppType,
     entries: &dyn TableLike,
@@ -1615,6 +1671,22 @@ fn import_hermes(app: &AppType, contents: Option<&[u8]>) -> Result<Vec<McpImport
     Ok(imports)
 }
 
+fn hermes_section_contains(
+    app: &AppType,
+    contents: Option<&[u8]>,
+    id: &str,
+) -> Result<bool, McpConfigError> {
+    let root = parse_yaml_root(app, contents)?;
+    let section_key = serde_yaml::Value::String("mcp_servers".to_owned());
+    let Some(entries) = root.get(&section_key) else {
+        return Ok(false);
+    };
+    let entries = entries
+        .as_mapping()
+        .ok_or_else(|| invalid_document(app, "'mcp_servers' must be a mapping"))?;
+    Ok(entries.contains_key(serde_yaml::Value::String(id.to_owned())))
+}
+
 fn project_hermes(
     app: &AppType,
     contents: Option<&[u8]>,
@@ -1935,6 +2007,34 @@ mod tests {
                 descriptor.id()
             );
         }
+    }
+
+    #[test]
+    fn native_existence_detects_invalid_entries_without_importing_them() {
+        let documents: &[(AppType, &[u8])] = &[
+            (AppType::Claude, br#"{"mcpServers":{"same":42}}"#),
+            (AppType::Gemini, br#"{"mcpServers":{"same":false}}"#),
+            (AppType::OpenCode, br#"{"mcp":{"same":[]}}"#),
+            (AppType::Codex, b"[mcp_servers.same]\ninvalid = true\n"),
+            (AppType::GrokBuild, b"[mcp_servers.same]\ninvalid = true\n"),
+            (AppType::Hermes, b"mcp_servers:\n  same: invalid\n"),
+        ];
+        for (app, contents) in documents {
+            assert!(mcp_server_exists(app, Some(contents), "same").unwrap());
+            assert!(!mcp_server_exists(app, Some(contents), "other").unwrap());
+            assert!(import_mcp_servers(app, Some(contents)).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn adapter_exposes_native_mcp_existence() {
+        let adapter = crate::builtin_app_adapter(&AppType::Claude);
+        assert!(adapter
+            .contains_mcp_server(
+                Some(br#"{"mcpServers":{"same":{"command":"npx"}}}"#),
+                "same"
+            )
+            .unwrap());
     }
 
     #[test]

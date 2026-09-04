@@ -49,6 +49,17 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
         crate::import_mcp_servers(self.descriptor().app(), contents)
     }
 
+    /// Reports whether the observed live document contains an MCP entry with this id.
+    ///
+    /// Unlike import, this also detects entries whose server definition is invalid.
+    fn contains_mcp_server(
+        &self,
+        contents: Option<&[u8]>,
+        id: &str,
+    ) -> Result<bool, McpConfigError> {
+        crate::mcp_server_exists(self.descriptor().app(), contents, id)
+    }
+
     /// Projects one MCP state change into the complete live document.
     fn project_mcp_server(
         &self,
