@@ -819,21 +819,25 @@ pub fn delete_provider(
         "DELETE FROM main.providers
          WHERE id COLLATE BINARY = ?1 AND app_type COLLATE BINARY = ?2",
         params![id, app_type],
-        ProviderWriteGuard::None,
+        ProviderWriteGuard::TargetAbsent { id, app_type },
     )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ProviderWriteGuard {
+enum ProviderWriteGuard<'value> {
     None,
     SideEffects,
+    TargetAbsent {
+        id: &'value str,
+        app_type: &'value str,
+    },
 }
 
 fn execute_provider_write<P: Params>(
     transaction: &mut Transaction<'_>,
     sql: &str,
     params: P,
-    guard: ProviderWriteGuard,
+    guard: ProviderWriteGuard<'_>,
 ) -> Result<ProviderWriteOutcome, SharedStoreError> {
     if transaction.is_autocommit() {
         return Err(SharedStoreError::ProviderWrite {
@@ -850,7 +854,7 @@ fn execute_provider_write<P: Params>(
     let result = (|| {
         let provider_count_before = match guard {
             ProviderWriteGuard::SideEffects => Some(provider_row_count(&savepoint)?),
-            ProviderWriteGuard::None => None,
+            ProviderWriteGuard::None | ProviderWriteGuard::TargetAbsent { .. } => None,
         };
         let total_before = sqlite_total_changes(&savepoint);
         let changed = {
@@ -863,13 +867,20 @@ fn execute_provider_write<P: Params>(
             .map(|before| provider_row_count(&savepoint).map(|after| before != after))
             .transpose()?
             .unwrap_or(false);
+        let target_present = match guard {
+            ProviderWriteGuard::TargetAbsent { id, app_type } => {
+                provider_exists(&savepoint, id, app_type)?
+            }
+            ProviderWriteGuard::None | ProviderWriteGuard::SideEffects => false,
+        };
         Ok((
             changed,
             sqlite_total_changes(&savepoint) - total_before,
             provider_count_changed,
+            target_present,
         ))
     })();
-    let (changed, total_changed, provider_count_changed) = match result {
+    let (changed, total_changed, provider_count_changed, target_present) = match result {
         Ok(result) => result,
         Err(error) => {
             let _ = savepoint.finish();
@@ -879,7 +890,13 @@ fn execute_provider_write<P: Params>(
             ));
         }
     };
-    if guard != ProviderWriteGuard::None
+    if changed == 0 {
+        savepoint
+            .finish()
+            .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
+    if matches!(guard, ProviderWriteGuard::SideEffects)
         && (total_changed != changed as u64 || provider_count_changed)
     {
         savepoint
@@ -887,8 +904,13 @@ fn execute_provider_write<P: Params>(
             .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
         return Ok(ProviderWriteOutcome::NotApplied);
     }
+    if target_present {
+        savepoint
+            .finish()
+            .map_err(|error| redact_provider_write_error(error, transaction.is_autocommit()))?;
+        return Ok(ProviderWriteOutcome::NotApplied);
+    }
     let outcome = match changed {
-        0 => ProviderWriteOutcome::NotApplied,
         1 => ProviderWriteOutcome::Applied,
         _ => {
             savepoint
@@ -907,6 +929,17 @@ fn execute_provider_write<P: Params>(
 
 fn provider_row_count(connection: &Connection) -> rusqlite::Result<i64> {
     connection.query_row("SELECT COUNT(*) FROM main.providers", [], |row| row.get(0))
+}
+
+fn provider_exists(connection: &Connection, id: &str, app_type: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM main.providers
+             WHERE id COLLATE BINARY = ?1 AND app_type COLLATE BINARY = ?2
+         )",
+        params![id, app_type],
+        |row| row.get(0),
+    )
 }
 
 fn sqlite_total_changes(connection: &Connection) -> u64 {
@@ -1739,6 +1772,98 @@ mod tests {
         assert_eq!(unchanged.meta, "original");
         assert_eq!(unchanged.is_current, 0);
         transaction.commit().expect("commit suppressed writes");
+    }
+
+    #[test]
+    fn provider_delete_rejects_trigger_rewrites() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = SharedDatabase::open(directory.path().join("cc-switch.db"))
+            .expect("open shared database");
+        database
+            .ensure_provider_schema()
+            .expect("initialize provider schema");
+        let mut connection = database.connect().expect("connect shared database");
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin provider transaction");
+        assert_eq!(
+            insert_provider(
+                &mut transaction,
+                &provider_insert("provider", "original", "{}")
+            )
+            .expect("insert provider fixture"),
+            ProviderWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit provider fixture");
+        connection
+            .execute_batch(
+                "CREATE TABLE provider_delete_effect (value INTEGER NOT NULL);
+                 INSERT INTO provider_delete_effect VALUES (0);
+                 CREATE TRIGGER reinsert_provider AFTER DELETE ON providers
+                 WHEN OLD.id = 'provider' AND OLD.app_type = 'claude'
+                 BEGIN
+                     INSERT INTO providers (id, app_type, name, settings_config)
+                     VALUES (OLD.id, OLD.app_type, OLD.name, OLD.settings_config);
+                     UPDATE provider_delete_effect SET value = 1;
+                 END;",
+            )
+            .expect("create reinserting host trigger");
+
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin guarded delete");
+        assert_eq!(
+            delete_provider(&mut transaction, "provider", "claude")
+                .expect("reject provider reinsertion"),
+            ProviderWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit rejected delete");
+
+        let provider = read_provider_row(&connection, "provider", "claude")
+            .expect("read provider")
+            .expect("original provider remains");
+        assert_eq!(provider.settings_config, "original");
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM provider_delete_effect", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("read delete effect"),
+            0
+        );
+
+        connection
+            .execute_batch(
+                "DROP TRIGGER reinsert_provider;
+                 CREATE TRIGGER remove_provider_before_delete BEFORE DELETE ON providers
+                 WHEN OLD.id = 'provider' AND OLD.app_type = 'claude'
+                 BEGIN
+                     DELETE FROM providers
+                     WHERE id = OLD.id AND app_type = OLD.app_type;
+                     UPDATE provider_delete_effect SET value = 2;
+                     SELECT RAISE(IGNORE);
+                 END;",
+            )
+            .expect("create pre-deleting host trigger");
+
+        let mut transaction =
+            begin_immediate_transaction(&mut connection).expect("begin guarded delete");
+        assert_eq!(
+            delete_provider(&mut transaction, "provider", "claude")
+                .expect("reject provider pre-deletion"),
+            ProviderWriteOutcome::NotApplied
+        );
+        transaction.commit().expect("commit rejected delete");
+
+        assert!(read_provider_row(&connection, "provider", "claude")
+            .expect("read provider")
+            .is_some());
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM provider_delete_effect", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("read delete effect"),
+            0
+        );
     }
 
     #[test]
