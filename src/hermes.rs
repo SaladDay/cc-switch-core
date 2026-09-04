@@ -3,7 +3,57 @@
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::ProviderEntry;
+use crate::{
+    integration::AppIntegration,
+    mcp::HERMES_MCP,
+    native_import::{self, NativeImportBehavior},
+    projection::{self, NativeContextRequirement, NativeProjectionBehavior},
+    registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
+    simple_provider::{self, SimpleProviderBehavior, HERMES_FORM},
+    AppType, LogicalTarget, NativeResourcePath, ProviderEntry, SkillAppContract, SkillConfigTarget,
+    SkillDiscovery,
+};
+
+const CAPABILITIES: &[AppCapability] = &[
+    AppCapability::ProviderManagement,
+    AppCapability::LiveConfiguration,
+    AppCapability::Mcp,
+    AppCapability::Prompts,
+    AppCapability::Skills,
+];
+
+pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
+    AppDescriptor::new(
+        AppType::Hermes,
+        "hermes",
+        "Hermes",
+        "hermes",
+        ProviderConfigurationMode::Additive,
+        CAPABILITIES,
+        &[],
+    )
+    .with_mcp(&HERMES_MCP)
+    .with_skills(SkillAppContract::catalog(
+        "enabled_hermes",
+        SkillDiscovery::NativeOnly,
+        Some(SkillConfigTarget::HermesConfig),
+        NativeResourcePath::relative("skills"),
+    )),
+    &[LogicalTarget::HermesConfig],
+    &HERMES_FORM,
+    SimpleProviderBehavior::new(
+        simple_provider::extract_hermes,
+        simple_provider::project_hermes,
+        false,
+    ),
+    NativeImportBehavior::new(native_import::import_hermes),
+    NativeProjectionBehavior::new(
+        projection::hermes_plan,
+        Some(projection::hermes_remove_plan),
+        projection::declared_native_targets,
+        NativeContextRequirement::Standard,
+    ),
+);
 
 const KEY_ALIASES: [(&str, &str); 5] = [
     ("baseUrl", "base_url"),

@@ -6,6 +6,59 @@ use serde_json::Value;
 use thiserror::Error;
 use toml_edit::{DocumentMut, TableLike};
 
+use crate::{
+    integration::AppIntegration,
+    mcp::GROKBUILD_MCP,
+    native_import::{self, NativeImportBehavior},
+    projection::{self, NativeContextRequirement, NativeProjectionBehavior},
+    registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
+    simple_provider::{self, SimpleProviderBehavior, GROKBUILD_FORM},
+    AppType, LogicalTarget, NativeResourcePath, SkillAppContract, SkillConfigTarget,
+    SkillDiscovery,
+};
+
+const CAPABILITIES: &[AppCapability] = &[
+    AppCapability::ProviderManagement,
+    AppCapability::LiveConfiguration,
+    AppCapability::LocalProxy,
+    AppCapability::Mcp,
+    AppCapability::Prompts,
+    AppCapability::Skills,
+];
+
+pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
+    AppDescriptor::new(
+        AppType::GrokBuild,
+        "grokbuild",
+        "Grok Build",
+        "grok",
+        ProviderConfigurationMode::Switch,
+        CAPABILITIES,
+        &["grok-build", "grok_build", "grok"],
+    )
+    .with_mcp(&GROKBUILD_MCP)
+    .with_skills(SkillAppContract::catalog(
+        "enabled_grokbuild",
+        SkillDiscovery::NativeAndUnified,
+        Some(SkillConfigTarget::GrokConfig),
+        NativeResourcePath::relative("skills"),
+    )),
+    &[LogicalTarget::GrokConfig],
+    &GROKBUILD_FORM,
+    SimpleProviderBehavior::new(
+        simple_provider::extract_grokbuild,
+        simple_provider::project_grokbuild,
+        true,
+    ),
+    NativeImportBehavior::new(native_import::import_grokbuild),
+    NativeProjectionBehavior::new(
+        projection::grokbuild_plan,
+        None,
+        projection::declared_native_targets,
+        NativeContextRequirement::Standard,
+    ),
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderMode {
     Official,

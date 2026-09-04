@@ -5,6 +5,51 @@ use std::fmt;
 use serde_json::{json, Value};
 use thiserror::Error;
 
+use crate::{
+    integration::AppIntegration,
+    native_import::{self, NativeImportBehavior},
+    projection::{self, NativeContextRequirement, NativeProjectionBehavior},
+    registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
+    simple_provider::{self, SimpleProviderBehavior, CLAUDE_DESKTOP_FORM},
+    AppType, LogicalTarget,
+};
+
+const CAPABILITIES: &[AppCapability] = &[
+    AppCapability::ProviderManagement,
+    AppCapability::LiveConfiguration,
+];
+
+pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
+    AppDescriptor::new(
+        AppType::ClaudeDesktop,
+        "claude-desktop",
+        "Claude Desktop",
+        "claude",
+        ProviderConfigurationMode::Switch,
+        CAPABILITIES,
+        &["claude_desktop", "claudedesktop"],
+    ),
+    &[
+        LogicalTarget::ClaudeDesktopNormalConfig,
+        LogicalTarget::ClaudeDesktopThreepConfig,
+        LogicalTarget::ClaudeDesktopProfile,
+        LogicalTarget::ClaudeDesktopMeta,
+    ],
+    &CLAUDE_DESKTOP_FORM,
+    SimpleProviderBehavior::new(
+        simple_provider::extract_claude_like,
+        simple_provider::project_claude_desktop,
+        false,
+    ),
+    NativeImportBehavior::new(native_import::import_claude_desktop),
+    NativeProjectionBehavior::new(
+        projection::claude_desktop_plan,
+        None,
+        projection::declared_native_targets,
+        NativeContextRequirement::ClaudeDesktop,
+    ),
+);
+
 const ONE_M_CONTEXT_MARKER: &str = "[1m]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

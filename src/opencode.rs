@@ -3,7 +3,56 @@
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::ProviderEntry;
+use crate::{
+    integration::AppIntegration,
+    mcp::OPENCODE_MCP,
+    native_import::{self, NativeImportBehavior},
+    projection::{self, NativeContextRequirement, NativeProjectionBehavior},
+    registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
+    simple_provider::{self, SimpleProviderBehavior, OPENCODE_FORM},
+    AppType, LogicalTarget, NativeResourcePath, ProviderEntry, SkillAppContract, SkillDiscovery,
+};
+
+const CAPABILITIES: &[AppCapability] = &[
+    AppCapability::ProviderManagement,
+    AppCapability::LiveConfiguration,
+    AppCapability::Mcp,
+    AppCapability::Prompts,
+    AppCapability::Skills,
+];
+
+pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
+    AppDescriptor::new(
+        AppType::OpenCode,
+        "opencode",
+        "OpenCode",
+        "opencode",
+        ProviderConfigurationMode::Additive,
+        CAPABILITIES,
+        &[],
+    )
+    .with_mcp(&OPENCODE_MCP)
+    .with_skills(SkillAppContract::catalog(
+        "enabled_opencode",
+        SkillDiscovery::NativeAndUnified,
+        None,
+        NativeResourcePath::relative("skills"),
+    )),
+    &[LogicalTarget::OpenCodeConfig],
+    &OPENCODE_FORM,
+    SimpleProviderBehavior::new(
+        simple_provider::extract_opencode,
+        simple_provider::project_opencode,
+        false,
+    ),
+    NativeImportBehavior::new(native_import::import_opencode),
+    NativeProjectionBehavior::new(
+        projection::opencode_plan,
+        Some(projection::remove_opencode),
+        projection::declared_native_targets,
+        NativeContextRequirement::Standard,
+    ),
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PrepareProviderEntryError {

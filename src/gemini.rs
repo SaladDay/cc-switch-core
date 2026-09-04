@@ -5,6 +5,60 @@ use std::{collections::BTreeMap, fmt};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::{
+    integration::AppIntegration,
+    mcp::GEMINI_MCP,
+    native_import::{self, NativeImportBehavior},
+    projection::{self, NativeContextRequirement, NativeProjectionBehavior},
+    registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
+    simple_provider::{self, SimpleProviderBehavior, GEMINI_FORM},
+    AppType, LogicalTarget, NativeResourcePath, SkillAppContract, SkillConfigTarget,
+    SkillDiscovery,
+};
+
+const CAPABILITIES: &[AppCapability] = &[
+    AppCapability::ProviderManagement,
+    AppCapability::LiveConfiguration,
+    AppCapability::CommonConfiguration,
+    AppCapability::LocalProxy,
+    AppCapability::Mcp,
+    AppCapability::Prompts,
+    AppCapability::Skills,
+];
+
+pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
+    AppDescriptor::new(
+        AppType::Gemini,
+        "gemini",
+        "Gemini",
+        "gemini",
+        ProviderConfigurationMode::Switch,
+        CAPABILITIES,
+        &[],
+    )
+    .with_mcp(&GEMINI_MCP)
+    .with_skills(SkillAppContract::catalog(
+        "enabled_gemini",
+        SkillDiscovery::NativeAndUnified,
+        Some(SkillConfigTarget::GeminiSettings),
+        NativeResourcePath::relative("skills"),
+    )),
+    &[LogicalTarget::GeminiEnv, LogicalTarget::GeminiSettings],
+    &GEMINI_FORM,
+    SimpleProviderBehavior::new(
+        simple_provider::extract_gemini,
+        simple_provider::project_gemini,
+        false,
+    ),
+    NativeImportBehavior::new(native_import::import_gemini),
+    NativeProjectionBehavior::new(
+        projection::gemini_plan,
+        None,
+        projection::declared_native_targets,
+        NativeContextRequirement::Standard,
+    ),
+);
+
 /// Authentication selection written to Gemini's `settings.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {

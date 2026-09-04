@@ -3,7 +3,46 @@
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::ProviderEntry;
+use crate::{
+    integration::AppIntegration,
+    native_import::{self, NativeImportBehavior},
+    projection::{self, NativeContextRequirement, NativeProjectionBehavior},
+    registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
+    simple_provider::{self, SimpleProviderBehavior, OPENCLAW_FORM},
+    AppType, LogicalTarget, ProviderEntry,
+};
+
+const CAPABILITIES: &[AppCapability] = &[
+    AppCapability::ProviderManagement,
+    AppCapability::LiveConfiguration,
+    AppCapability::Prompts,
+];
+
+pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
+    AppDescriptor::new(
+        AppType::OpenClaw,
+        "openclaw",
+        "OpenClaw",
+        "openclaw",
+        ProviderConfigurationMode::Additive,
+        CAPABILITIES,
+        &[],
+    ),
+    &[LogicalTarget::OpenClawConfig],
+    &OPENCLAW_FORM,
+    SimpleProviderBehavior::new(
+        simple_provider::extract_openai_array_provider,
+        simple_provider::project_openclaw,
+        false,
+    ),
+    NativeImportBehavior::new(native_import::import_openclaw),
+    NativeProjectionBehavior::new(
+        projection::openclaw_plan,
+        Some(projection::remove_openclaw),
+        projection::declared_native_targets,
+        NativeContextRequirement::Standard,
+    ),
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PrepareProviderEntryError {

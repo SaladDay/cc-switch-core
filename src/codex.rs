@@ -7,6 +7,67 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use toml_edit::DocumentMut;
 
+use crate::{
+    integration::AppIntegration,
+    mcp::CODEX_MCP,
+    native_import::{self, NativeImportBehavior},
+    projection::{self, NativeContextRequirement, NativePolicyBehavior, NativeProjectionBehavior},
+    registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
+    simple_provider::{self, SimpleProviderBehavior, CODEX_FORM},
+    AppType, LogicalTarget, NativeResourcePath, SkillAppContract, SkillDiscovery,
+};
+
+const CAPABILITIES: &[AppCapability] = &[
+    AppCapability::ProviderManagement,
+    AppCapability::LiveConfiguration,
+    AppCapability::CommonConfiguration,
+    AppCapability::LocalProxy,
+    AppCapability::Mcp,
+    AppCapability::Prompts,
+    AppCapability::Skills,
+];
+
+pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
+    AppDescriptor::new(
+        AppType::Codex,
+        "codex",
+        "Codex",
+        "codex",
+        ProviderConfigurationMode::Switch,
+        CAPABILITIES,
+        &[],
+    )
+    .with_mcp(&CODEX_MCP)
+    .with_skills(SkillAppContract::catalog(
+        "enabled_codex",
+        SkillDiscovery::NativeAndUnified,
+        None,
+        NativeResourcePath::relative("skills"),
+    )),
+    &[
+        LogicalTarget::CodexAuth,
+        LogicalTarget::CodexConfig,
+        LogicalTarget::CodexModelCatalog,
+    ],
+    &CODEX_FORM,
+    SimpleProviderBehavior::new(
+        simple_provider::extract_codex,
+        simple_provider::project_codex,
+        false,
+    ),
+    NativeImportBehavior::new(native_import::import_codex),
+    NativeProjectionBehavior::new(
+        projection::codex_plan,
+        None,
+        projection::codex_native_targets,
+        NativeContextRequirement::Standard,
+    )
+    .with_policy(NativePolicyBehavior::new(
+        projection::codex_policy_plan,
+        projection::codex_policy_targets,
+    )),
+);
+
 pub const MODEL_CATALOG_FILENAME: &str = "cc-switch-model-catalog.json";
 
 const RESERVED_MODEL_PROVIDER_IDS: &[&str] = &[

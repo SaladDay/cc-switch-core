@@ -4,6 +4,59 @@ use std::{error::Error, fmt};
 
 use serde_json::Value;
 
+use crate::{
+    integration::AppIntegration,
+    mcp::CLAUDE_MCP,
+    native_import::{self, NativeImportBehavior},
+    projection::{self, NativeContextRequirement, NativeProjectionBehavior},
+    registry::{AppCapability, AppDescriptor, ProviderConfigurationMode},
+    simple_provider::{self, SimpleProviderBehavior, CLAUDE_FORM},
+    AppType, LogicalTarget, NativeResourcePath, SkillAppContract, SkillDiscovery,
+};
+
+const CAPABILITIES: &[AppCapability] = &[
+    AppCapability::ProviderManagement,
+    AppCapability::LiveConfiguration,
+    AppCapability::CommonConfiguration,
+    AppCapability::LocalProxy,
+    AppCapability::Mcp,
+    AppCapability::Prompts,
+    AppCapability::Skills,
+];
+
+pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
+    AppDescriptor::new(
+        AppType::Claude,
+        "claude",
+        "Claude",
+        "claude",
+        ProviderConfigurationMode::Switch,
+        CAPABILITIES,
+        &[],
+    )
+    .with_mcp(&CLAUDE_MCP)
+    .with_skills(SkillAppContract::catalog(
+        "enabled_claude",
+        SkillDiscovery::NativeOnly,
+        None,
+        NativeResourcePath::relative("skills"),
+    )),
+    &[LogicalTarget::ClaudeSettings],
+    &CLAUDE_FORM,
+    SimpleProviderBehavior::new(
+        simple_provider::extract_claude_like,
+        simple_provider::project_claude,
+        false,
+    ),
+    NativeImportBehavior::new(native_import::import_claude),
+    NativeProjectionBehavior::new(
+        projection::claude_plan,
+        None,
+        projection::declared_native_targets,
+        NativeContextRequirement::Standard,
+    ),
+);
+
 /// A validated Claude Code settings document ready for the live-write layer.
 #[derive(Clone, PartialEq)]
 pub struct PreparedLiveSnapshot {
