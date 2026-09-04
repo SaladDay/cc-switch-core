@@ -62,6 +62,10 @@ not observable and therefore remains a host contract violation. Callers own an
 immediate transaction and any other product-specific MCP state. Read-only
 consumers do not need to opt into this write contract.
 
+Per-application MCP selection columns come from the Core registry. New hosts
+should use the registry-complete catalog values; fixed-field Store APIs remain
+available only for compatibility with existing callers.
+
 MCP native links record which application owns a catalog entry and retain an
 optional lossless import snapshot. Core validates the link table and installs a
 single cleanup trigger so deleting a catalog row cannot leave a stale snapshot.

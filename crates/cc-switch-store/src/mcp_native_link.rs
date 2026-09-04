@@ -1,5 +1,6 @@
 use std::fmt;
 
+use cc_switch_core::builtin_app_registry;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use crate::{mcp::has_non_abort_conflict_policy, SharedStoreError};
@@ -113,22 +114,21 @@ fn native_link_table_exists(connection: &Connection) -> Result<bool, SharedStore
 }
 
 fn claim_enabled_legacy_links(connection: &Connection) -> Result<(), SharedStoreError> {
-    const ENABLED_APPS: &[(&str, &str)] = &[
-        ("claude", "enabled_claude"),
-        ("codex", "enabled_codex"),
-        ("gemini", "enabled_gemini"),
-        ("grokbuild", "enabled_grokbuild"),
-        ("opencode", "enabled_opencode"),
-        ("hermes", "enabled_hermes"),
-    ];
-    for (app_id, column) in ENABLED_APPS {
+    for descriptor in builtin_app_registry().descriptors() {
+        let Some(column) = descriptor
+            .mcp_contract()
+            .map(|contract| contract.catalog_column())
+        else {
+            continue;
+        };
         connection
             .execute(
                 &format!(
                     "INSERT INTO main.mcp_native_links (server_id, app_id, native_snapshot)
-                     SELECT id, ?1, NULL FROM main.mcp_servers WHERE {column} <> 0"
+                     SELECT id, ?1, NULL FROM main.mcp_servers WHERE \"{}\" <> 0",
+                    column.as_str()
                 ),
-                [app_id],
+                [descriptor.id()],
             )
             .map_err(|error| redact_native_link_write_error(error, connection.is_autocommit()))?;
     }
@@ -511,26 +511,46 @@ mod tests {
         ensure_mcp_server_schema(&mut connection).expect("initialize MCP catalog");
         connection
             .execute_batch(
-                "INSERT INTO mcp_servers (
-                    id, name, server_config, enabled_claude, enabled_codex
-                 ) VALUES ('enabled', 'Enabled', '{}', 1, 1);
-                 INSERT INTO mcp_servers (
-                    id, name, server_config, enabled_claude, enabled_codex
-                 ) VALUES ('disabled', 'Disabled', '{}', 0, 0);",
+                "INSERT INTO mcp_servers (id, name, server_config)
+                 VALUES ('enabled', 'Enabled', '{}');
+                 INSERT INTO mcp_servers (id, name, server_config)
+                 VALUES ('disabled', 'Disabled', '{}');",
             )
             .expect("insert legacy MCP rows");
+        for descriptor in builtin_app_registry().descriptors() {
+            let Some(column) = descriptor
+                .mcp_contract()
+                .map(|contract| contract.catalog_column())
+            else {
+                continue;
+            };
+            connection
+                .execute(
+                    &format!(
+                        "UPDATE mcp_servers SET \"{}\" = 1 WHERE id = 'enabled'",
+                        column.as_str()
+                    ),
+                    [],
+                )
+                .expect("enable legacy MCP app");
+        }
 
         ensure_mcp_native_link_schema(&mut connection).expect("initialize native links");
 
-        assert!(read_mcp_native_link(&connection, "enabled", "claude")
-            .unwrap()
-            .is_some());
-        assert!(read_mcp_native_link(&connection, "enabled", "codex")
-            .unwrap()
-            .is_some());
-        assert!(read_mcp_native_link(&connection, "disabled", "claude")
-            .unwrap()
-            .is_none());
+        for descriptor in builtin_app_registry().descriptors() {
+            if descriptor.mcp_contract().is_some() {
+                assert!(
+                    read_mcp_native_link(&connection, "enabled", descriptor.id())
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    read_mcp_native_link(&connection, "disabled", descriptor.id())
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
     }
 
     #[test]

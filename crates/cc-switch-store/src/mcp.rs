@@ -1,8 +1,11 @@
 use std::fmt;
 
-use cc_switch_core::McpConfigTarget;
+use cc_switch_core::{
+    builtin_app_registry, mcp_catalog_columns, AppType, McpCatalogColumn, McpConfigTarget,
+};
 use rusqlite::{
-    params, Connection, OptionalExtension, Params, Row, ToSql, Transaction, TransactionBehavior,
+    params, params_from_iter, Connection, OptionalExtension, Params, Row, ToSql, Transaction,
+    TransactionBehavior,
 };
 
 use crate::{source_fingerprint, SharedStoreError};
@@ -10,9 +13,15 @@ use crate::{source_fingerprint, SharedStoreError};
 /// Canonical MCP catalog table shared by CC Switch products.
 pub const MCP_SERVERS_TABLE: &str = "mcp_servers";
 
-const SELECT_MCP_SERVER_FIELDS: &str = "id, name, server_config, description, homepage, docs, tags,
-    enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild, enabled_opencode,
-    enabled_hermes";
+const MCP_SERVER_BASE_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "server_config",
+    "description",
+    "homepage",
+    "docs",
+    "tags",
+];
 const MCP_SERVER_FIELD_COUNT: usize = 13;
 
 const CREATE_MCP_SERVERS_TABLE: &str = "CREATE TABLE IF NOT EXISTS main.mcp_servers (
@@ -22,18 +31,12 @@ const CREATE_MCP_SERVERS_TABLE: &str = "CREATE TABLE IF NOT EXISTS main.mcp_serv
     description TEXT,
     homepage TEXT,
     docs TEXT,
-    tags TEXT NOT NULL DEFAULT '[]',
-    enabled_claude BOOLEAN NOT NULL DEFAULT 0,
-    enabled_codex BOOLEAN NOT NULL DEFAULT 0,
-    enabled_gemini BOOLEAN NOT NULL DEFAULT 0,
-    enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
-    enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
-    enabled_hermes BOOLEAN NOT NULL DEFAULT 0
+    tags TEXT NOT NULL DEFAULT '[]'
 )";
 
 const BASE_MCP_SERVER_COLUMNS: &[&str] = &["id", "name", "server_config"];
 
-const MCP_SERVER_COLUMNS: &[McpServerColumn] = &[
+const MCP_SERVER_BASE_COLUMNS: &[McpServerColumn] = &[
     McpServerColumn::primary_text("id"),
     McpServerColumn::required_text("name"),
     McpServerColumn::required_text("server_config"),
@@ -41,42 +44,6 @@ const MCP_SERVER_COLUMNS: &[McpServerColumn] = &[
     McpServerColumn::optional_text("homepage"),
     McpServerColumn::optional_text("docs"),
     McpServerColumn::defaulted("tags", "TEXT", "TEXT NOT NULL DEFAULT '[]'", "'[]'"),
-    McpServerColumn::defaulted(
-        "enabled_claude",
-        "BOOLEAN",
-        "BOOLEAN NOT NULL DEFAULT 0",
-        "0",
-    ),
-    McpServerColumn::defaulted(
-        "enabled_codex",
-        "BOOLEAN",
-        "BOOLEAN NOT NULL DEFAULT 0",
-        "0",
-    ),
-    McpServerColumn::defaulted(
-        "enabled_gemini",
-        "BOOLEAN",
-        "BOOLEAN NOT NULL DEFAULT 0",
-        "0",
-    ),
-    McpServerColumn::defaulted(
-        "enabled_grokbuild",
-        "BOOLEAN",
-        "BOOLEAN NOT NULL DEFAULT 0",
-        "0",
-    ),
-    McpServerColumn::defaulted(
-        "enabled_opencode",
-        "BOOLEAN",
-        "BOOLEAN NOT NULL DEFAULT 0",
-        "0",
-    ),
-    McpServerColumn::defaulted(
-        "enabled_hermes",
-        "BOOLEAN",
-        "BOOLEAN NOT NULL DEFAULT 0",
-        "0",
-    ),
 ];
 
 #[derive(Clone, Copy)]
@@ -149,6 +116,48 @@ struct ExistingColumn {
     hidden: i64,
 }
 
+struct McpProjection {
+    selections: Vec<McpCatalogColumn>,
+    select_list: String,
+    host_offset: usize,
+}
+
+fn mcp_server_contract_columns() -> Vec<McpServerColumn> {
+    let mut columns = MCP_SERVER_BASE_COLUMNS.to_vec();
+    columns.extend(mcp_catalog_columns().map(|column| {
+        McpServerColumn::defaulted(
+            column.as_str(),
+            "BOOLEAN",
+            "BOOLEAN NOT NULL DEFAULT 0",
+            "0",
+        )
+    }));
+    columns
+}
+
+fn core_mcp_projection() -> McpProjection {
+    let selections = mcp_catalog_columns().collect::<Vec<_>>();
+    let mut fields = MCP_SERVER_BASE_FIELDS
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect::<Vec<_>>();
+    fields.extend(
+        selections
+            .iter()
+            .map(|column| format!("mcp_servers.{}", quoted_mcp_column(column.as_str()))),
+    );
+    let host_offset = fields.len();
+    McpProjection {
+        selections,
+        select_list: fields.join(", "),
+        host_offset,
+    }
+}
+
+fn quoted_mcp_column(column: &str) -> String {
+    format!("\"{}\"", column.replace('"', "\"\""))
+}
+
 /// An unparsed row from the shared `mcp_servers` table.
 #[derive(Clone, PartialEq, Eq)]
 pub struct McpServerRow {
@@ -165,6 +174,7 @@ pub struct McpServerRow {
     pub enabled_grokbuild: i64,
     pub enabled_opencode: i64,
     pub enabled_hermes: i64,
+    selections: Vec<(McpCatalogColumn, i64)>,
     source_fingerprint: [u8; 32],
 }
 
@@ -173,6 +183,27 @@ impl McpServerRow {
     /// unknown future columns, without exposing their contents.
     pub fn source_fingerprint(&self) -> &[u8; 32] {
         &self.source_fingerprint
+    }
+
+    /// Returns whether this row selects an application with an MCP contract.
+    pub fn enabled_for(&self, app: &AppType) -> Option<bool> {
+        let column = builtin_app_registry()
+            .for_app(app)
+            .mcp_contract()?
+            .catalog_column();
+        self.selections
+            .iter()
+            .find_map(|(candidate, enabled)| (*candidate == column).then_some(*enabled != 0))
+    }
+
+    /// Returns every registry-declared MCP selection in stable order.
+    pub fn selections(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (McpCatalogColumn, bool)> + DoubleEndedIterator + Clone + '_
+    {
+        self.selections
+            .iter()
+            .map(|(column, enabled)| (*column, *enabled != 0))
     }
 }
 
@@ -255,6 +286,72 @@ impl McpServerValues<'_> {
     }
 }
 
+/// Non-selection fields for one shared MCP catalog row.
+pub struct McpServerFields<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub server_config: &'a str,
+    pub description: Option<&'a str>,
+    pub homepage: Option<&'a str>,
+    pub docs: Option<&'a str>,
+    pub tags: &'a str,
+}
+
+/// MCP row values whose application selections come from the Core registry.
+pub struct McpServerCatalogValues<'a> {
+    fields: McpServerFields<'a>,
+    selections: Vec<(McpCatalogColumn, bool)>,
+}
+
+impl<'a> McpServerCatalogValues<'a> {
+    /// Captures one value for every MCP application in registry order.
+    pub fn new(fields: McpServerFields<'a>, mut enabled_for: impl FnMut(&AppType) -> bool) -> Self {
+        let selections = builtin_app_registry()
+            .descriptors()
+            .filter_map(|descriptor| {
+                descriptor
+                    .mcp_contract()
+                    .map(|contract| (contract.catalog_column(), enabled_for(descriptor.app())))
+            })
+            .collect();
+        Self { fields, selections }
+    }
+
+    fn params(&self) -> Vec<&dyn ToSql> {
+        let mut params: Vec<&dyn ToSql> = vec![
+            &self.fields.id,
+            &self.fields.name,
+            &self.fields.server_config,
+            &self.fields.description,
+            &self.fields.homepage,
+            &self.fields.docs,
+            &self.fields.tags,
+        ];
+        params.extend(
+            self.selections
+                .iter()
+                .map(|(_, enabled)| enabled as &dyn ToSql),
+        );
+        params
+    }
+}
+
+impl fmt::Debug for McpServerCatalogValues<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpServerCatalogValues")
+            .field("id", &self.fields.id)
+            .field("name", &self.fields.name)
+            .field("server_config", &"<redacted>")
+            .field("description", &self.fields.description)
+            .field("homepage", &self.fields.homepage)
+            .field("docs", &self.fields.docs)
+            .field("tags", &self.fields.tags)
+            .field("selections", &self.selections)
+            .finish()
+    }
+}
+
 fn enabled_column(target: McpConfigTarget) -> &'static str {
     match target {
         McpConfigTarget::Claude => "enabled_claude",
@@ -287,7 +384,7 @@ pub fn ensure_mcp_server_schema(connection: &mut Connection) -> Result<(), Share
     let initial_columns = mcp_server_columns(&transaction)?;
     verify_base_mcp_server_schema(&initial_columns)?;
     verify_mcp_server_primary_key(&transaction, &initial_columns)?;
-    for expected in MCP_SERVER_COLUMNS {
+    for expected in mcp_server_contract_columns() {
         if !initial_columns
             .iter()
             .any(|column| column.name == expected.name)
@@ -307,14 +404,16 @@ pub fn ensure_mcp_server_schema(connection: &mut Connection) -> Result<(), Share
 pub fn read_mcp_server_rows(
     connection: &Connection,
 ) -> Result<Vec<McpServerRow>, SharedStoreError> {
+    let projection = core_mcp_projection();
     let sql = format!(
-        "SELECT {SELECT_MCP_SERVER_FIELDS}, mcp_servers.*
+        "SELECT {}, mcp_servers.*
          FROM main.mcp_servers AS mcp_servers
-         ORDER BY name COLLATE BINARY ASC, id COLLATE BINARY ASC"
+         ORDER BY name COLLATE BINARY ASC, id COLLATE BINARY ASC",
+        projection.select_list
     );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement
-        .query_map([], mcp_server_from_row)?
+        .query_map([], |row| mcp_server_from_row(row, &projection))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(SharedStoreError::from)?;
     Ok(rows)
@@ -325,15 +424,83 @@ pub fn read_mcp_server_row(
     connection: &Connection,
     id: &str,
 ) -> Result<Option<McpServerRow>, SharedStoreError> {
+    let projection = core_mcp_projection();
     let sql = format!(
-        "SELECT {SELECT_MCP_SERVER_FIELDS}, mcp_servers.*
+        "SELECT {}, mcp_servers.*
          FROM main.mcp_servers AS mcp_servers
-         WHERE id COLLATE BINARY = ?1"
+         WHERE id COLLATE BINARY = ?1",
+        projection.select_list
     );
     connection
-        .query_row(&sql, [id], mcp_server_from_row)
+        .query_row(&sql, [id], |row| mcp_server_from_row(row, &projection))
         .optional()
         .map_err(SharedStoreError::from)
+}
+
+/// Inserts one registry-complete MCP row when its binary identifier is absent.
+pub fn insert_mcp_server_catalog(
+    transaction: &mut Transaction<'_>,
+    server: &McpServerCatalogValues<'_>,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    if mcp_server_for_write(transaction, server.fields.id)?.is_some() {
+        return Ok(McpServerWriteOutcome::NotApplied);
+    }
+    let columns = MCP_SERVER_BASE_FIELDS
+        .iter()
+        .map(|field| (*field).to_owned())
+        .chain(
+            server
+                .selections
+                .iter()
+                .map(|(column, _)| quoted_mcp_column(column.as_str())),
+        )
+        .collect::<Vec<_>>();
+    let placeholders = (1..=columns.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "INSERT INTO main.mcp_servers ({}) VALUES ({placeholders})",
+        columns.join(", ")
+    );
+    let params = server.params();
+    execute_mcp_server_write(transaction, &sql, params_from_iter(params), |connection| {
+        Ok(read_mcp_server_row(connection, server.fields.id)?
+            .as_ref()
+            .is_some_and(|row| mcp_server_catalog_matches(row, server)))
+    })
+}
+
+/// Replaces Registry-owned MCP fields after a full source fingerprint match.
+pub fn update_mcp_server_catalog(
+    transaction: &mut Transaction<'_>,
+    expected_fingerprint: &[u8; 32],
+    server: &McpServerCatalogValues<'_>,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    if !mcp_server_fingerprint_matches(transaction, server.fields.id, expected_fingerprint)? {
+        return Ok(McpServerWriteOutcome::NotApplied);
+    }
+    let assignments = MCP_SERVER_BASE_FIELDS
+        .iter()
+        .skip(1)
+        .map(|field| (*field).to_owned())
+        .chain(
+            server
+                .selections
+                .iter()
+                .map(|(column, _)| quoted_mcp_column(column.as_str())),
+        )
+        .enumerate()
+        .map(|(offset, field)| format!("{field} = ?{}", offset + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("UPDATE main.mcp_servers SET {assignments} WHERE id COLLATE BINARY = ?1");
+    let params = server.params();
+    execute_mcp_server_write(transaction, &sql, params_from_iter(params), |connection| {
+        Ok(read_mcp_server_row(connection, server.fields.id)?
+            .as_ref()
+            .is_some_and(|row| mcp_server_catalog_matches(row, server)))
+    })
 }
 
 /// Inserts one MCP row only when its binary identifier is absent.
@@ -395,6 +562,39 @@ pub fn set_mcp_server_enabled(
     target: McpConfigTarget,
     enabled: bool,
 ) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    set_mcp_server_enabled_column(
+        transaction,
+        id,
+        expected_fingerprint,
+        enabled_column(target),
+        enabled,
+    )
+}
+
+/// Changes one Registry-declared application selection after a fingerprint match.
+pub fn set_mcp_server_selection(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    expected_fingerprint: &[u8; 32],
+    column: McpCatalogColumn,
+    enabled: bool,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
+    set_mcp_server_enabled_column(
+        transaction,
+        id,
+        expected_fingerprint,
+        column.as_str(),
+        enabled,
+    )
+}
+
+fn set_mcp_server_enabled_column(
+    transaction: &mut Transaction<'_>,
+    id: &str,
+    expected_fingerprint: &[u8; 32],
+    column: &str,
+    enabled: bool,
+) -> Result<McpServerWriteOutcome, SharedStoreError> {
     let Some(before) = mcp_server_for_write(transaction, id)? else {
         return Ok(McpServerWriteOutcome::NotApplied);
     };
@@ -403,12 +603,12 @@ pub fn set_mcp_server_enabled(
     }
     let sql = format!(
         "UPDATE main.mcp_servers SET {} = ?1 WHERE id COLLATE BINARY = ?2",
-        enabled_column(target)
+        quoted_mcp_column(column)
     );
     execute_mcp_server_write(transaction, &sql, params![enabled, id], |connection| {
         Ok(read_mcp_server_row(connection, id)?
             .as_ref()
-            .is_some_and(|after| mcp_toggle_matches(&before, after, target, enabled)))
+            .is_some_and(|after| mcp_toggle_matches(&before, after, column, enabled)))
     })
 }
 
@@ -469,7 +669,22 @@ fn verify_mcp_server_table_sql(connection: &Connection, sql: &str) -> Result<(),
         })
 }
 
-fn mcp_server_from_row(row: &Row<'_>) -> Result<McpServerRow, rusqlite::Error> {
+fn mcp_server_from_row(
+    row: &Row<'_>,
+    projection: &McpProjection,
+) -> Result<McpServerRow, rusqlite::Error> {
+    let selections = projection
+        .selections
+        .iter()
+        .enumerate()
+        .map(|(offset, column)| row.get(7 + offset).map(|enabled| (*column, enabled)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected = |name| {
+        selections
+            .iter()
+            .find_map(|(column, enabled)| (column.as_str() == name).then_some(*enabled))
+            .unwrap_or_default()
+    };
     Ok(McpServerRow {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -478,13 +693,14 @@ fn mcp_server_from_row(row: &Row<'_>) -> Result<McpServerRow, rusqlite::Error> {
         homepage: row.get(4)?,
         docs: row.get(5)?,
         tags: row.get(6)?,
-        enabled_claude: row.get(7)?,
-        enabled_codex: row.get(8)?,
-        enabled_gemini: row.get(9)?,
-        enabled_grokbuild: row.get(10)?,
-        enabled_opencode: row.get(11)?,
-        enabled_hermes: row.get(12)?,
-        source_fingerprint: source_fingerprint(row, MCP_SERVER_FIELD_COUNT)?,
+        enabled_claude: selected("enabled_claude"),
+        enabled_codex: selected("enabled_codex"),
+        enabled_gemini: selected("enabled_gemini"),
+        enabled_grokbuild: selected("enabled_grokbuild"),
+        enabled_opencode: selected("enabled_opencode"),
+        enabled_hermes: selected("enabled_hermes"),
+        selections,
+        source_fingerprint: source_fingerprint(row, projection.host_offset)?,
     })
 }
 
@@ -616,20 +832,47 @@ fn mcp_server_matches(row: &McpServerRow, values: &McpServerValues<'_>) -> bool 
         && row.enabled_hermes == i64::from(values.enabled_hermes)
 }
 
+fn mcp_server_catalog_matches(row: &McpServerRow, values: &McpServerCatalogValues<'_>) -> bool {
+    row.id == values.fields.id
+        && row.name == values.fields.name
+        && row.server_config == values.fields.server_config
+        && row.description.as_deref() == values.fields.description
+        && row.homepage.as_deref() == values.fields.homepage
+        && row.docs.as_deref() == values.fields.docs
+        && row.tags == values.fields.tags
+        && row
+            .selections
+            .iter()
+            .map(|(column, enabled)| (*column, *enabled))
+            .eq(values
+                .selections
+                .iter()
+                .map(|(column, enabled)| (*column, i64::from(*enabled))))
+}
+
 fn mcp_toggle_matches(
     before: &McpServerRow,
     after: &McpServerRow,
-    target: McpConfigTarget,
+    column: &str,
     enabled: bool,
 ) -> bool {
     let mut expected = before.clone();
-    match target {
-        McpConfigTarget::Claude => expected.enabled_claude = i64::from(enabled),
-        McpConfigTarget::Codex => expected.enabled_codex = i64::from(enabled),
-        McpConfigTarget::Gemini => expected.enabled_gemini = i64::from(enabled),
-        McpConfigTarget::GrokBuild => expected.enabled_grokbuild = i64::from(enabled),
-        McpConfigTarget::OpenCode => expected.enabled_opencode = i64::from(enabled),
-        McpConfigTarget::Hermes => expected.enabled_hermes = i64::from(enabled),
+    let Some((_, selected)) = expected
+        .selections
+        .iter_mut()
+        .find(|(candidate, _)| candidate.as_str() == column)
+    else {
+        return false;
+    };
+    *selected = i64::from(enabled);
+    match column {
+        "enabled_claude" => expected.enabled_claude = i64::from(enabled),
+        "enabled_codex" => expected.enabled_codex = i64::from(enabled),
+        "enabled_gemini" => expected.enabled_gemini = i64::from(enabled),
+        "enabled_grokbuild" => expected.enabled_grokbuild = i64::from(enabled),
+        "enabled_opencode" => expected.enabled_opencode = i64::from(enabled),
+        "enabled_hermes" => expected.enabled_hermes = i64::from(enabled),
+        _ => {}
     }
     expected.source_fingerprint = after.source_fingerprint;
     expected == *after
@@ -761,7 +1004,7 @@ fn verify_base_mcp_server_schema(columns: &[ExistingColumn]) -> Result<(), Share
 fn verify_mcp_server_schema(connection: &Connection) -> Result<(), SharedStoreError> {
     let columns = mcp_server_columns(connection)?;
     verify_mcp_server_primary_key(connection, &columns)?;
-    for expected in MCP_SERVER_COLUMNS {
+    for expected in mcp_server_contract_columns() {
         let actual = columns
             .iter()
             .find(|column| column.name == expected.name)
@@ -870,6 +1113,26 @@ mod tests {
         }
     }
 
+    fn catalog_values<'a>(
+        id: &'a str,
+        name: &'a str,
+        server_config: &'a str,
+        enabled_apps: &[AppType],
+    ) -> McpServerCatalogValues<'a> {
+        McpServerCatalogValues::new(
+            McpServerFields {
+                id,
+                name,
+                server_config,
+                description: Some("description"),
+                homepage: None,
+                docs: Some("https://example.com/docs"),
+                tags: "[\"docs\"]",
+            },
+            |app| enabled_apps.contains(app),
+        )
+    }
+
     #[test]
     fn creates_canonical_schema_without_owning_product_version() {
         let (_directory, database) = test_database();
@@ -887,7 +1150,7 @@ mod tests {
             37
         );
         let columns = mcp_server_columns(&connection).expect("read MCP schema");
-        assert_eq!(columns.len(), MCP_SERVER_COLUMNS.len());
+        assert_eq!(columns.len(), mcp_server_contract_columns().len());
         verify_mcp_server_schema(&connection).expect("verify MCP schema");
     }
 
@@ -996,6 +1259,151 @@ mod tests {
         assert!(read_mcp_server_row(&connection, "Upper")
             .expect("read binary mismatch")
             .is_none());
+    }
+
+    #[test]
+    fn registry_catalog_writes_round_trip_every_selection() {
+        let (_directory, database) = test_database();
+        let mut connection = database.connect().expect("connect shared database");
+        ensure_mcp_server_schema(&mut connection).expect("initialize MCP schema");
+        connection
+            .execute_batch("ALTER TABLE mcp_servers ADD COLUMN host_note TEXT DEFAULT 'keep';")
+            .expect("add host extension");
+
+        let initial = catalog_values(
+            "server",
+            "Server",
+            "{}",
+            &[AppType::Claude, AppType::Hermes],
+        );
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("transaction");
+        assert_eq!(
+            insert_mcp_server_catalog(&mut transaction, &initial).expect("insert catalog row"),
+            McpServerWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit insert");
+
+        let inserted = read_mcp_server_row(&connection, "server")
+            .expect("read inserted row")
+            .expect("inserted row exists");
+        assert!(inserted.enabled_for(&AppType::Claude).unwrap());
+        assert!(inserted.enabled_for(&AppType::Hermes).unwrap());
+        assert_eq!(inserted.enabled_for(&AppType::Pi), None);
+        assert_eq!(inserted.selections().count(), mcp_catalog_columns().count());
+
+        let updated = catalog_values("server", "Updated", "{}", &[AppType::Gemini]);
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("transaction");
+        assert_eq!(
+            update_mcp_server_catalog(&mut transaction, inserted.source_fingerprint(), &updated,)
+                .expect("update catalog row"),
+            McpServerWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit update");
+
+        let updated = read_mcp_server_row(&connection, "server")
+            .expect("read updated row")
+            .expect("updated row exists");
+        let codex_column = builtin_app_registry()
+            .for_app(&AppType::Codex)
+            .mcp_contract()
+            .unwrap()
+            .catalog_column();
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("transaction");
+        assert_eq!(
+            set_mcp_server_selection(
+                &mut transaction,
+                "server",
+                updated.source_fingerprint(),
+                codex_column,
+                true,
+            )
+            .expect("toggle catalog selection"),
+            McpServerWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit toggle");
+
+        let final_row = read_mcp_server_row(&connection, "server")
+            .expect("read final row")
+            .expect("final row exists");
+        assert_eq!(final_row.name, "Updated");
+        assert!(final_row.enabled_for(&AppType::Codex).unwrap());
+        assert!(final_row.enabled_for(&AppType::Gemini).unwrap());
+        assert!(!final_row.enabled_for(&AppType::Claude).unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT host_note FROM mcp_servers WHERE id = 'server'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read host extension"),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn registry_catalog_rejects_rewritten_selection_values() {
+        let (_directory, database) = test_database();
+        database
+            .ensure_mcp_server_schema()
+            .expect("initialize MCP schema");
+        let mut connection = database.connect().expect("connect shared database");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER rewrite_catalog_insert AFTER INSERT ON mcp_servers BEGIN
+                    UPDATE mcp_servers SET enabled_claude = 2 WHERE id = NEW.id;
+                 END;",
+            )
+            .expect("create insert rewrite trigger");
+
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("transaction");
+        let rewritten_insert = catalog_values("rewritten", "Rewritten", "{}", &[AppType::Claude]);
+        assert_eq!(
+            insert_mcp_server_catalog(&mut transaction, &rewritten_insert)
+                .expect("reject rewritten insert"),
+            McpServerWriteOutcome::NotApplied
+        );
+        assert!(read_mcp_server_row(&transaction, "rewritten")
+            .expect("read rolled-back insert")
+            .is_none());
+        transaction.commit().expect("commit empty transaction");
+
+        connection
+            .execute_batch("DROP TRIGGER rewrite_catalog_insert;")
+            .expect("remove insert rewrite trigger");
+        let initial = catalog_values("server", "Server", "{}", &[]);
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("transaction");
+        assert_eq!(
+            insert_mcp_server_catalog(&mut transaction, &initial).expect("insert initial row"),
+            McpServerWriteOutcome::Applied
+        );
+        transaction.commit().expect("commit initial row");
+        let before = read_mcp_server_row(&connection, "server")
+            .expect("read initial row")
+            .expect("initial row exists");
+
+        connection
+            .execute_batch(
+                "CREATE TRIGGER rewrite_catalog_update
+                 AFTER UPDATE OF enabled_gemini ON mcp_servers BEGIN
+                    UPDATE mcp_servers SET enabled_gemini = -1 WHERE id = NEW.id;
+                 END;",
+            )
+            .expect("create update rewrite trigger");
+        let updated = catalog_values("server", "Updated", "{}", &[AppType::Gemini]);
+        let mut transaction = begin_immediate_transaction(&mut connection).expect("transaction");
+        assert_eq!(
+            update_mcp_server_catalog(&mut transaction, before.source_fingerprint(), &updated)
+                .expect("reject rewritten update"),
+            McpServerWriteOutcome::NotApplied
+        );
+        assert_eq!(
+            read_mcp_server_row(&transaction, "server")
+                .expect("read rolled-back update")
+                .expect("initial row remains"),
+            before
+        );
+        transaction.commit().expect("commit empty transaction");
     }
 
     #[test]
@@ -1213,10 +1621,8 @@ mod tests {
 
     #[test]
     fn write_contract_rejects_corrupt_table_definition() {
-        let connection = Connection::open_in_memory().expect("open database");
-        connection
-            .execute_batch(CREATE_MCP_SERVERS_TABLE)
-            .expect("create canonical MCP table");
+        let mut connection = Connection::open_in_memory().expect("open database");
+        ensure_mcp_server_schema(&mut connection).expect("create canonical MCP table");
         connection
             .execute_batch(
                 "PRAGMA writable_schema = ON;

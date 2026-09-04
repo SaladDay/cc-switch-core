@@ -23,9 +23,10 @@ mod mcp_native_link;
 mod skill;
 
 pub use mcp::{
-    delete_mcp_server, ensure_mcp_server_schema, insert_mcp_server, read_mcp_server_row,
-    read_mcp_server_rows, set_mcp_server_enabled, update_mcp_server,
-    verify_mcp_server_write_contract, McpServerRow, McpServerValues, McpServerWriteOutcome,
+    delete_mcp_server, ensure_mcp_server_schema, insert_mcp_server, insert_mcp_server_catalog,
+    read_mcp_server_row, read_mcp_server_rows, set_mcp_server_enabled, set_mcp_server_selection,
+    update_mcp_server, update_mcp_server_catalog, verify_mcp_server_write_contract,
+    McpServerCatalogValues, McpServerFields, McpServerRow, McpServerValues, McpServerWriteOutcome,
     MCP_SERVERS_TABLE,
 };
 pub use mcp_native_link::{
