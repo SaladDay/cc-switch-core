@@ -365,6 +365,51 @@ mod tests {
     }
 
     #[test]
+    fn mcp_catalog_columns_follow_the_registry() {
+        let expected = [
+            ("claude", "enabled_claude"),
+            ("codex", "enabled_codex"),
+            ("gemini", "enabled_gemini"),
+            ("grokbuild", "enabled_grokbuild"),
+            ("opencode", "enabled_opencode"),
+            ("hermes", "enabled_hermes"),
+        ];
+        let actual = builtin_app_registry()
+            .descriptors()
+            .filter_map(|descriptor| {
+                descriptor
+                    .mcp_contract()
+                    .map(|contract| (descriptor.id(), contract.catalog_column().as_str()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            crate::mcp_catalog_columns()
+                .map(crate::McpCatalogColumn::as_str)
+                .collect::<Vec<_>>(),
+            expected.map(|(_, column)| column)
+        );
+
+        let mut columns = HashSet::new();
+        for column in crate::mcp_catalog_columns() {
+            assert!(
+                column.as_str().starts_with("enabled_")
+                    && column
+                        .as_str()
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "{}",
+                column.as_str()
+            );
+            assert!(
+                columns.insert(column),
+                "duplicate column {}",
+                column.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn skill_contract_matrix_is_stable() {
         let catalog = crate::SkillCatalogColumn::new;
 

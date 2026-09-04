@@ -55,12 +55,18 @@ pub enum McpConfigTarget {
 /// MCP behavior that a host must honor for one application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct McpAppContract {
+    catalog_column: McpCatalogColumn,
     target: McpConfigTarget,
     preserves_disabled_entry: bool,
     supports_cwd: bool,
 }
 
 impl McpAppContract {
+    /// Returns the shared-catalog column that stores this application's state.
+    pub const fn catalog_column(self) -> McpCatalogColumn {
+        self.catalog_column
+    }
+
     /// Returns the application-owned MCP document target.
     pub const fn target(self) -> McpConfigTarget {
         self.target
@@ -77,32 +83,60 @@ impl McpAppContract {
     }
 }
 
+/// A schema-backed `mcp_servers` selection column declared by Core.
+///
+/// Hosts can read its identifier but cannot construct arbitrary columns.
+///
+/// ```compile_fail
+/// use cc_switch_core::McpCatalogColumn;
+/// let _ = McpCatalogColumn("enabled_unknown");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct McpCatalogColumn(&'static str);
+
+impl McpCatalogColumn {
+    pub(crate) const fn new(column: &'static str) -> Self {
+        Self(column)
+    }
+
+    /// Returns the fixed database identifier.
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
 pub(crate) const CLAUDE_MCP: McpAppContract = McpAppContract {
+    catalog_column: McpCatalogColumn::new("enabled_claude"),
     target: McpConfigTarget::Claude,
     preserves_disabled_entry: false,
     supports_cwd: true,
 };
 pub(crate) const CODEX_MCP: McpAppContract = McpAppContract {
+    catalog_column: McpCatalogColumn::new("enabled_codex"),
     target: McpConfigTarget::Codex,
     preserves_disabled_entry: true,
     supports_cwd: true,
 };
 pub(crate) const GEMINI_MCP: McpAppContract = McpAppContract {
+    catalog_column: McpCatalogColumn::new("enabled_gemini"),
     target: McpConfigTarget::Gemini,
     preserves_disabled_entry: false,
     supports_cwd: true,
 };
 pub(crate) const GROKBUILD_MCP: McpAppContract = McpAppContract {
+    catalog_column: McpCatalogColumn::new("enabled_grokbuild"),
     target: McpConfigTarget::GrokBuild,
     preserves_disabled_entry: true,
     supports_cwd: true,
 };
 pub(crate) const OPENCODE_MCP: McpAppContract = McpAppContract {
+    catalog_column: McpCatalogColumn::new("enabled_opencode"),
     target: McpConfigTarget::OpenCode,
     preserves_disabled_entry: true,
     supports_cwd: false,
 };
 pub(crate) const HERMES_MCP: McpAppContract = McpAppContract {
+    catalog_column: McpCatalogColumn::new("enabled_hermes"),
     target: McpConfigTarget::Hermes,
     preserves_disabled_entry: true,
     supports_cwd: false,
@@ -219,6 +253,17 @@ pub enum McpConfigError {
 /// Returns the MCP behavior declared for an application.
 pub fn mcp_app_contract(app: &AppType) -> Option<&'static McpAppContract> {
     crate::builtin_app_registry().for_app(app).mcp_contract()
+}
+
+/// Returns every shared `mcp_servers.enabled_*` column in registry order.
+pub fn mcp_catalog_columns() -> impl Iterator<Item = McpCatalogColumn> + Clone {
+    crate::builtin_app_registry()
+        .descriptors()
+        .filter_map(|descriptor| {
+            descriptor
+                .mcp_contract()
+                .map(|contract| contract.catalog_column())
+        })
 }
 
 /// Returns the live MCP target declared for an application.
