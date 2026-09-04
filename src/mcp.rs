@@ -16,6 +16,29 @@ mod json_patch;
 
 const MAX_MCP_ID_BYTES: usize = 128;
 const MANAGED_SERVER_FIELDS: &[&str] = &["type", "command", "args", "env", "cwd", "url", "headers"];
+const MCP_METADATA_FIELDS: &[&str] = &[
+    "enabled",
+    "source",
+    "id",
+    "name",
+    "description",
+    "tags",
+    "homepage",
+    "docs",
+    "server",
+];
+const GEMINI_TIMEOUT_FIELDS: &[&str] = &[
+    "timeout",
+    "startup_timeout_sec",
+    "startup_timeout_ms",
+    "tool_timeout_sec",
+    "tool_timeout_ms",
+];
+const NATIVE_ALIAS_FIELDS: &[(&str, &str)] = &[
+    ("environment", "env"),
+    ("http_headers", "headers"),
+    ("httpUrl", "url"),
+];
 
 /// One application-owned MCP configuration document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -187,6 +210,13 @@ pub fn validate_mcp_server(id: &str, server: &Value) -> Result<(), McpConfigErro
     let object = server.as_object().ok_or_else(|| {
         McpConfigError::InvalidServer("the definition must be an object".to_owned())
     })?;
+    for (native, canonical) in NATIVE_ALIAS_FIELDS {
+        if object.contains_key(*native) {
+            return Err(McpConfigError::InvalidServer(format!(
+                "'{native}' is a native field; use canonical '{canonical}'"
+            )));
+        }
+    }
     let transport = match object.get("type") {
         Some(Value::String(transport)) => transport.as_str(),
         Some(_) => {
@@ -248,6 +278,23 @@ pub fn validate_mcp_server_for_app(
             "application '{}' cannot represent 'cwd'",
             app.as_str()
         )));
+    }
+    if contract.target() == McpConfigTarget::Codex {
+        for (key, value) in object {
+            if !MANAGED_SERVER_FIELDS.contains(&key.as_str())
+                && !MCP_METADATA_FIELDS.contains(&key.as_str())
+                && key != "http_headers"
+            {
+                json_to_toml_item(value)?;
+            }
+        }
+    }
+    if contract.target() == McpConfigTarget::Gemini {
+        for field in GEMINI_TIMEOUT_FIELDS {
+            if let Some(value) = object.get(*field) {
+                validate_timeout_value(field, value)?;
+            }
+        }
     }
     Ok(())
 }
@@ -353,6 +400,69 @@ pub fn project_mcp_server(
         ));
     }
     Ok(projected)
+}
+
+/// Projects several server changes in memory and returns one complete document.
+///
+/// Hosts can validate the whole batch before performing a single compare-and-swap write.
+pub fn project_mcp_servers(
+    app: &AppType,
+    contents: Option<&[u8]>,
+    changes: &[(&str, McpServerProjection<'_>)],
+) -> Result<Option<String>, McpConfigError> {
+    let original = contents.map(Vec::from);
+    let mut projected = original.clone();
+    for (id, projection) in changes {
+        if let Some(next) = project_mcp_server(app, projected.as_deref(), id, *projection)? {
+            projected = Some(next.into_bytes());
+        }
+    }
+    if projected == original {
+        return Ok(None);
+    }
+    projected
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|_| invalid_document(app, "projected document is not UTF-8"))
+}
+
+/// Replaces the complete native MCP collection while preserving target-owned fields
+/// on desired entries with the same id.
+pub fn replace_mcp_servers(
+    app: &AppType,
+    contents: Option<&[u8]>,
+    servers: &Map<String, Value>,
+) -> Result<Option<String>, McpConfigError> {
+    let target = require_target(app)?;
+    validate_document_size(app, contents)?;
+    for (id, server) in servers {
+        validate_mcp_server_for_app(app, id, server)?;
+    }
+    let projected = match target {
+        McpConfigTarget::Claude => {
+            replace_json_section(app, contents, "mcpServers", JsonFlavor::Claude, servers)?
+        }
+        McpConfigTarget::Gemini => {
+            replace_json_section(app, contents, "mcpServers", JsonFlavor::Gemini, servers)?
+        }
+        McpConfigTarget::OpenCode => {
+            replace_json_section(app, contents, "mcp", JsonFlavor::OpenCode, servers)?
+        }
+        McpConfigTarget::Codex => replace_toml_section(app, contents, servers, false)?,
+        McpConfigTarget::GrokBuild => replace_toml_section(app, contents, servers, true)?,
+        McpConfigTarget::Hermes => replace_hermes_section(app, contents, servers)?,
+    };
+    if projected.len() > MAX_OPERATION_CONTENT_BYTES {
+        return Err(invalid_document(
+            app,
+            &format!("projected document exceeds {MAX_OPERATION_CONTENT_BYTES} bytes"),
+        ));
+    }
+    if contents == Some(projected.as_bytes()) {
+        Ok(None)
+    } else {
+        Ok(Some(projected))
+    }
 }
 
 fn require_target(app: &AppType) -> Result<McpConfigTarget, McpConfigError> {
@@ -674,6 +784,43 @@ fn project_json_section(
     }
 }
 
+fn replace_json_section(
+    app: &AppType,
+    contents: Option<&[u8]>,
+    section: &str,
+    flavor: JsonFlavor,
+    servers: &Map<String, Value>,
+) -> Result<String, McpConfigError> {
+    ensure_lossless_json_projection(app, contents)?;
+    let mut root = parse_json_root(app, contents)?;
+    let existing = root
+        .get(section)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut ids = servers.keys().collect::<Vec<_>>();
+    ids.sort();
+    let mut replacement = Map::new();
+    for id in ids {
+        replacement.insert(
+            id.clone(),
+            to_json_flavor(flavor, &servers[id], existing.get(id))?,
+        );
+    }
+    let replacement = Value::Object(replacement);
+    root.as_object_mut()
+        .expect("validated JSON root")
+        .insert(section.to_owned(), replacement.clone());
+    if let Some(original) = contents {
+        let original =
+            std::str::from_utf8(original).map_err(|_| invalid_document(app, "not UTF-8"))?;
+        json_patch::replace_top_level_value(original, section, &replacement)
+            .map_err(|message| invalid_document(app, &message))
+    } else {
+        pretty_json(root).map_err(|message| invalid_document(app, &message))
+    }
+}
+
 fn ensure_lossless_json_projection(
     app: &AppType,
     contents: Option<&[u8]>,
@@ -768,6 +915,7 @@ fn to_json_flavor(
                 .cloned()
                 .unwrap_or_default();
             clear_fields(&mut output, MANAGED_SERVER_FIELDS);
+            copy_json_extensions(unified, &mut output, &[]);
             copy_fields(unified, &mut output, MANAGED_SERVER_FIELDS);
             Ok(Value::Object(output))
         }
@@ -776,12 +924,15 @@ fn to_json_flavor(
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
+            let existing_timeout = output.get("timeout").cloned();
             clear_fields(
                 &mut output,
                 &[
                     "type", "command", "args", "env", "cwd", "url", "httpUrl", "headers",
                 ],
             );
+            clear_fields(&mut output, GEMINI_TIMEOUT_FIELDS);
+            copy_json_extensions(unified, &mut output, GEMINI_TIMEOUT_FIELDS);
             match unified
                 .get("type")
                 .and_then(Value::as_str)
@@ -797,6 +948,14 @@ fn to_json_flavor(
                 "sse" => copy_fields(unified, &mut output, &["url", "headers"]),
                 _ => unreachable!("validated transport"),
             }
+            let has_configured_timeout = GEMINI_TIMEOUT_FIELDS
+                .iter()
+                .any(|field| unified.contains_key(*field));
+            let timeout = match existing_timeout {
+                Some(timeout) if !has_configured_timeout => timeout,
+                _ => Value::Number(gemini_timeout_ms(unified).into()),
+            };
+            output.insert("timeout".to_owned(), timeout);
             Ok(Value::Object(output))
         }
         JsonFlavor::OpenCode => {
@@ -816,6 +975,7 @@ fn to_json_flavor(
             ] {
                 output.remove(key);
             }
+            copy_json_extensions(unified, &mut output, &["environment"]);
             match unified
                 .get("type")
                 .and_then(Value::as_str)
@@ -854,6 +1014,70 @@ fn to_json_flavor(
             Ok(Value::Object(output))
         }
     }
+}
+
+fn copy_json_extensions(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+    native_fields: &[&str],
+) {
+    for (key, value) in source {
+        if !MANAGED_SERVER_FIELDS.contains(&key.as_str())
+            && !MCP_METADATA_FIELDS.contains(&key.as_str())
+            && !native_fields.contains(&key.as_str())
+        {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn gemini_timeout_ms(server: &Map<String, Value>) -> u64 {
+    const DEFAULT_STARTUP_MS: u64 = 10_000;
+    const DEFAULT_TOOL_MS: u64 = 60_000;
+
+    let timeout = numeric_timeout(server.get("timeout"), 1).unwrap_or(0);
+    let startup = [
+        numeric_timeout(server.get("startup_timeout_sec"), 1_000),
+        numeric_timeout(server.get("startup_timeout_ms"), 1),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(DEFAULT_STARTUP_MS);
+    let tool = [
+        numeric_timeout(server.get("tool_timeout_sec"), 1_000),
+        numeric_timeout(server.get("tool_timeout_ms"), 1),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(DEFAULT_TOOL_MS);
+    timeout.max(startup).max(tool)
+}
+
+fn validate_timeout_value(field: &str, value: &Value) -> Result<(), McpConfigError> {
+    let multiplier = if field.ends_with("_sec") { 1_000 } else { 1 };
+    if numeric_timeout(Some(value), multiplier).is_some() {
+        Ok(())
+    } else {
+        Err(McpConfigError::InvalidServer(format!(
+            "'{field}' must be a non-negative number of whole milliseconds"
+        )))
+    }
+}
+
+fn numeric_timeout(value: Option<&Value>, multiplier: u64) -> Option<u64> {
+    value.and_then(|value| {
+        if let Some(value) = value.as_u64() {
+            return value.checked_mul(multiplier);
+        }
+        let milliseconds = value.as_f64()? * multiplier as f64;
+        (milliseconds.is_finite()
+            && milliseconds >= 0.0
+            && milliseconds < u64::MAX as f64
+            && milliseconds.fract() == 0.0)
+            .then_some(milliseconds as u64)
+    })
 }
 
 fn infer_transport(object: &mut Map<String, Value>) {
@@ -1038,6 +1262,46 @@ fn project_toml_section(
     Ok(changed.then(|| document.to_string()))
 }
 
+fn replace_toml_section(
+    app: &AppType,
+    contents: Option<&[u8]>,
+    servers: &Map<String, Value>,
+    grok: bool,
+) -> Result<String, McpConfigError> {
+    let mut document = parse_toml(app, contents)?;
+    let mut ids = servers.keys().collect::<Vec<_>>();
+    ids.sort();
+    let entries = ids
+        .into_iter()
+        .map(|id| {
+            let existing = official_toml_entry(&document, id)
+                .cloned()
+                .or_else(|| {
+                    (!grok)
+                        .then(|| legacy_toml_entry(&document, id).cloned())
+                        .flatten()
+                })
+                .filter(|item| item.as_table_like().is_some() || item.as_inline_table().is_some());
+            unified_to_toml_server(&servers[id], grok, existing).map(|entry| (id.clone(), entry))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    document.as_table_mut().remove("mcp_servers");
+    if !entries.is_empty() {
+        let mut table = Table::new();
+        for (id, entry) in entries {
+            table.insert(&id, entry);
+        }
+        document["mcp_servers"] = Item::Table(table);
+    }
+    if grok {
+        document.as_table_mut().remove("disabled_mcp_servers");
+    } else if let Some(mcp) = document.get_mut("mcp").and_then(Item::as_table_like_mut) {
+        mcp.remove("servers");
+    }
+    Ok(document.to_string())
+}
+
 fn grok_disabled_ids(
     app: &AppType,
     document: &DocumentMut,
@@ -1121,6 +1385,13 @@ fn ensure_official_toml_entries<'a>(
     app: &AppType,
     document: &'a mut DocumentMut,
 ) -> Result<&'a mut dyn TableLike, McpConfigError> {
+    if let Some(inline) = document
+        .get("mcp_servers")
+        .and_then(Item::as_inline_table)
+        .cloned()
+    {
+        document["mcp_servers"] = Item::Table(inline.into_table());
+    }
     match document.get("mcp_servers") {
         Some(value) if value.as_table_like().is_none() => {
             return Err(invalid_document(app, "'mcp_servers' must be a table"));
@@ -1159,7 +1430,11 @@ fn unified_to_toml_server(
     existing: Option<Item>,
 ) -> Result<Item, McpConfigError> {
     let source = server.as_object().expect("validated server object");
-    let mut output = existing.unwrap_or_else(|| Item::Table(Table::new()));
+    let mut output = match existing {
+        Some(Item::Value(toml_edit::Value::InlineTable(table))) => Item::Table(table.into_table()),
+        Some(item) => item,
+        None => Item::Table(Table::new()),
+    };
     let table = output.as_table_like_mut().ok_or_else(|| {
         McpConfigError::InvalidServer("existing TOML MCP entry must be a table".to_owned())
     })?;
@@ -1177,15 +1452,17 @@ fn unified_to_toml_server(
         table.remove(key);
     }
     for (key, value) in source {
-        if !MANAGED_SERVER_FIELDS.contains(&key.as_str()) || grok && key == "type" {
-            continue;
+        if MANAGED_SERVER_FIELDS.contains(&key.as_str()) && !(grok && key == "type") {
+            let target_key = if key == "headers" && !grok {
+                "http_headers"
+            } else {
+                key
+            };
+            table.insert(target_key, json_to_toml_item(value)?);
+        } else if !grok && !MCP_METADATA_FIELDS.contains(&key.as_str()) && key != "http_headers" {
+            table.remove(key);
+            table.insert(key, json_to_toml_item(value)?);
         }
-        let target_key = if key == "headers" && !grok {
-            "http_headers"
-        } else {
-            key
-        };
-        table.insert(target_key, json_to_toml_item(value)?);
     }
     Ok(output)
 }
@@ -1200,6 +1477,10 @@ fn json_to_toml_item(value: &Value) -> Result<Item, McpConfigError> {
         Value::Number(value) => {
             if let Some(integer) = value.as_i64() {
                 Ok(toml_edit::value(integer))
+            } else if value.as_u64().is_some() {
+                Err(McpConfigError::InvalidServer(
+                    "integer cannot be represented by TOML without loss".to_owned(),
+                ))
             } else if let Some(float) = value.as_f64() {
                 Ok(toml_edit::value(float))
             } else {
@@ -1216,19 +1497,28 @@ fn json_to_toml_item(value: &Value) -> Result<Item, McpConfigError> {
             Ok(Item::Value(toml_edit::Value::Array(array)))
         }
         Value::Object(values) => {
-            let mut table = InlineTable::new();
+            let mut table = Table::new();
             for (key, value) in values {
-                table.insert(key, json_to_toml_value(value)?);
+                table.insert(key, json_to_toml_item(value)?);
             }
-            Ok(Item::Value(toml_edit::Value::InlineTable(table)))
+            Ok(Item::Table(table))
         }
     }
 }
 
 fn json_to_toml_value(value: &Value) -> Result<toml_edit::Value, McpConfigError> {
-    json_to_toml_item(value)?.into_value().map_err(|_| {
-        McpConfigError::InvalidServer("nested value cannot be represented by TOML".to_owned())
-    })
+    match value {
+        Value::Object(values) => {
+            let mut table = InlineTable::new();
+            for (key, value) in values {
+                table.insert(key, json_to_toml_value(value)?);
+            }
+            Ok(toml_edit::Value::InlineTable(table))
+        }
+        _ => json_to_toml_item(value)?.into_value().map_err(|_| {
+            McpConfigError::InvalidServer("nested value cannot be represented by TOML".to_owned())
+        }),
+    }
 }
 
 fn item_to_json(item: &Item) -> Result<Value, ()> {
@@ -1411,6 +1701,50 @@ fn project_hermes(
     Ok(Some(projected))
 }
 
+fn replace_hermes_section(
+    app: &AppType,
+    contents: Option<&[u8]>,
+    servers: &Map<String, Value>,
+) -> Result<String, McpConfigError> {
+    let original = contents
+        .map(|value| std::str::from_utf8(value).map(str::to_owned))
+        .transpose()
+        .map_err(|_| invalid_document(app, "not UTF-8"))?
+        .unwrap_or_default();
+    let root = parse_yaml_root(app, contents)?;
+    let section_key = serde_yaml::Value::String("mcp_servers".to_owned());
+    let section_existed = root.contains_key(&section_key);
+    let existing = root
+        .get(&section_key)
+        .and_then(serde_yaml::Value::as_mapping)
+        .cloned()
+        .unwrap_or_default();
+    let mut ids = servers.keys().collect::<Vec<_>>();
+    ids.sort();
+    let mut replacement = serde_yaml::Mapping::new();
+    for id in ids {
+        let id_key = serde_yaml::Value::String(id.clone());
+        replacement.insert(
+            id_key.clone(),
+            hermes_projection(app, &servers[id], existing.get(&id_key), true)?,
+        );
+    }
+    let projected = replace_yaml_section(
+        &original,
+        "mcp_servers",
+        &serde_yaml::Value::Mapping(replacement),
+        section_existed,
+    )
+    .map_err(|message| invalid_document(app, &message))?;
+    serde_yaml::from_str::<serde_yaml::Value>(&projected).map_err(|_| {
+        invalid_document(
+            app,
+            "projected MCP section would invalidate references elsewhere in the YAML document",
+        )
+    })?;
+    Ok(projected)
+}
+
 fn hermes_projection(
     app: &AppType,
     server: &Value,
@@ -1466,6 +1800,7 @@ fn to_hermes(
             "type", "command", "args", "env", "cwd", "url", "headers", "enabled",
         ],
     );
+    copy_json_extensions(unified, &mut output, &[]);
     match unified
         .get("type")
         .and_then(Value::as_str)
@@ -1627,6 +1962,13 @@ mod tests {
         .is_err());
         assert!(validate_mcp_server(" ", &json!({"command": "npx"})).is_err());
         assert!(validate_mcp_server(" server ", &json!({"command": "npx"})).is_err());
+        for alias in [
+            json!({"command":"npx","environment":{"TOKEN":"secret"}}),
+            json!({"type":"http","url":"https://example.com","http_headers":{}}),
+            json!({"type":"http","url":"https://example.com","httpUrl":"https://other"}),
+        ] {
+            assert!(validate_mcp_server("server", &alias).is_err());
+        }
         assert_eq!(
             format!(
                 "{:?}",
@@ -1692,7 +2034,7 @@ mod tests {
         assert_eq!(root["mcpServers"]["old"]["command"], "old");
         assert_eq!(root["mcpServers"]["new"]["command"], "npx");
         assert_eq!(root["mcpServers"]["new"]["future"], "keep");
-        assert!(root["mcpServers"]["new"].get("auth").is_none());
+        assert_eq!(root["mcpServers"]["new"]["auth"], "do-not-copy");
         let imports = import_mcp_servers(&AppType::Claude, Some(projected.as_bytes())).unwrap();
         assert!(imports
             .iter()
@@ -1704,14 +2046,88 @@ mod tests {
     }
 
     #[test]
+    fn collection_replacement_preserves_matching_native_fields_and_removes_invalid_entries() {
+        let desired = json!({
+            "kept": {"command":"new"},
+            "added": {"type":"http","url":"https://example.com"}
+        });
+        let projected = replace_mcp_servers(
+            &AppType::Claude,
+            Some(
+                br#"{"theme":"dark","mcpServers":{"bad":42,"removed":{"command":"old"},"kept":{"command":"old","trust":true}}}"#,
+            ),
+            desired.as_object().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let root: Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(root["theme"], "dark");
+        assert!(root["mcpServers"].get("bad").is_none());
+        assert!(root["mcpServers"].get("removed").is_none());
+        assert_eq!(root["mcpServers"]["kept"]["command"], "new");
+        assert_eq!(root["mcpServers"]["kept"]["trust"], true);
+        assert_eq!(root["mcpServers"]["added"]["url"], "https://example.com");
+    }
+
+    #[test]
+    fn collection_replacement_conforms_for_every_registered_mcp_target() {
+        let desired = json!({"server":{"command":"npx"}});
+        for app in [
+            AppType::Claude,
+            AppType::Codex,
+            AppType::Gemini,
+            AppType::GrokBuild,
+            AppType::OpenCode,
+            AppType::Hermes,
+        ] {
+            let projected = replace_mcp_servers(&app, None, desired.as_object().unwrap())
+                .unwrap()
+                .unwrap();
+            let imports = import_mcp_servers(&app, Some(projected.as_bytes())).unwrap();
+            assert_eq!(imports.len(), 1, "{} replacement", app.as_str());
+            assert_eq!(imports[0].id, "server");
+            assert!(imports[0].enabled);
+
+            let cleared = replace_mcp_servers(&app, Some(projected.as_bytes()), &Map::new())
+                .unwrap()
+                .unwrap();
+            assert!(import_mcp_servers(&app, Some(cleared.as_bytes()))
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn batch_projection_is_all_or_nothing_for_the_host() {
+        let valid = json!({"command":"new"});
+        let invalid = json!({"command":"npx","future":null});
+        let result = project_mcp_servers(
+            &AppType::Codex,
+            Some(b"[mcp_servers.existing]\ncommand = \"old\"\n"),
+            &[
+                ("existing", McpServerProjection::Enable(&valid)),
+                ("invalid", McpServerProjection::Enable(&invalid)),
+            ],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn gemini_and_opencode_use_native_shapes() {
         let gemini = project_mcp_server(
             &AppType::Gemini,
             Some(
-                br#"{"theme":"dark","mcpServers":{"remote":{"httpUrl":"https://old.example","future":"keep"}}}"#,
+                br#"{"theme":"dark","mcpServers":{"remote":{"httpUrl":"https://old.example","future":"keep","description":"native"}}}"#,
             ),
             "remote",
-            McpServerProjection::Enable(&json!({"type":"http","url":"https://example.com","headers":{"Authorization":"secret"}})),
+            McpServerProjection::Enable(&json!({
+                "type":"http",
+                "url":"https://example.com",
+                "headers":{"Authorization":"secret"},
+                "startup_timeout_sec":75,
+                "future":"replace",
+                "name":"ui-only"
+            })),
         )
         .unwrap()
         .unwrap();
@@ -1721,13 +2137,44 @@ mod tests {
             "https://example.com"
         );
         assert!(root["mcpServers"]["remote"].get("type").is_none());
-        assert_eq!(root["mcpServers"]["remote"]["future"], "keep");
+        assert_eq!(root["mcpServers"]["remote"]["future"], "replace");
+        assert_eq!(root["mcpServers"]["remote"]["timeout"], 75_000);
+        assert!(root["mcpServers"]["remote"].get("name").is_none());
+        assert_eq!(root["mcpServers"]["remote"]["description"], "native");
+
+        let fresh_gemini = project_mcp_server(
+            &AppType::Gemini,
+            None,
+            "local",
+            McpServerProjection::Enable(&json!({"command":"npx","future":true})),
+        )
+        .unwrap()
+        .unwrap();
+        let root: Value = serde_json::from_str(&fresh_gemini).unwrap();
+        assert_eq!(root["mcpServers"]["local"]["future"], true);
+        assert_eq!(root["mcpServers"]["local"]["timeout"], 60_000);
+
+        let dual_timeout = project_mcp_server(
+            &AppType::Gemini,
+            None,
+            "local",
+            McpServerProjection::Enable(&json!({
+                "command":"npx",
+                "startup_timeout_sec":1,
+                "startup_timeout_ms":120_000,
+                "tool_timeout_ms":1
+            })),
+        )
+        .unwrap()
+        .unwrap();
+        let root: Value = serde_json::from_str(&dual_timeout).unwrap();
+        assert_eq!(root["mcpServers"]["local"]["timeout"], 120_000);
 
         let opencode = project_mcp_server(
             &AppType::OpenCode,
             Some(br#"{"mcp":{"local":{"type":"local","command":["old"],"timeout":30,"enabled":false}}}"#),
             "local",
-            McpServerProjection::Enable(&json!({"type":"stdio","command":"npx","args":["-y"],"env":{"TOKEN":"secret"}})),
+            McpServerProjection::Enable(&json!({"type":"stdio","command":"npx","args":["-y"],"env":{"TOKEN":"secret"},"future":"shared"})),
         )
         .unwrap()
         .unwrap();
@@ -1735,6 +2182,7 @@ mod tests {
         assert_eq!(root["mcp"]["local"]["command"], json!(["npx", "-y"]));
         assert_eq!(root["mcp"]["local"]["environment"]["TOKEN"], "secret");
         assert_eq!(root["mcp"]["local"]["timeout"], 30);
+        assert_eq!(root["mcp"]["local"]["future"], "shared");
         assert_eq!(root["mcp"]["local"]["enabled"], true);
         let disabled = project_mcp_server(
             &AppType::OpenCode,
@@ -1819,11 +2267,93 @@ mod tests {
         .unwrap();
         assert!(codex.contains("model = \"keep\""));
         assert!(codex.contains("[mcp_servers.old]"));
-        assert!(codex.contains("http_headers"));
+        assert!(codex.contains("[mcp_servers.remote.http_headers]"));
         assert!(codex.contains("future = \"keep\""));
         assert!(codex.contains("future_date = 1979-05-27T07:32:00Z"));
         assert!(!codex.contains("future_date = \"1979-05-27T07:32:00Z\""));
         assert!(!codex.contains("enabled = false"));
+        assert!(codex.contains("timeout = 30"));
+
+        let fresh_codex = project_mcp_server(
+            &AppType::Codex,
+            None,
+            "local",
+            McpServerProjection::Enable(&json!({
+                "command":"npx",
+                "startup_timeout_sec":15,
+                "proxy":{"mode":"auto"},
+                "name":"ui-only",
+                "description":"ui-only",
+                "tags":["ui-only"]
+            })),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(fresh_codex.contains("startup_timeout_sec = 15"));
+        let fresh_codex: DocumentMut = fresh_codex.parse().unwrap();
+        let fresh_codex = item_to_json(fresh_codex.get("mcp_servers").unwrap()).unwrap();
+        assert_eq!(fresh_codex["local"]["proxy"]["mode"], "auto");
+        assert!(fresh_codex["local"].get("name").is_none());
+        assert!(fresh_codex["local"].get("description").is_none());
+        assert!(fresh_codex["local"].get("tags").is_none());
+
+        let inline = project_mcp_server(
+            &AppType::Codex,
+            Some(b"model = \"keep\"\nmcp_servers = { local = { command = \"old\", future = \"keep\" } }\n"),
+            "local",
+            McpServerProjection::Enable(&json!({
+                "command":"npx",
+                "env":{"TOKEN":"secret"}
+            })),
+        )
+        .unwrap()
+        .unwrap();
+        let inline: DocumentMut = inline.parse().unwrap();
+        assert_eq!(item_to_json(inline.get("model").unwrap()).unwrap(), "keep");
+        let inline = item_to_json(inline.get("mcp_servers").unwrap()).unwrap();
+        assert_eq!(inline["local"]["command"], "npx");
+        assert_eq!(inline["local"]["future"], "keep");
+        assert_eq!(inline["local"]["env"]["TOKEN"], "secret");
+
+        assert!(project_mcp_server(
+            &AppType::Codex,
+            None,
+            "invalid-extension",
+            McpServerProjection::Enable(&json!({"command":"npx","future":null})),
+        )
+        .is_err());
+
+        for timeout in [json!("60"), json!(-1), json!(-0.5), json!(60_000.9)] {
+            assert!(project_mcp_server(
+                &AppType::Gemini,
+                None,
+                "invalid-timeout",
+                McpServerProjection::Enable(&json!({"command":"npx","timeout":timeout})),
+            )
+            .is_err());
+        }
+        assert!(project_mcp_server(
+            &AppType::Gemini,
+            None,
+            "fractional-timeout",
+            McpServerProjection::Enable(&json!({"command":"npx","tool_timeout_sec":60.0009}),),
+        )
+        .is_err());
+        assert!(project_mcp_server(
+            &AppType::Gemini,
+            None,
+            "overflowing-timeout",
+            McpServerProjection::Enable(&json!({"command":"npx","startup_timeout_sec":u64::MAX}),),
+        )
+        .is_err());
+
+        assert!(project_mcp_server(
+            &AppType::Codex,
+            None,
+            "oversized-integer",
+            McpServerProjection::Enable(&json!({"command":"npx","future":u64::MAX})),
+        )
+        .is_err());
 
         let disabled = project_mcp_server(
             &AppType::Codex,
@@ -1925,6 +2455,18 @@ mod tests {
         assert_eq!(disabled["mcp_servers"]["remote"]["timeout"], 30);
         assert_eq!(disabled["mcp_servers"]["remote"]["future"], "keep");
         assert_eq!(disabled["mcp_servers"]["remote"]["enabled"], false);
+
+        let fresh = project_mcp_server(
+            &AppType::Hermes,
+            None,
+            "local",
+            McpServerProjection::Enable(&json!({"command":"npx","timeout":45,"future":"shared"})),
+        )
+        .unwrap()
+        .unwrap();
+        let fresh: Value = serde_yaml::from_str(&fresh).unwrap();
+        assert_eq!(fresh["mcp_servers"]["local"]["timeout"], 45);
+        assert_eq!(fresh["mcp_servers"]["local"]["future"], "shared");
     }
 
     #[test]
