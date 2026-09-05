@@ -33,8 +33,8 @@ pub enum ModelHeaderValue {
     Literal(&'static str),
 }
 
-/// One response alternative. Pointers follow JSON Pointer syntax; an empty
-/// collection pointer selects the root array. Invalid pointers match nothing.
+/// One response alternative. Pointers use [`Value::pointer`]; an empty collection
+/// pointer selects the root array. Missing collections and non-string IDs are skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelListShape {
     pub collection_pointer: &'static str,
