@@ -6,6 +6,38 @@ use cc_switch_core::model_fetch::{
 use serde_json::json;
 
 #[test]
+fn registered_defaults_are_explicit_without_changing_descriptor_payloads() {
+    let expected = [
+        ("claude", Some(&ANTHROPIC_COMPATIBLE)),
+        ("claude-desktop", None),
+        ("codex", Some(&BEARER_COMPATIBLE)),
+        ("gemini", Some(&GOOGLE_API_KEY)),
+        ("grokbuild", None),
+        ("opencode", Some(&BEARER_COMPATIBLE)),
+        ("openclaw", Some(&BEARER_COMPATIBLE)),
+        ("hermes", Some(&BEARER_COMPATIBLE)),
+        ("pi", Some(&BEARER_COMPATIBLE)),
+    ];
+    let registry = cc_switch_core::builtin_app_registry();
+    assert_eq!(registry.descriptors().len(), expected.len());
+    for (descriptor, (id, spec)) in registry.descriptors().zip(expected) {
+        assert_eq!(descriptor.id(), id);
+        assert_eq!(descriptor.default_model_fetch_spec(), spec, "{id}");
+        let serialized = serde_json::to_value(descriptor).unwrap();
+        assert_eq!(serialized.as_object().unwrap().len(), 5, "{id}");
+        for key in [
+            "id",
+            "displayName",
+            "brandKey",
+            "configurationMode",
+            "capabilities",
+        ] {
+            assert!(serialized.get(key).is_some(), "{id}: {key}");
+        }
+    }
+}
+
+#[test]
 fn compatible_specs_keep_candidate_and_header_order() {
     assert_eq!(
         BEARER_COMPATIBLE.candidate_urls(" https://relay.example/ ", BaseUrl),

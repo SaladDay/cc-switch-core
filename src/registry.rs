@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::{
     integration::{builtin_app_integration, builtin_app_integrations},
+    model_fetch::ModelFetchSpec,
     AppType, McpAppContract, NativeConfigRoot, SkillAppContract,
 };
 
@@ -55,6 +56,8 @@ pub struct AppDescriptor {
     #[serde(skip_serializing)]
     skill_contract: Option<SkillAppContract>,
     #[serde(skip_serializing)]
+    default_model_fetch_spec: Option<&'static ModelFetchSpec>,
+    #[serde(skip_serializing)]
     aliases: &'static [&'static str],
 }
 
@@ -78,6 +81,7 @@ impl AppDescriptor {
             capabilities,
             mcp_contract: None,
             skill_contract: None,
+            default_model_fetch_spec: None,
             aliases,
         }
     }
@@ -94,6 +98,11 @@ impl AppDescriptor {
 
     pub(crate) const fn with_skills(mut self, contract: SkillAppContract) -> Self {
         self.skill_contract = Some(contract);
+        self
+    }
+
+    pub(crate) const fn with_model_fetch(mut self, spec: &'static ModelFetchSpec) -> Self {
+        self.default_model_fetch_spec = Some(spec);
         self
     }
 
@@ -145,6 +154,14 @@ impl AppDescriptor {
     /// Returns the application's installed-Skill behavior, when supported.
     pub const fn skill_contract(&self) -> Option<SkillAppContract> {
         self.skill_contract
+    }
+
+    /// Returns the default compatible model-list rules, when declared.
+    /// This is not a supported-protocol list or a product feature flag. Hosts
+    /// retain provider/authentication overrides and may use their own spec.
+    /// `None` means no common default has been established, not lack of support.
+    pub const fn default_model_fetch_spec(&self) -> Option<&'static ModelFetchSpec> {
+        self.default_model_fetch_spec
     }
 
     fn matches_id(&self, normalized: &str) -> bool {

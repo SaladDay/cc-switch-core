@@ -32,6 +32,7 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         CAPABILITIES,
         &[],
     )
+    .with_model_fetch(&crate::model_fetch::BEARER_COMPATIBLE)
     .with_mcp(&HERMES_MCP)
     .with_skills(SkillAppContract::catalog(
         "enabled_hermes",

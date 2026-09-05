@@ -34,6 +34,7 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         CAPABILITIES,
         &[],
     )
+    .with_model_fetch(&crate::model_fetch::ANTHROPIC_COMPATIBLE)
     .with_config_root(NativeConfigRoot::home_relative(".claude"))
     .with_mcp(&CLAUDE_MCP)
     .with_skills(SkillAppContract::catalog(

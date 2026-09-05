@@ -197,8 +197,10 @@ commit `739ac4a3` (not pushed), and Lite PR #40.
    tests. Separate remaining host policy from unfinished shared behavior; remove
    replaced production code only after real callers use Core.
 
-Each slice uses the independent double-blind gate. The first is in progress;
-registry selection and overall model-fetch acceptance are not complete.
+Each slice uses the independent double-blind gate. The first passed baseline
+comparisons, real CLI/TUI tests, both independent reviews and Core/Lite CI: Core
+`a09204b`, CLI local `e95f36de` (not pushed), and Lite PR #41. The second is in
+progress; overall model-fetch acceptance is not complete.
 
 The real caller is `cli::tui::fetch_provider_models_for_tui`, also used by CLI
 `provider_inspect::fetch_models_from_source`. The older
@@ -228,6 +230,27 @@ dependency versions or MSRV. Lite adopts the reviewed pin without exposing a new
 feature. Rollback restores CLI transformations and pins together, or Lite's pins;
 no data migration is introduced. HTTP and full-product compatibility outside the
 baseline fixture scope remain unverified.
+
+The second slice declares optional model-fetch defaults in the existing App
+descriptors. The seven CLI Apps retain their established defaults. Claude Desktop
+and GrokBuild have no verified common default yet; absence does not mean the App
+cannot fetch models. No capability flag, serialized descriptor field, second
+registry or product-mode flag is added.
+
+The CLI one-off and saved-provider paths consume those defaults; the TUI retains
+its field-to-App mapping and explicit protocol overrides. Core specs reach the
+HTTP executor directly, without conversion back into a consumer protocol enum.
+Claude bearer-only providers, Gemini access tokens, Pi custom authentication,
+OAuth dispatch and CLI flag parsing stay host-owned and retain their behavior.
+The CLI's generic fallback for a missing default remains a host choice.
+
+Acceptance covers every registered default and unchanged descriptor payloads,
+CLI/TUI default and override matrices, existing provider-auth tests, independent
+baseline HTTP comparisons, and a custom declaration through the real HTTP
+executor. This is a product-neutral contract for the future full consumer, not
+evidence of that consumer's defaults or compatibility. The API is additive;
+wire/schema, dependency versions and MSRV stay unchanged. Lite only adopts the
+pin. Rollback restores CLI callers and pins together; no data migration occurs.
 
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.

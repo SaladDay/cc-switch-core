@@ -30,6 +30,7 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         CAPABILITIES,
         &[],
     )
+    .with_model_fetch(&crate::model_fetch::BEARER_COMPATIBLE)
     .with_config_root(NativeConfigRoot::home_relative(".pi/agent"))
     .with_skills(SkillAppContract::catalog(
         "enabled_pi",

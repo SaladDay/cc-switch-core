@@ -36,6 +36,7 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         CAPABILITIES,
         &[],
     )
+    .with_model_fetch(&crate::model_fetch::GOOGLE_API_KEY)
     .with_config_root(NativeConfigRoot::home_relative(".gemini"))
     .with_mcp(&GEMINI_MCP)
     .with_skills(SkillAppContract::catalog(
