@@ -161,8 +161,8 @@ regressions, two fresh independent reviews after the final correction, and Core
 multi-platform and Lite CI. Core revision `0ed213d`, CLI local commit `0593724d`,
 and Lite PR #39 record the accepted versions. The CLI branch was not pushed.
 
-Claude model-key migration and live metadata cleanup are the next provider
-slice. Core owns these in-memory transformations on native JSON. The CLI retains
+Claude model-key migration and live metadata cleanup are shared.
+Core owns these in-memory transformations on native JSON. The CLI retains
 the existing import, backfill, effective-settings, temporary-launch and live-write
 call sites, including when each transformation runs. Model-key migration is
 explicit: Core/Lite's default import and projection do not start applying it.
@@ -178,6 +178,56 @@ for these Claude-specific operations. Acceptance requires baseline comparisons,
 real provider/temporary-launch tests, unchanged default codecs, and double review.
 The additive Rust API changes no defaults, wire/schema, dependencies or MSRV.
 Rollback reverts CLI delegates and pins together; no data migration is introduced.
+
+This connection passed baseline comparisons, real caller tests, two independent
+blind reviews, and Core/Lite CI. Accepted versions are Core `23f2ed5`, CLI local
+commit `739ac4a3` (not pushed), and Lite PR #40.
+
+## Model-fetch slices
+
+1. Share declarative endpoint candidates, key-header templates and response
+   alternatives through `ModelFetchSpec`. Replace the real CLI/TUI HTTP caller's
+   transformations, retaining the host's HTTP execution and errors. No new UI,
+   network retry, OAuth session or pagination behavior belongs in this slice.
+2. Connect application defaults to the existing registry and retain explicit
+   provider-protocol overrides. An App's default must not restrict its supported
+   provider protocols or reflect Lite's feature selection. Do not introduce a
+   second App registry or infer support for unverified native providers.
+3. Trace actual consumers and run registry/protocol conformance and compatibility
+   tests. Separate remaining host policy from unfinished shared behavior; remove
+   replaced production code only after real callers use Core.
+
+Each slice uses the independent double-blind gate. The first is in progress;
+registry selection and overall model-fetch acceptance are not complete.
+
+The real caller is `cli::tui::fetch_provider_models_for_tui`, also used by CLI
+`provider_inspect::fetch_models_from_source`. The older
+`ProviderService::fetch_provider_models` has no in-repository caller and is not
+the migration target. Tests must compare candidate order, full-URL derivation,
+malformed inputs, response precedence, untrimmed/empty IDs, stable deduplication,
+key-header order, custom-header interaction and host errors against that baseline.
+Local HTTP fixtures must exercise the production path, not just Core helpers.
+
+The full-product boundary is a static protocol specification and native JSON
+response, not a simple provider form. A decoder only selects IDs; the host keeps
+the original response for rich metadata and pagination. Custom declaration tests
+verify this contract, not full-product parity. Credentials, provider selection,
+custom headers, URL/header validation, request limits, timeouts, retries and
+network publication stay host-owned. Candidate URLs are not authorization to send
+credentials, and template expansion does not validate header contents.
+
+The [Claude model-list reference](https://platform.claude.com/docs/en/api/models/list)
+and [Gemini model-list reference](https://ai.google.dev/api/models) describe their
+native response fields and pagination. Existing compatibility-root fallbacks,
+dual Anthropic authentication headers and cross-format response fallback come
+from the CLI baseline, not canonical API requirements. Preserve these behaviors
+explicitly rather than applying new protocol defaults during migration.
+
+The first slice adds Rust APIs without changing existing defaults, wire/schema,
+dependency versions or MSRV. Lite adopts the reviewed pin without exposing a new
+feature. Rollback restores CLI transformations and pins together, or Lite's pins;
+no data migration is introduced. HTTP and full-product compatibility outside the
+baseline fixture scope remain unverified.
 
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.

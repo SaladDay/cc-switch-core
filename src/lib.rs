@@ -25,6 +25,7 @@ pub mod hermes;
 mod integration;
 mod json5_patch;
 mod mcp;
+pub mod model_fetch;
 mod native_import;
 pub mod openclaw;
 pub mod opencode;

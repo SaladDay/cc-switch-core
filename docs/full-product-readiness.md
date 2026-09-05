@@ -23,9 +23,10 @@ Proxy activation, failover decisions, OAuth sessions, tray/UI events, downloads,
 and scheduling remain host workflows. Reusable configuration transformations used
 by those workflows may belong in Core even if Lite does not expose the feature.
 Do not duplicate a native codec merely because one caller is a proxy workflow.
-Future model-fetch protocol declarations, request planning and response decoding
-belong in Core when shared; credential acquisition, HTTP execution and retries
-remain with the host. These model-fetch contracts are not implemented yet.
+Model-fetch protocol declarations, request planning and response decoding belong
+in Core when shared; credential acquisition, HTTP execution and retries remain
+with the host. The first model-fetch slice adds declarative endpoint/header and
+response rules. Registry selection and its consumer acceptance remain pending.
 
 Behavior differences require named, typed choices such as validation responsibility,
 field selection, or native ownership. Do not introduce `is_lite`, `cli_mode`, or a
