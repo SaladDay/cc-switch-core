@@ -50,9 +50,10 @@ pub use executor::{
 pub use mcp::{
     capture_mcp_native_snapshot, import_mcp_servers, mcp_app_contract, mcp_catalog_columns,
     mcp_config_target, mcp_server_exists, mcp_servers_equivalent, project_mcp_server,
-    project_mcp_servers, replace_mcp_servers, validate_mcp_server, validate_mcp_server_for_app,
-    McpAppContract, McpCatalogColumn, McpConfigError, McpConfigResource, McpConfigTarget,
-    McpEntryDecodePolicy, McpEntryEncodePolicy, McpImport, McpNativeSnapshot, McpServerProjection,
+    project_mcp_servers, replace_mcp_servers, validate_mcp_connection, validate_mcp_server,
+    validate_mcp_server_for_app, McpAppContract, McpCatalogColumn, McpConfigError,
+    McpConfigResource, McpConfigTarget, McpConnectionError, McpEntryDecodePolicy,
+    McpEntryEncodePolicy, McpImport, McpNativeSnapshot, McpServerProjection,
 };
 pub use native_import::{
     CodexImportClassification, CodexImportPolicy, CodexImportPresence, CodexImportValidation,

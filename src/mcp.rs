@@ -12,8 +12,11 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike};
 
 use crate::{AppType, LogicalTarget, MAX_OPERATION_CONTENT_BYTES};
 
+mod connection;
 mod gemini_codec;
 mod json_patch;
+
+pub use connection::{validate_mcp_connection, McpConnectionError};
 
 const MAX_MCP_ID_BYTES: usize = 128;
 const MANAGED_SERVER_FIELDS: &[&str] = &["type", "command", "args", "env", "cwd", "url", "headers"];
@@ -443,32 +446,22 @@ pub fn validate_mcp_server(id: &str, server: &Value) -> Result<(), McpConfigErro
             )));
         }
     }
-    let transport = match object.get("type") {
-        Some(Value::String(transport)) => transport.as_str(),
-        Some(_) => {
-            return Err(McpConfigError::InvalidServer(
-                "'type' must be a string".to_owned(),
-            ));
-        }
-        None => "stdio",
-    };
+    let transport = connection::validate_fields(object)
+        .map_err(|error| McpConfigError::InvalidServer(error.to_string()))?;
     match transport {
-        "stdio" => {
-            required_string(object, "command", "stdio definitions require command")?;
+        connection::Transport::Stdio => {
             string_array(object, "args")?;
             string_map(object, "env")?;
             optional_string(object, "cwd")?;
             reject_fields(object, &["url", "headers"], "stdio")?;
         }
-        "http" | "sse" => {
-            required_string(object, "url", "remote definitions require url")?;
+        connection::Transport::Http | connection::Transport::Sse => {
             string_map(object, "headers")?;
-            reject_fields(object, &["command", "args", "env", "cwd"], transport)?;
-        }
-        other => {
-            return Err(McpConfigError::InvalidServer(format!(
-                "unsupported transport '{other}'"
-            )))
+            reject_fields(
+                object,
+                &["command", "args", "env", "cwd"],
+                transport.as_str(),
+            )?;
         }
     }
     if serde_json::to_vec(server)
@@ -787,22 +780,6 @@ fn validate_id(id: &str) -> Result<(), McpConfigError> {
         ))
     } else {
         Ok(())
-    }
-}
-
-fn required_string(
-    object: &Map<String, Value>,
-    key: &str,
-    message: &str,
-) -> Result<(), McpConfigError> {
-    if object
-        .get(key)
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        Ok(())
-    } else {
-        Err(McpConfigError::InvalidServer(message.to_owned()))
     }
 }
 

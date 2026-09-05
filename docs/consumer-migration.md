@@ -51,8 +51,8 @@ Provider/MCP/Skill catalog storage already uses Store in the CLI. Native provide
 MCP, and Skill behavior is not yet fully migrated. OpenCode/Hermes MCP entry
 conversion and Codex MCP entry projection have passed compatibility tests and two
 independent reviews per change. Remaining MCP conversion and document handling
-are not complete: Gemini timeout precedence and import tolerance differ between
-consumers and need explicit policy boundaries.
+are not complete. Gemini entry conversion now has explicit policy boundaries for
+the consumers' different timeout precedence and import tolerance.
 
 Provider migration starts with Codex auth observation. The CLI retains opaque
 nonempty snapshot payloads, including timestamps; Lite uses credential-aware
@@ -100,7 +100,7 @@ The CLI production import uses the shared codec and removes the replaced
 transport conversion. Compatibility tests, two independent blind reviews, and
 a final independent review after a test-only refinement passed.
 
-The next Gemini MCP slice shares entry import and export in the CLI's real
+Gemini MCP now shares entry import and export in the CLI's real
 `read_mcp_servers_map` / `set_mcp_servers_map` calls. The explicit policies retain
 unconsumed fields, string-based type inference, and saturating seconds-first
 timeouts. Default Core/Lite codecs keep their existing rules. Parsing, document
@@ -114,7 +114,26 @@ they do not establish full-product parity. The full product's field selection
 and timeout rules still require baseline verification before adoption. This is
 an additive Rust API change, not a wire/schema, dependency, or Rust-version change.
 Consumers can keep their previous pins without a data migration. Acceptance
-requires baseline-derived CLI comparisons, real caller tests, unchanged default
+passed baseline-derived CLI comparisons, real caller tests, unchanged default
 codec conformance, and two independent blind reviews before publication.
+
+The next slice shares minimum MCP connection validation. The CLI's production
+`mcp::validate_server_spec`, used by the native import paths, delegates transport
+and required-field checks to Core and keeps its localized errors. Core's strict
+validator reuses those checks but still owns canonical field validation, IDs,
+native-alias rejection, limits, and error order. Connection-only validation is
+not permission to write a canonical configuration: hosts still select parsing,
+catalog enablement, metadata, and projection policy. Legacy entry points with
+different validation semantics are not changed.
+
+The intended full-product boundary is the same connection check for rich native
+entries, without narrowing them to a simple form. Synthetic extension fixtures
+test that boundary, not full-product parity. No full-product caller was inspected
+or migrated. This additive Rust API changes no defaults, wire/schema contract,
+dependency versions, or MSRV. Acceptance requires baseline-derived CLI result and
+localized-error comparisons, real import tests, strict-default conformance, and
+two independent blind reviews. Consumer rollback reverts the integration and pin
+together; no data migration is needed for this slice.
+
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.
