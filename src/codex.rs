@@ -56,7 +56,8 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         simple_provider::project_codex,
         false,
     ),
-    NativeImportBehavior::new(native_import::import_codex),
+    NativeImportBehavior::new(native_import::import_codex)
+        .with_policy(native_import::import_codex_policy),
     NativeProjectionBehavior::new(
         projection::codex_plan,
         None,

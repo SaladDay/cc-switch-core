@@ -20,6 +20,60 @@ use crate::{
 
 const CLAUDE_DESKTOP_OFFICIAL_ID: &str = "claude-desktop-official";
 
+/// Validation responsibility for a Codex import.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CodexImportValidation {
+    /// Require an auth object and valid TOML using Core's parser.
+    #[default]
+    Strict,
+    /// Preserve any JSON auth value and UTF-8 config accepted by the host.
+    /// The host must validate config with its own grammar before importing.
+    HostValidated,
+}
+
+/// Whether an empty config file alone counts as an installed Codex configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CodexImportPresence {
+    #[default]
+    AnyDocument,
+    AuthOrNonblankConfig,
+}
+
+/// Evidence used to distinguish official login from provider-key configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CodexImportClassification {
+    /// Use credential-aware auth observation only.
+    #[default]
+    AuthCredentials,
+    /// Retain opaque non-key auth payloads, unless auth or the selected native
+    /// config field supplies a provider key under the given table syntax.
+    SnapshotPayload(codex::ProviderTableSyntax),
+}
+
+/// Product-neutral Codex import choices. Defaults preserve Core's strict import.
+/// Paths, parser diagnostics, catalog loading, naming, and persistence stay in hosts.
+///
+/// ```
+/// use cc_switch_core::{CodexImportPolicy, CodexImportPresence, NativeImportPolicy};
+/// let policy = NativeImportPolicy::Codex(CodexImportPolicy {
+///     presence: CodexImportPresence::AuthOrNonblankConfig,
+///     ..CodexImportPolicy::default()
+/// });
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodexImportPolicy {
+    pub validation: CodexImportValidation,
+    pub presence: CodexImportPresence,
+    pub classification: CodexImportClassification,
+}
+
+/// Explicit import policy accepted by the corresponding registered adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NativeImportPolicy {
+    Codex(CodexImportPolicy),
+}
+
 /// Native Hermes section from which an imported provider originated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HermesProviderSource {
@@ -91,6 +145,8 @@ pub enum NativeImportStep {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NativeImportError {
+    #[error("native import policy is not supported by '{app_id}'")]
+    UnsupportedPolicy { app_id: String },
     #[error("live documents belong to '{actual}', expected '{expected}'")]
     WrongDocumentApp { expected: String, actual: String },
     #[error("live configuration is missing for {resource}")]
@@ -117,30 +173,62 @@ impl From<NativeImportError> for ProjectError {
 
 pub(crate) type ProjectResult<T> = Result<T, ProjectError>;
 type NativeImporter = fn(&AppType, &LiveDocumentSet) -> ProjectResult<Vec<NativeImportCandidate>>;
+type NativePolicyImporter = fn(
+    &AppType,
+    &LiveDocumentSet,
+    &NativeImportPolicy,
+) -> ProjectResult<Vec<NativeImportCandidate>>;
 
 /// Native import behavior bound to one built-in integration.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NativeImportBehavior {
     project: NativeImporter,
+    project_policy: Option<NativePolicyImporter>,
 }
 
 impl NativeImportBehavior {
     pub(crate) const fn new(project: NativeImporter) -> Self {
-        Self { project }
+        Self {
+            project,
+            project_policy: None,
+        }
+    }
+
+    pub(crate) const fn with_policy(mut self, project: NativePolicyImporter) -> Self {
+        self.project_policy = Some(project);
+        self
     }
 
     fn project(
         self,
         app: &AppType,
         documents: &LiveDocumentSet,
+        policy: Option<&NativeImportPolicy>,
     ) -> ProjectResult<Vec<NativeImportCandidate>> {
-        (self.project)(app, documents)
+        match policy {
+            None => (self.project)(app, documents),
+            Some(policy) => match self.project_policy {
+                Some(project) => project(app, documents, policy),
+                None => Err(NativeImportError::UnsupportedPolicy {
+                    app_id: app.as_str().to_owned(),
+                }
+                .into()),
+            },
+        }
     }
 }
 
 pub(crate) fn project_native_import(
     adapter_app: &AppType,
     documents: &LiveDocumentSet,
+) -> Result<NativeImportStep, NativeImportError> {
+    project_native_import_with_policy(adapter_app, documents, None)
+}
+
+pub(crate) fn project_native_import_with_policy(
+    adapter_app: &AppType,
+    documents: &LiveDocumentSet,
+    policy: Option<&NativeImportPolicy>,
 ) -> Result<NativeImportStep, NativeImportError> {
     if documents.app() != adapter_app {
         return Err(NativeImportError::WrongDocumentApp {
@@ -151,7 +239,7 @@ pub(crate) fn project_native_import(
 
     match builtin_app_integration(adapter_app)
         .native_import_behavior()
-        .project(adapter_app, documents)
+        .project(adapter_app, documents, policy)
     {
         Ok(candidates) => Ok(NativeImportStep::Ready { candidates }),
         Err(ProjectError::Observe(target)) => Ok(NativeImportStep::Observe { target }),
@@ -181,18 +269,67 @@ pub(crate) fn import_codex(
     app: &AppType,
     documents: &LiveDocumentSet,
 ) -> ProjectResult<Vec<NativeImportCandidate>> {
+    import_codex_with_policy(app, documents, &CodexImportPolicy::default())
+}
+
+pub(crate) fn import_codex_policy(
+    app: &AppType,
+    documents: &LiveDocumentSet,
+    policy: &NativeImportPolicy,
+) -> ProjectResult<Vec<NativeImportCandidate>> {
+    let NativeImportPolicy::Codex(policy) = policy;
+    import_codex_with_policy(app, documents, policy)
+}
+
+fn import_codex_with_policy(
+    app: &AppType,
+    documents: &LiveDocumentSet,
+    policy: &CodexImportPolicy,
+) -> ProjectResult<Vec<NativeImportCandidate>> {
     let config = optional_text(documents, LogicalTarget::CodexConfig, "Codex")?;
-    let auth = optional_json_object(documents, LogicalTarget::CodexAuth, "Codex")?;
-    if config.is_none() && auth.is_none() {
+    let auth = match policy.validation {
+        CodexImportValidation::Strict => {
+            optional_json_object(documents, LogicalTarget::CodexAuth, "Codex")?
+        }
+        CodexImportValidation::HostValidated => {
+            observed_contents(documents, LogicalTarget::CodexAuth)?
+                .map(|contents| {
+                    serde_json::from_slice::<Value>(contents).map_err(|_| {
+                        invalid_document(LogicalTarget::CodexAuth, "Codex JSON could not be parsed")
+                    })
+                })
+                .transpose()?
+        }
+    };
+    let config_present = match policy.presence {
+        CodexImportPresence::AnyDocument => config.is_some(),
+        CodexImportPresence::AuthOrNonblankConfig => {
+            config.is_some_and(|config| !config.trim().is_empty())
+        }
+    };
+    if !config_present && auth.is_none() {
         return Err(missing("Codex"));
     }
     let settings = json!({
         "auth": auth.unwrap_or_else(|| json!({})),
         "config": config.unwrap_or_default()
     });
-    codex::prepare_strict_live_snapshot(&settings)
-        .map_err(|error| invalid_document(LogicalTarget::CodexConfig, error.to_string()))?;
-    let official = codex_auth_is_official(&settings["auth"]);
+    if policy.validation == CodexImportValidation::Strict {
+        codex::prepare_strict_live_snapshot(&settings)
+            .map_err(|error| invalid_document(LogicalTarget::CodexConfig, error.to_string()))?;
+    }
+    let official = match policy.classification {
+        CodexImportClassification::AuthCredentials => codex_auth_is_official(&settings["auth"]),
+        CodexImportClassification::SnapshotPayload(syntax) => {
+            codex::observe_auth(&settings["auth"]).has_payload()
+                && codex::extract_api_key(
+                    Some(&settings["auth"]),
+                    settings["config"].as_str(),
+                    syntax,
+                )
+                .is_none()
+        }
+    };
     Ok(vec![candidate(
         app.clone(),
         if official {

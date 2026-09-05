@@ -55,8 +55,9 @@ pub use mcp::{
     McpImport, McpNativeSnapshot, McpServerProjection,
 };
 pub use native_import::{
+    CodexImportClassification, CodexImportPolicy, CodexImportPresence, CodexImportValidation,
     HermesProviderSource, NativeImportCandidate, NativeImportContext, NativeImportError,
-    NativeImportStep,
+    NativeImportPolicy, NativeImportStep,
 };
 pub use operation::{
     ConfigFormat, ContentExpectation, LogicalTarget, OperationPlan, OperationPlanDecodeError,

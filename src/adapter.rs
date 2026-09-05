@@ -192,6 +192,20 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
     ) -> Result<NativeImportStep, NativeImportError> {
         native_import::project_native_import(self.descriptor().app(), documents)
     }
+
+    /// Advances import using an explicit policy supported by this integration.
+    /// The default import method keeps its existing validation and classification.
+    fn project_native_import_with_policy(
+        &self,
+        documents: &LiveDocumentSet,
+        policy: &crate::NativeImportPolicy,
+    ) -> Result<NativeImportStep, NativeImportError> {
+        native_import::project_native_import_with_policy(
+            self.descriptor().app(),
+            documents,
+            Some(policy),
+        )
+    }
 }
 
 impl sealed::Sealed for AppIntegration {}

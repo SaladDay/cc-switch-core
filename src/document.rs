@@ -107,6 +107,16 @@ impl LiveDocumentSet {
         app: AppType,
         documents: impl IntoIterator<Item = ObservedDocument>,
     ) -> Result<Self, LiveDocumentSetError> {
+        Self::try_new_with_content_limit(app, documents, MAX_OPERATION_CONTENT_BYTES)
+    }
+
+    /// Builds a local snapshot under an explicit host-selected per-document bound.
+    /// Default snapshots and serialized operation plans retain their fixed limits.
+    pub fn try_new_with_content_limit(
+        app: AppType,
+        documents: impl IntoIterator<Item = ObservedDocument>,
+        maximum_content_bytes: usize,
+    ) -> Result<Self, LiveDocumentSetError> {
         let targets = builtin_app_adapter(&app).targets();
         let mut supplied = HashMap::with_capacity(targets.len());
 
@@ -125,11 +135,11 @@ impl LiveDocumentSet {
             }
             if document
                 .contents()
-                .is_some_and(|contents| contents.len() > MAX_OPERATION_CONTENT_BYTES)
+                .is_some_and(|contents| contents.len() > maximum_content_bytes)
             {
                 return Err(LiveDocumentSetError::ContentTooLarge {
                     target,
-                    limit: MAX_OPERATION_CONTENT_BYTES,
+                    limit: maximum_content_bytes,
                 });
             }
             if supplied.insert(target, document).is_some() {

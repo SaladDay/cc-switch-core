@@ -72,11 +72,20 @@ remain unchanged; trusted local plans may use an explicit host-selected bound.
 This connection passed compatibility tests, double-review rounds, and a final
 independent review after the fixes converged.
 
-The next slice shares the remaining Codex credential codec: API-key selection,
+The shared Codex credential codec covers API-key selection,
 third-party auth sanitization, token projection/removal, and snapshot backfill.
 The CLI retains its TOML grammar checks, localized errors, and decisions about
 when to write auth or capture a snapshot. The default Core projection keeps its
 existing inline-table support. Model catalogs, session-history rewriting, and
 proxy strategy are outside this slice.
+This connection passed compatibility tests and two independent blind reviews.
+
+The next slice moves Codex native import through the registered adapter. Hosts
+choose validation responsibility, document-presence rules, and authentication
+classification explicitly. The default import remains strict. A host-validated
+snapshot preserves the host's accepted JSON shape and TOML grammar; paths, parser
+diagnostics, provider names, model-catalog loading, and session-history policy
+remain in that host. Local document inventories can use an explicit content
+bound without changing default snapshot or operation-plan limits.
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.
