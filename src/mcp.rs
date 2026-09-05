@@ -52,7 +52,44 @@ pub enum McpConfigTarget {
     Hermes,
 }
 
+/// Field selection when decoding a native MCP entry.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum McpEntryDecodePolicy {
+    /// Keep the existing structural codec, including native extensions.
+    #[default]
+    Preserve,
+    /// Extract tolerant Codex transport fields only. String arrays/maps discard
+    /// non-string members and empty results; extensions and enablement stay with
+    /// the caller. Explicit invalid types are retained for caller validation.
+    /// Other native formats currently reject this policy.
+    TransportFields,
+}
+
 impl McpConfigTarget {
+    /// Decodes an entry with explicit field selection, without validating a
+    /// connection, choosing catalog metadata, or reading a document.
+    ///
+    /// [`McpEntryDecodePolicy::TransportFields`] currently supports Codex. It
+    /// infers HTTP only from a nonblank string URL when `type` is absent, and
+    /// prefers an object-valued `http_headers` over legacy `headers`, even when
+    /// that object is empty. The default [`Self::decode_server`] is unchanged.
+    pub fn decode_server_with_policy(
+        self,
+        entry: &Value,
+        policy: McpEntryDecodePolicy,
+    ) -> Result<Value, McpConfigError> {
+        match policy {
+            McpEntryDecodePolicy::Preserve => self.decode_server(entry),
+            McpEntryDecodePolicy::TransportFields if self == Self::Codex => {
+                Ok(decode_codex_transport_fields(server_object(entry)?))
+            }
+            McpEntryDecodePolicy::TransportFields => {
+                Err(McpConfigError::UnsupportedEntryPolicy { target: self })
+            }
+        }
+    }
+
     /// Converts one native entry to the shared transport field names.
     ///
     /// This is a structural codec, not validation or catalog import. Extension
@@ -308,6 +345,8 @@ impl fmt::Debug for McpImport {
 pub enum McpConfigError {
     #[error("application '{app_id}' does not support MCP")]
     UnsupportedApp { app_id: String },
+    #[error("native MCP format '{target:?}' does not support this entry decoding policy")]
+    UnsupportedEntryPolicy { target: McpConfigTarget },
     #[error("MCP server id is invalid: {0}")]
     InvalidId(String),
     #[error("MCP server definition is invalid: {0}")]
@@ -1492,6 +1531,71 @@ fn normalize_toml_server(object: &mut Map<String, Value>) {
         object.insert("type".to_owned(), Value::String("http".to_owned()));
     } else {
         infer_transport(object);
+    }
+}
+
+fn decode_codex_transport_fields(entry: &Map<String, Value>) -> Value {
+    let inferred_type = if entry
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        "http"
+    } else {
+        "stdio"
+    };
+    let type_value = entry
+        .get("type")
+        .cloned()
+        .unwrap_or_else(|| Value::String(inferred_type.to_owned()));
+    let mut fields = Map::new();
+    match type_value.as_str() {
+        Some("stdio") => {
+            if let Some(value) = entry.get("command").and_then(Value::as_str) {
+                fields.insert("command".to_owned(), Value::String(value.to_owned()));
+            }
+            if let Some(values) = entry.get("args").and_then(Value::as_array) {
+                let values: Vec<_> = values.iter().filter(|v| v.is_string()).cloned().collect();
+                if !values.is_empty() {
+                    fields.insert("args".to_owned(), Value::Array(values));
+                }
+            }
+            if let Some(value) = entry.get("cwd").and_then(Value::as_str) {
+                if !value.trim().is_empty() {
+                    fields.insert("cwd".to_owned(), Value::String(value.to_owned()));
+                }
+            }
+            insert_string_map(&mut fields, "env", entry.get("env"));
+        }
+        Some("http" | "sse") => {
+            if let Some(url) = entry.get("url").and_then(Value::as_str) {
+                fields.insert("url".to_owned(), Value::String(url.to_owned()));
+            }
+            let headers = entry
+                .get("http_headers")
+                .filter(|value| value.is_object())
+                .or_else(|| entry.get("headers"));
+            insert_string_map(&mut fields, "headers", headers);
+        }
+        _ => {}
+    }
+    // Put the type first, as in the unfiltered codec's input representation.
+    let mut output = Map::new();
+    output.insert("type".to_owned(), type_value);
+    output.extend(fields);
+    Value::Object(output)
+}
+
+fn insert_string_map(output: &mut Map<String, Value>, key: &str, value: Option<&Value>) {
+    if let Some(values) = value.and_then(Value::as_object) {
+        let values: Map<_, _> = values
+            .iter()
+            .filter(|(_, value)| value.is_string())
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if !values.is_empty() {
+            output.insert(key.to_owned(), Value::Object(values));
+        }
     }
 }
 

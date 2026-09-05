@@ -80,12 +80,20 @@ existing inline-table support. Model catalogs, session-history rewriting, and
 proxy strategy are outside this slice.
 This connection passed compatibility tests and two independent blind reviews.
 
-The next slice moves Codex native import through the registered adapter. Hosts
+Codex native import now uses the registered adapter. Hosts
 choose validation responsibility, document-presence rules, and authentication
 classification explicitly. The default import remains strict. A host-validated
 snapshot preserves the host's accepted JSON shape and TOML grammar; paths, parser
 diagnostics, provider names, model-catalog loading, and session-history policy
 remain in that host. Local document inventories can use an explicit content
 bound without changing default snapshot or operation-plan limits.
+This connection passed compatibility tests and two independent blind reviews.
+
+Codex MCP entry import next shares tolerant transport decoding. Its explicit
+field-selection policy does not replace the default structural codec or strict
+document import. Hosts retain parser diagnostics, shallow extension selection,
+collection tolerance, legacy-section precedence, catalog metadata, and enablement.
+The CLI must use the shared codec in its production import path and remove the
+replaced transport conversion rather than keeping a second production copy.
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.
