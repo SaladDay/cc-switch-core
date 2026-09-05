@@ -59,7 +59,7 @@ Codex bearer-token routing has also passed compatibility tests and double review
 Shared reads and writes retain each host's accepted TOML table syntax, token
 precedence, and error behavior.
 
-The next slice connects CLI Codex two-file auth/config writes to Core execution. The CLI
+CLI Codex two-file auth/config writes now use Core execution. The CLI
 keeps path resolution, permission policy, accepted JSON/TOML syntax, and native
 file sizes. Core owns conditional writes and guarded recovery; the CLI must not
 repeat an unconditional snapshot restore after a Core-managed write failure.
@@ -69,5 +69,14 @@ publishing its replacement; Core's existing atomic file writer provides that pri
 Model-catalog publication and rollback after later MCP/snapshot work remain host
 workflows, not part of this slice. The default execution and wire size limits
 remain unchanged; trusted local plans may use an explicit host-selected bound.
+This connection passed compatibility tests, double-review rounds, and a final
+independent review after the fixes converged.
+
+The next slice shares the remaining Codex credential codec: API-key selection,
+third-party auth sanitization, token projection/removal, and snapshot backfill.
+The CLI retains its TOML grammar checks, localized errors, and decisions about
+when to write auth or capture a snapshot. The default Core projection keeps its
+existing inline-table support. Model catalogs, session-history rewriting, and
+proxy strategy are outside this slice.
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.

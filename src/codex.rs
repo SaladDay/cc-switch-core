@@ -418,17 +418,90 @@ pub fn prepare_provider_live_config(
     auth: &Value,
     config: &str,
 ) -> Result<String, PrepareNativeLiveError> {
-    let token = auth
-        .get("OPENAI_API_KEY")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .or_else(|| extract_experimental_bearer_token(config));
-    let Some(token) = token else {
+    prepare_provider_live_config_with_syntax(
+        auth,
+        config,
+        ProviderTableSyntax::TablesAndInlineTables,
+    )
+}
+
+/// The provider-config projection with explicit credential-read syntax.
+/// The write format is unchanged: inline provider tables use the root token.
+pub fn prepare_provider_live_config_with_syntax(
+    auth: &Value,
+    config: &str,
+    syntax: ProviderTableSyntax,
+) -> Result<String, PrepareNativeLiveError> {
+    let Some(token) = extract_api_key(Some(auth), Some(config), syntax) else {
         return Ok(config.to_owned());
     };
     set_experimental_bearer_token(config, &token)
+}
+
+/// Reads a nonblank provider API key without treating OAuth payloads as keys.
+pub fn extract_auth_api_key(auth: &Value) -> Option<String> {
+    auth.get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+}
+
+/// Prefers auth's API key, then the native config's selected bearer token.
+pub fn extract_api_key(
+    auth: Option<&Value>,
+    config: Option<&str>,
+    syntax: ProviderTableSyntax,
+) -> Option<String> {
+    auth.and_then(extract_auth_api_key)
+        .or_else(|| config.and_then(|config| read_experimental_bearer_token(config, syntax)))
+}
+
+/// Produces API-key-only auth for a third-party provider. Live credentials win
+/// over a stored fallback; OAuth and unrelated fields never enter the result.
+/// Hosts decide whether this auth should be stored, written, or left unused.
+pub fn sanitize_third_party_auth(
+    auth: Option<&Value>,
+    config: Option<&str>,
+    fallback_auth: Option<&Value>,
+    fallback_config: Option<&str>,
+    syntax: ProviderTableSyntax,
+) -> Value {
+    let key = extract_api_key(auth, config, syntax)
+        .or_else(|| extract_api_key(fallback_auth, fallback_config, syntax));
+    let mut sanitized = serde_json::Map::new();
+    if let Some(key) = key {
+        sanitized.insert("OPENAI_API_KEY".to_owned(), Value::String(key));
+    }
+    Value::Object(sanitized)
+}
+
+/// Lifts a live bearer token into a stored provider snapshot. Auth fields from
+/// the template survive; live OAuth fields are not copied into stored auth.
+/// No token means no mutation. Hosts retain catalog/session and storage policy.
+pub fn restore_provider_token_for_backfill(
+    settings: &mut Value,
+    template: &Value,
+    syntax: ProviderTableSyntax,
+) -> Result<(), PrepareNativeLiveError> {
+    let Some(config) = settings.get("config").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(token) = read_experimental_bearer_token(config, syntax) else {
+        return Ok(());
+    };
+    let cleaned = remove_experimental_bearer_token_if(config, syntax, |_| true)?;
+    if let Some(settings) = settings.as_object_mut() {
+        let mut auth = template
+            .get("auth")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        auth.insert("OPENAI_API_KEY".to_owned(), Value::String(token));
+        settings.insert("config".to_owned(), Value::String(cleaned));
+        settings.insert("auth".to_owned(), Value::Object(auth));
+    }
+    Ok(())
 }
 
 /// Writes a token into the active custom provider's ordinary TOML table.
@@ -567,10 +640,6 @@ fn active_provider_id(document: &DocumentMut) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn extract_experimental_bearer_token(config: &str) -> Option<String> {
-    read_experimental_bearer_token(config, ProviderTableSyntax::TablesAndInlineTables)
-}
-
 /// TOML table syntax accepted when reading provider-scoped credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderTableSyntax {
@@ -587,6 +656,15 @@ impl ProviderTableSyntax {
                 .as_table()
                 .map(|table| table as &dyn toml_edit::TableLike),
             Self::TablesAndInlineTables => item.as_table_like(),
+        }
+    }
+
+    fn table_mut(self, item: &mut toml_edit::Item) -> Option<&mut dyn toml_edit::TableLike> {
+        match self {
+            Self::TablesOnly => item
+                .as_table_mut()
+                .map(|table| table as &mut dyn toml_edit::TableLike),
+            Self::TablesAndInlineTables => item.as_table_like_mut(),
         }
     }
 }
@@ -623,6 +701,49 @@ pub fn read_experimental_bearer_token(config: &str, syntax: ProviderTableSyntax)
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_owned)
+}
+
+/// Removes matching bearer fields from the active named table and the root.
+/// Unlike credential selection, cleanup also visits an active built-in table.
+/// Inactive providers and non-string fields are retained. The predicate sees
+/// trimmed strings (including blanks), in active-table then root order.
+pub fn remove_experimental_bearer_token_if(
+    config: &str,
+    syntax: ProviderTableSyntax,
+    predicate: impl Fn(&str) -> bool,
+) -> Result<String, PrepareNativeLiveError> {
+    if config.trim().is_empty() || !config.contains("experimental_bearer_token") {
+        return Ok(config.to_owned());
+    }
+    let mut document = config
+        .parse::<DocumentMut>()
+        .map_err(|_| PrepareNativeLiveError::InvalidConfig)?;
+    if let Some(id) = active_provider_id(&document) {
+        if let Some(provider) = document
+            .get_mut("model_providers")
+            .and_then(|item| syntax.table_mut(item))
+            .and_then(|providers| providers.get_mut(&id))
+            .and_then(|item| syntax.table_mut(item))
+        {
+            if provider
+                .get("experimental_bearer_token")
+                .and_then(|item| item.as_str())
+                .map(str::trim)
+                .is_some_and(&predicate)
+            {
+                provider.remove("experimental_bearer_token");
+            }
+        }
+    }
+    if document
+        .get("experimental_bearer_token")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .is_some_and(&predicate)
+    {
+        document.as_table_mut().remove("experimental_bearer_token");
+    }
+    Ok(document.to_string())
 }
 
 fn is_custom_provider_id(id: &str) -> bool {
