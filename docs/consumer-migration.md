@@ -54,5 +54,9 @@ consumers and need explicit policy boundaries.
 Provider migration starts with Codex auth observation. The CLI retains opaque
 nonempty snapshot payloads, including timestamps; Lite uses credential-aware
 checks. Shared observations must support both without changing either policy.
-This change is under validation. Native provider projection/import and Skill
-deployment remain pending. No stage above is marked complete yet.
+Auth observation has passed compatibility tests and independent double review.
+Codex bearer-token routing is the next migration slice: shared native reads and
+writes must retain each host's accepted TOML table syntax, token precedence, and
+error behavior. Authentication policy and file execution are outside this slice.
+The rest of native provider projection/import and Skill deployment remain pending.
+No stage above is marked complete yet.

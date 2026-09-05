@@ -428,6 +428,19 @@ pub fn prepare_provider_live_config(
     let Some(token) = token else {
         return Ok(config.to_owned());
     };
+    set_experimental_bearer_token(config, &token)
+}
+
+/// Writes a token into the active custom provider's ordinary TOML table.
+///
+/// Reserved provider ids, missing tables, and inline tables use the top-level
+/// field. Existing unrelated fields and tables are retained. Empty or invalid
+/// TOML is rejected. The host chooses the token and owns authentication policy
+/// and file I/O; no parser-specific types cross the consumer boundary.
+pub fn set_experimental_bearer_token(
+    config: &str,
+    token: &str,
+) -> Result<String, PrepareNativeLiveError> {
     if config.trim().is_empty() {
         return Err(PrepareNativeLiveError::MissingConfigForApiKey);
     }
@@ -442,11 +455,11 @@ pub fn prepare_provider_live_config(
             .and_then(|providers| providers.get_mut(&provider_id))
             .and_then(|item| item.as_table_mut())
         {
-            provider["experimental_bearer_token"] = toml_edit::value(&token);
+            provider["experimental_bearer_token"] = toml_edit::value(token);
             return Ok(document.to_string());
         }
     }
-    document["experimental_bearer_token"] = toml_edit::value(&token);
+    document["experimental_bearer_token"] = toml_edit::value(token);
     Ok(document.to_string())
 }
 
@@ -555,6 +568,37 @@ fn active_provider_id(document: &DocumentMut) -> Option<String> {
 }
 
 fn extract_experimental_bearer_token(config: &str) -> Option<String> {
+    read_experimental_bearer_token(config, ProviderTableSyntax::TablesAndInlineTables)
+}
+
+/// TOML table syntax accepted when reading provider-scoped credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderTableSyntax {
+    /// Both `model_providers` and its provider entry must be ordinary tables.
+    TablesOnly,
+    /// Ordinary and inline tables are both accepted at either level.
+    TablesAndInlineTables,
+}
+
+impl ProviderTableSyntax {
+    fn table(self, item: &toml_edit::Item) -> Option<&dyn toml_edit::TableLike> {
+        match self {
+            Self::TablesOnly => item
+                .as_table()
+                .map(|table| table as &dyn toml_edit::TableLike),
+            Self::TablesAndInlineTables => item.as_table_like(),
+        }
+    }
+}
+
+/// Reads the active custom provider's bearer token, falling back to the root
+/// field when that provider has no string token. Reserved ids use only the root.
+///
+/// Whitespace is trimmed after selection: a blank provider token suppresses a
+/// root token rather than falling back to it. Invalid TOML yields no token.
+/// Hosts choose supported table syntax and may perform their own syntax checks.
+/// This function does not read `auth.json` or change documents.
+pub fn read_experimental_bearer_token(config: &str, syntax: ProviderTableSyntax) -> Option<String> {
     if !config.contains("experimental_bearer_token") {
         return None;
     }
@@ -567,9 +611,9 @@ fn extract_experimental_bearer_token(config: &str) -> Option<String> {
     let token = match active_provider_id(&document) {
         Some(id) if is_custom_provider_id(&id) => document
             .get("model_providers")
-            .and_then(|item| item.as_table_like())
+            .and_then(|item| syntax.table(item))
             .and_then(|providers| providers.get(&id))
-            .and_then(|item| item.as_table_like())
+            .and_then(|item| syntax.table(item))
             .and_then(|provider| provider.get("experimental_bearer_token"))
             .and_then(|item| item.as_str())
             .or_else(top_level),
