@@ -1,4 +1,5 @@
 use cc_switch_core::model_fetch::{
+    parse_model_ids,
     ModelEndpointInput::{BaseUrl, CompletionUrl},
     ModelEndpointPolicy, ModelFetchSpec, ModelHeaderValue, ModelListShape, ANTHROPIC_COMPATIBLE,
     BEARER_COMPATIBLE, GOOGLE_API_KEY,
@@ -35,6 +36,28 @@ fn registered_defaults_are_explicit_without_changing_descriptor_payloads() {
             assert!(serialized.get(key).is_some(), "{id}: {key}");
         }
     }
+}
+
+#[test]
+fn response_only_consumer_needs_no_request_or_authentication_spec() {
+    let shapes = [ModelListShape {
+        collection_pointer: "/native/catalog",
+        id_pointer: "/model/id",
+        strip_prefix: Some("vendor/"),
+    }];
+    let response = json!({"native": {"catalog": [
+        {"model": {"id": "vendor/a"}, "capabilities": {"future": true}},
+        {"model": {"id": "vendor/a"}}, {"model": {"id": "vendor/"}},
+        {"model": {"id": "vendor/vendor/b"}}, {"model": {"id": " c "}}
+    ]}, "cursor": "opaque"});
+    let original = response.clone();
+    assert_eq!(
+        parse_model_ids(&response, &shapes),
+        ["a", "", "vendor/b", " c "]
+    );
+    assert!(parse_model_ids(&response, &[]).is_empty());
+    assert!(parse_model_ids(&json!(null), &shapes).is_empty());
+    assert_eq!(response, original);
 }
 
 #[test]

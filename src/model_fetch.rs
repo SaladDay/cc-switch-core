@@ -200,29 +200,45 @@ impl ModelFetchSpec {
     /// assert_eq!(BEARER_COMPATIBLE.parse_model_ids(&response), ["a", "b"]);
     /// ```
     pub fn parse_model_ids(&self, payload: &Value) -> Vec<String> {
-        for shape in self.response_shapes {
-            let Some(items) = payload
-                .pointer(shape.collection_pointer)
-                .and_then(Value::as_array)
-            else {
-                continue;
-            };
-            let mut seen = HashSet::new();
-            let ids: Vec<String> = items
-                .iter()
-                .filter_map(|item| {
-                    let id = item.pointer(shape.id_pointer)?.as_str()?;
-                    let id = shape
-                        .strip_prefix
-                        .and_then(|prefix| id.strip_prefix(prefix))
-                        .unwrap_or(id);
-                    seen.insert(id).then(|| id.to_owned())
-                })
-                .collect();
-            if !ids.is_empty() {
-                return ids;
-            }
-        }
-        Vec::new()
+        parse_model_ids(payload, self.response_shapes)
     }
+}
+
+/// Decodes the first alternative yielding string IDs, without selecting request
+/// endpoints or authentication. Empty strings and whitespace are retained; IDs
+/// are deduplicated in arrival order after stripping at most one declared prefix.
+/// Missing collections and non-string IDs are skipped. No match returns an empty
+/// list. The borrowed response retains all metadata and pagination fields.
+///
+/// ```
+/// use cc_switch_core::model_fetch::{parse_model_ids, COMPATIBLE_MODEL_LISTS};
+/// use serde_json::json;
+/// let response = json!({"models": [{"name": "models/a"}, {"name": "models/a"}]});
+/// assert_eq!(parse_model_ids(&response, COMPATIBLE_MODEL_LISTS), ["a"]);
+/// ```
+pub fn parse_model_ids(payload: &Value, shapes: &[ModelListShape]) -> Vec<String> {
+    for shape in shapes {
+        let Some(items) = payload
+            .pointer(shape.collection_pointer)
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        let mut seen = HashSet::new();
+        let ids: Vec<String> = items
+            .iter()
+            .filter_map(|item| {
+                let id = item.pointer(shape.id_pointer)?.as_str()?;
+                let id = shape
+                    .strip_prefix
+                    .and_then(|prefix| id.strip_prefix(prefix))
+                    .unwrap_or(id);
+                seen.insert(id).then(|| id.to_owned())
+            })
+            .collect();
+        if !ids.is_empty() {
+            return ids;
+        }
+    }
+    Vec::new()
 }

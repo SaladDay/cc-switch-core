@@ -199,13 +199,16 @@ commit `739ac4a3` (not pushed), and Lite PR #40.
 
 Each slice uses the independent double-blind gate. The first passed baseline
 comparisons, real CLI/TUI tests, both independent reviews and Core/Lite CI: Core
-`a09204b`, CLI local `e95f36de` (not pushed), and Lite PR #41. The second is in
-progress; overall model-fetch acceptance is not complete.
+`a09204b`, CLI local `e95f36de` (not pushed), and Lite PR #41. The second passed
+compatibility tests, two independent reviews and Core/Lite CI: Core `4c982ee`,
+CLI local `875854da` (not pushed), and Lite PR #42. The third is in progress;
+overall model-fetch acceptance is not complete.
 
 The real caller is `cli::tui::fetch_provider_models_for_tui`, also used by CLI
 `provider_inspect::fetch_models_from_source`. The older
-`ProviderService::fetch_provider_models` has no in-repository caller and is not
-the migration target. Tests must compare candidate order, full-URL derivation,
+`ProviderService::fetch_provider_models` has no in-repository caller, but remains
+a public API. Its request behavior is not the TUI migration baseline. Tests must
+compare candidate order, full-URL derivation,
 malformed inputs, response precedence, untrimmed/empty IDs, stable deduplication,
 key-header order, custom-header interaction and host errors against that baseline.
 Local HTTP fixtures must exercise the production path, not just Core helpers.
@@ -247,11 +250,32 @@ The CLI's generic fallback for a missing default remains a host choice.
 
 Acceptance covers every registered default and unchanged descriptor payloads,
 CLI/TUI default and override matrices, form-to-request App identity, existing
-provider-auth tests, independent baseline HTTP comparisons, and a custom declaration through the real HTTP
-executor. This is a product-neutral contract for the future full consumer, not
+provider-auth tests, independent baseline HTTP comparisons, and a custom
+declaration through the real HTTP executor. This is a product-neutral contract
+for the future full consumer, not
 evidence of that consumer's defaults or compatibility. The API is additive;
 wire/schema, dependency versions and MSRV stay unchanged. Lite only adopts the
 pin. Rollback restores CLI callers and pins together; no data migration occurs.
+
+The third slice checks the actual worker request/HTTP/result channels, including
+App identity independent of destination fields, protocol overrides, response
+correlation and host errors. Synthetic requests check this channel contract;
+they do not establish full-product parity or test OAuth credential acquisition.
+
+Response decoding is also available without a request specification. The old
+public `ProviderService::fetch_provider_models` uses that decoder, removing its
+duplicate response traversal. Its signature, URL candidates, optional/empty-key
+handling, two authentication headers and localized errors remain host-owned and
+unchanged. Adopting a built-in request spec there would change existing behavior.
+The main `ModelFetchSpec` method delegates to the same decoder, so the new entry
+point does not create another implementation. Full-product consumers may likewise
+reuse response rules while retaining their own requests and rich response data.
+
+Acceptance requires real worker-channel tests, the old public API's loopback
+response/header/error fixtures, existing baseline HTTP comparisons, Core/Lite
+regressions and double review. The additive decoder API changes no defaults,
+wire/schema, dependencies or MSRV. Lite only adopts the reviewed pin; rollback
+reverts the CLI delegate and consumer pins without a data migration.
 
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.

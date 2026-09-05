@@ -26,9 +26,10 @@ Do not duplicate a native codec merely because one caller is a proxy workflow.
 Model-fetch protocol declarations, request planning and response decoding belong
 in Core when shared; credential acquisition, HTTP execution and retries remain
 with the host. The first model-fetch slice adds declarative endpoint/header and
-response rules. The next slice connects optional defaults through the existing
-registry while leaving provider/authentication overrides with the host; consumer
-acceptance of that slice is still in progress.
+response rules. Optional defaults now use the existing registry while leaving
+provider/authentication overrides with the host; that slice passed CLI/Lite
+acceptance. Response-only callers can reuse the decoder without selecting request
+rules. The worker-channel and legacy public-API acceptance slice is in progress.
 
 Behavior differences require named, typed choices such as validation responsibility,
 field selection, or native ownership. Do not introduce `is_lite`, `cli_mode`, or a
