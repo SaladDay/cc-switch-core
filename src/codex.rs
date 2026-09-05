@@ -271,31 +271,79 @@ pub enum PrepareNativeLiveError {
     WebSearchConflict,
 }
 
+/// Credential and payload observations, without a decision to write or delete auth.
+///
+/// A nonempty payload is not necessarily usable login material. Hosts that
+/// conservatively retain opaque snapshots can use the payload observations;
+/// credential-aware cleanup can use the credential observation instead.
+/// Only booleans are retained, so debug output never contains credentials.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuthObservation {
+    provider_api_key: bool,
+    credential_material: bool,
+    non_key_payload: bool,
+}
+
+impl AuthObservation {
+    /// Whether `OPENAI_API_KEY` is a nonempty string.
+    pub fn has_provider_api_key(self) -> bool {
+        self.provider_api_key
+    }
+
+    /// Whether credentials other than the provider API key are present.
+    /// Known inert metadata is excluded; unknown nonempty credential carriers
+    /// are retained conservatively.
+    pub fn has_credential_material(self) -> bool {
+        self.credential_material
+    }
+
+    /// Whether any nonempty field other than `auth_mode` and `OPENAI_API_KEY`
+    /// is present. This includes timestamps and malformed credential containers.
+    pub fn has_non_key_payload(self) -> bool {
+        self.non_key_payload
+    }
+
+    /// Whether the object contains a provider key or non-key payload.
+    pub fn has_payload(self) -> bool {
+        self.provider_api_key || self.non_key_payload
+    }
+}
+
+/// Observes an auth snapshot without selecting a host's retention policy.
+pub fn observe_auth(auth: &Value) -> AuthObservation {
+    let mut observation = AuthObservation::default();
+    let Some(object) = auth.as_object() else {
+        return observation;
+    };
+    for (key, value) in object {
+        match key.as_str() {
+            "auth_mode" => {}
+            "OPENAI_API_KEY" => observation.provider_api_key = nonempty_string(value),
+            _ => {
+                observation.non_key_payload |= value_is_present(value);
+                observation.credential_material |=
+                    non_key_field_has_credential_material(key, value);
+            }
+        }
+    }
+    observation
+}
+
 /// Whether an auth object carries material that can authenticate Codex.
 pub fn auth_has_login_material(auth: &Value) -> bool {
-    let Some(object) = auth.as_object() else {
-        return false;
-    };
-    object
-        .iter()
-        .any(|(key, value)| auth_field_has_login_material(key, value, true))
+    let observation = observe_auth(auth);
+    observation.has_provider_api_key() || observation.has_credential_material()
 }
 
 /// Returns true for first-class login credentials, excluding a provider API
 /// key and inert metadata.
 pub fn auth_has_credential_login_material(auth: &Value) -> bool {
-    let Some(object) = auth.as_object() else {
-        return false;
-    };
-    object
-        .iter()
-        .any(|(key, value)| auth_field_has_login_material(key, value, false))
+    observe_auth(auth).has_credential_material()
 }
 
-fn auth_field_has_login_material(key: &str, value: &Value, include_provider_api_key: bool) -> bool {
+fn non_key_field_has_credential_material(key: &str, value: &Value) -> bool {
     match key {
-        "auth_mode" | "last_refresh" => false,
-        "OPENAI_API_KEY" => include_provider_api_key && nonempty_string(value),
+        "last_refresh" => false,
         "tokens" => token_map_has_login_material(value),
         "personal_access_token" => nonempty_string(value),
         "agent_identity" => agent_identity_has_login_material(value),

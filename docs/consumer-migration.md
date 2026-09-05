@@ -46,5 +46,13 @@ design reassessment; report an unresolved design instead of extending scope.
 
 Provider/MCP/Skill catalog storage already uses Store in the CLI. Native provider,
 MCP, and Skill behavior is not yet fully migrated. OpenCode/Hermes MCP entry
-conversion has passed compatibility tests and two independent reviews. Codex
-MCP entry projection is under validation. No stage above is marked complete yet.
+conversion and Codex MCP entry projection have passed compatibility tests and two
+independent reviews per change. Remaining MCP conversion and document handling
+are not complete: Gemini timeout precedence and import tolerance differ between
+consumers and need explicit policy boundaries.
+
+Provider migration starts with Codex auth observation. The CLI retains opaque
+nonempty snapshot payloads, including timestamps; Lite uses credential-aware
+checks. Shared observations must support both without changing either policy.
+This change is under validation. Native provider projection/import and Skill
+deployment remain pending. No stage above is marked complete yet.
