@@ -117,7 +117,7 @@ Consumers can keep their previous pins without a data migration. Acceptance
 passed baseline-derived CLI comparisons, real caller tests, unchanged default
 codec conformance, and two independent blind reviews before publication.
 
-The next slice shares minimum MCP connection validation. The CLI's production
+Minimum MCP connection validation is shared. The CLI's production
 `mcp::validate_server_spec`, used by the native import paths, delegates transport
 and required-field checks to Core and keeps its localized errors. Core's strict
 validator reuses those checks but still owns canonical field validation, IDs,
@@ -130,10 +130,29 @@ The intended full-product boundary is the same connection check for rich native
 entries, without narrowing them to a simple form. Synthetic extension fixtures
 test that boundary, not full-product parity. No full-product caller was inspected
 or migrated. This additive Rust API changes no defaults, wire/schema contract,
-dependency versions, or MSRV. Acceptance requires baseline-derived CLI result and
+dependency versions, or MSRV. Acceptance passed baseline-derived CLI result and
 localized-error comparisons, real import tests, strict-default conformance, and
 two independent blind reviews. Consumer rollback reverts the integration and pin
 together; no data migration is needed for this slice.
+
+Codex native MCP document operations are the next slice. The CLI's bulk sync,
+single-entry sync, and removal retain their distinct initialization, parsing,
+legacy cleanup, logging, and file-publication rules. Core handles native table
+replacement, tolerant upsert/removal, and explicitly requested legacy cleanup.
+Entry field selection stays unchanged in the CLI; strict Core/Lite projection
+defaults are not replaced by the tolerant native document API.
+
+The intended full-product boundary accepts native TOML entries, including rich
+unknown fields, without coupling callers to the editor's AST types. Core does
+not choose paths, catalog enablement, parser-error presentation, document limits,
+or transactions here. Display diagnostics can contain source; Debug is redacted.
+Compatibility requires byte-for-byte comparisons against the previous CLI file
+operations, including inline tables, malformed collections, skipped entries,
+uninitialized apps, and large native files. Synthetic extension fixtures test
+this contract, not full-product parity; that product has not been inspected or
+integrated. This additive API changes no schema, wire contract, dependencies, or
+MSRV. Lite retains its strict projection path. Consumers adopt reviewed pins;
+rollback reverts caller changes and pins together without a data migration.
 
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.

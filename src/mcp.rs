@@ -10,6 +10,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike};
 
+use crate::codex::mcp_document::{
+    clear_legacy_servers, remove_legacy_server as remove_legacy_toml_entry,
+};
 use crate::{AppType, LogicalTarget, MAX_OPERATION_CONTENT_BYTES};
 
 mod connection;
@@ -1777,8 +1780,8 @@ fn replace_toml_section(
     }
     if grok {
         document.as_table_mut().remove("disabled_mcp_servers");
-    } else if let Some(mcp) = document.get_mut("mcp").and_then(Item::as_table_like_mut) {
-        mcp.remove("servers");
+    } else {
+        clear_legacy_servers(&mut document);
     }
     Ok(document.to_string())
 }
@@ -1884,16 +1887,6 @@ fn ensure_official_toml_entries<'a>(
         .get_mut("mcp_servers")
         .and_then(Item::as_table_like_mut)
         .expect("MCP table initialized"))
-}
-
-fn remove_legacy_toml_entry(document: &mut DocumentMut, id: &str) -> bool {
-    document
-        .get_mut("mcp")
-        .and_then(Item::as_table_like_mut)
-        .and_then(|table| table.get_mut("servers"))
-        .and_then(Item::as_table_like_mut)
-        .and_then(|entries| entries.remove(id))
-        .is_some()
 }
 
 fn set_toml_enabled(item: &mut Item, enabled: bool) -> Result<(), McpConfigError> {

@@ -1,5 +1,8 @@
 //! Codex live-configuration preparation.
 
+pub(crate) mod mcp_document;
+pub use mcp_document::{McpDocument, McpDocumentParseError, McpRemoval};
+
 use std::{collections::HashSet, error::Error, fmt};
 
 use http::Uri;
