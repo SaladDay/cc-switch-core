@@ -13,6 +13,9 @@ of the implementation it replaces.
 - Review and verify each small change before proceeding. Do not combine provider,
   MCP, and Skill rewrites into one change set.
 - Use isolated test data and remove generated build caches after validation.
+- Apply the [full-product readiness plan](full-product-readiness.md) to each Core
+  change. CLI/Lite acceptance must not narrow the contracts needed by the full
+  desktop product, whose actual migration still requires separate authorization.
 
 ## Stages
 
@@ -89,11 +92,12 @@ remain in that host. Local document inventories can use an explicit content
 bound without changing default snapshot or operation-plan limits.
 This connection passed compatibility tests and two independent blind reviews.
 
-Codex MCP entry import next shares tolerant transport decoding. Its explicit
+Codex MCP entry import now shares tolerant transport decoding. Its explicit
 field-selection policy does not replace the default structural codec or strict
 document import. Hosts retain parser diagnostics, shallow extension selection,
 collection tolerance, legacy-section precedence, catalog metadata, and enablement.
-The CLI must use the shared codec in its production import path and remove the
-replaced transport conversion rather than keeping a second production copy.
+The CLI production import uses the shared codec and removes the replaced
+transport conversion. Compatibility tests, two independent blind reviews, and
+a final independent review after a test-only refinement passed.
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.
