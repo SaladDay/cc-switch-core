@@ -237,16 +237,17 @@ and GrokBuild have no verified common default yet; absence does not mean the App
 cannot fetch models. No capability flag, serialized descriptor field, second
 registry or product-mode flag is added.
 
-The CLI one-off and saved-provider paths consume those defaults; the TUI retains
-its field-to-App mapping and explicit protocol overrides. Core specs reach the
+The CLI one-off and saved-provider paths consume those defaults. TUI requests
+carry the form's App identity independently of shared field names, retaining
+explicit protocol overrides. Core specs reach the
 HTTP executor directly, without conversion back into a consumer protocol enum.
 Claude bearer-only providers, Gemini access tokens, Pi custom authentication,
 OAuth dispatch and CLI flag parsing stay host-owned and retain their behavior.
 The CLI's generic fallback for a missing default remains a host choice.
 
 Acceptance covers every registered default and unchanged descriptor payloads,
-CLI/TUI default and override matrices, existing provider-auth tests, independent
-baseline HTTP comparisons, and a custom declaration through the real HTTP
+CLI/TUI default and override matrices, form-to-request App identity, existing
+provider-auth tests, independent baseline HTTP comparisons, and a custom declaration through the real HTTP
 executor. This is a product-neutral contract for the future full consumer, not
 evidence of that consumer's defaults or compatibility. The API is additive;
 wire/schema, dependency versions and MSRV stay unchanged. Lite only adopts the
