@@ -93,3 +93,23 @@ fn codecs_keep_native_extensions_for_the_host_to_select() {
     assert_eq!(decoded["enabled"], false);
     assert!(decoded.get("http_headers").is_none());
 }
+
+#[test]
+fn codex_entry_fields_and_document_validation_are_separate() {
+    let server = json!({"type":"http", "url":"https://example.com/mcp",
+        "headers":{"X-Test":"value"}, "extension":null});
+    let native = McpConfigTarget::Codex
+        .encode_server(&server)
+        .expect("native field mapping");
+    assert_eq!(native["http_headers"], server["headers"]);
+    assert!(native.get("headers").is_none());
+    assert_eq!(native.get("extension"), Some(&Value::Null));
+    // TOML cannot represent null, so a validated document write still fails.
+    assert!(project_mcp_server(
+        &cc_switch_core::AppType::Codex,
+        None,
+        "test",
+        McpServerProjection::Enable(&server)
+    )
+    .is_err());
+}

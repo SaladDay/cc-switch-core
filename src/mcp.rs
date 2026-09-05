@@ -76,6 +76,8 @@ impl McpConfigTarget {
     /// Converts shared transport fields into a new native entry.
     ///
     /// This does not validate a connection or merge an existing live entry.
+    /// The result uses JSON values; native serialization may reject values that
+    /// its format cannot represent (for example a TOML extension containing null).
     /// Native enablement defaults to on where the format needs it. Hosts retain
     /// their field-selection and validation policies; use [`project_mcp_server`]
     /// for validated, loss-aware updates to an existing document.
@@ -85,12 +87,11 @@ impl McpConfigTarget {
             Self::Gemini => to_json_flavor(JsonFlavor::Gemini, server, None),
             Self::OpenCode => to_json_flavor(JsonFlavor::OpenCode, server, None),
             Self::Hermes => to_hermes(server, None, true),
-            Self::Codex | Self::GrokBuild => {
-                let item = unified_to_toml_server(server, self == Self::GrokBuild, None)?;
-                item_to_json(&item).map_err(|_| {
-                    McpConfigError::InvalidServer("entry cannot be represented as JSON".to_owned())
-                })
-            }
+            Self::Codex | Self::GrokBuild => Ok(Value::Object(
+                toml_server_fields(server_object(server)?, self == Self::GrokBuild)
+                    .map(|(key, value, _)| (key.to_owned(), value.clone()))
+                    .collect(),
+            )),
         }
     }
 }
@@ -1801,20 +1802,33 @@ fn unified_to_toml_server(
     ] {
         table.remove(key);
     }
-    for (key, value) in source {
+    for (key, value, replace_extension) in toml_server_fields(source, grok) {
+        if replace_extension {
+            table.remove(key);
+        }
+        table.insert(key, json_to_toml_item(value)?);
+    }
+    Ok(output)
+}
+
+fn toml_server_fields(
+    source: &Map<String, Value>,
+    grok: bool,
+) -> impl Iterator<Item = (&str, &Value, bool)> {
+    source.iter().filter_map(move |(key, value)| {
         if MANAGED_SERVER_FIELDS.contains(&key.as_str()) && !(grok && key == "type") {
             let target_key = if key == "headers" && !grok {
                 "http_headers"
             } else {
-                key
+                key.as_str()
             };
-            table.insert(target_key, json_to_toml_item(value)?);
+            Some((target_key, value, false))
         } else if !grok && !MCP_METADATA_FIELDS.contains(&key.as_str()) && key != "http_headers" {
-            table.remove(key);
-            table.insert(key, json_to_toml_item(value)?);
+            Some((key.as_str(), value, true))
+        } else {
+            None
         }
-    }
-    Ok(output)
+    })
 }
 
 fn json_to_toml_item(value: &Value) -> Result<Item, McpConfigError> {

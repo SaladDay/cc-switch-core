@@ -46,4 +46,5 @@ design reassessment; report an unresolved design instead of extending scope.
 
 Provider/MCP/Skill catalog storage already uses Store in the CLI. Native provider,
 MCP, and Skill behavior is not yet fully migrated. OpenCode/Hermes MCP entry
-conversion is under validation. No stage above is marked complete yet.
+conversion has passed compatibility tests and two independent reviews. Codex
+MCP entry projection is under validation. No stage above is marked complete yet.
