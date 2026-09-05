@@ -44,6 +44,42 @@ impl fmt::Display for McpDocumentParseError {
 
 impl Error for McpDocumentParseError {}
 
+/// A native entry with its field order and table structure retained in memory.
+/// It is not a validated MCP connection. Hosts choose which fields to include.
+pub struct McpEntry {
+    table: Table,
+}
+
+impl fmt::Debug for McpEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("McpEntry(<redacted>)")
+    }
+}
+
+impl McpEntry {
+    /// Parses a native table body, including sub-tables and unknown fields.
+    pub fn parse(contents: &str) -> Result<Self, McpDocumentParseError> {
+        Ok(Self {
+            table: parse_document(contents)?.into_table(),
+        })
+    }
+
+    /// Inserts a native TOML value after the existing fields. Replacing a key
+    /// keeps its position. Parsing completes before mutation. Sub-tables may be
+    /// supplied in `parse`; this method accepts values, including inline tables.
+    pub fn insert_native_value(
+        &mut self,
+        key: &str,
+        contents: &str,
+    ) -> Result<(), McpDocumentParseError> {
+        let value = contents
+            .parse::<toml_edit::Value>()
+            .map_err(|error| McpDocumentParseError(error.to_string()))?;
+        self.table.insert(key, Item::Value(value));
+        Ok(())
+    }
+}
+
 /// Observations from a tolerant removal, for host-owned diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -58,9 +94,9 @@ impl McpDocument {
     /// Hosts may use `Default` when their own policy accepts a blank document.
     ///
     /// ```
-    /// use cc_switch_core::codex::McpDocument;
+    /// use cc_switch_core::codex::{McpDocument, McpEntry};
     /// let mut doc = McpDocument::parse("model = 'keep'\n")?;
-    /// doc.upsert_native_server("echo", "command = 'echo'\n")?;
+    /// doc.upsert_server("echo", McpEntry::parse("command = 'echo'\n")?);
     /// assert!(doc.render().contains("model = 'keep'"));
     /// assert!(doc.remove_server("echo").removed_official);
     /// # Ok::<(), cc_switch_core::codex::McpDocumentParseError>(())
@@ -87,33 +123,24 @@ impl McpDocument {
         self.document.as_table_mut().remove("mcp_servers").is_some()
     }
 
-    /// Replaces the official collection with native entry documents in input
-    /// order. Each entry describes a table body, not a unified MCP connection.
+    /// Replaces the official collection with prepared native entries in input
+    /// order. Entries retain their field order without another text round trip.
     /// Empty input creates an empty table; use `clear_servers` to remove it.
-    /// Duplicate IDs keep the last entry. All entries parse before mutation.
-    pub fn replace_native_servers<'a>(
-        &mut self,
-        entries: impl IntoIterator<Item = (&'a str, &'a str)>,
-    ) -> Result<(), McpDocumentParseError> {
+    /// Duplicate IDs keep the last entry. Entries have already been parsed.
+    pub fn replace_servers<'a>(&mut self, entries: impl IntoIterator<Item = (&'a str, McpEntry)>) {
         let mut table = Table::new();
-        for (id, contents) in entries {
-            table.insert(id, Item::Table(parse_document(contents)?.into_table()));
+        for (id, entry) in entries {
+            table.insert(id, Item::Table(entry.table));
         }
         self.document["mcp_servers"] = Item::Table(table);
-        Ok(())
     }
 
     /// Replaces one native entry, preserving siblings and existing table style.
     /// A missing or malformed official collection is initialized to a table.
     /// Returns whether a malformed, user-authored collection was replaced.
-    /// Native entry parsing completes before mutation; legacy entries are not
+    /// Native entries have already been parsed; legacy entries are not
     /// touched unless the host calls `clear_legacy_servers` separately.
-    pub fn upsert_native_server(
-        &mut self,
-        id: &str,
-        contents: &str,
-    ) -> Result<bool, McpDocumentParseError> {
-        let entry = parse_document(contents)?.into_table();
+    pub fn upsert_server(&mut self, id: &str, entry: McpEntry) -> bool {
         let mut repaired = false;
         if self
             .document
@@ -131,8 +158,8 @@ impl McpDocument {
             .get_mut("mcp_servers")
             .and_then(Item::as_table_like_mut)
             .expect("native MCP collection initialized")
-            .insert(id, Item::Table(entry));
-        Ok(repaired)
+            .insert(id, Item::Table(entry.table));
+        repaired
     }
 
     /// Removes one ID from both native locations. Invalid collections are left

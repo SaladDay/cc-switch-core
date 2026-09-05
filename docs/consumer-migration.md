@@ -142,8 +142,10 @@ replacement, tolerant upsert/removal, and explicitly requested legacy cleanup.
 Entry field selection stays unchanged in the CLI; strict Core/Lite projection
 defaults are not replaced by the tolerant native document API.
 
-The intended full-product boundary accepts native TOML entries, including rich
-unknown fields, without coupling callers to the editor's AST types. Core does
+The intended full-product boundary accepts native TOML entries and incremental
+native values, including rich unknown fields, without coupling callers to the
+editor's AST types. Prepared entries keep their in-memory field order until
+publication. Hosts retain their own accepted grammar and diagnostics. Core does
 not choose paths, catalog enablement, parser-error presentation, document limits,
 or transactions here. Display diagnostics can contain source; Debug is redacted.
 Compatibility requires byte-for-byte comparisons against the previous CLI file

@@ -1,7 +1,7 @@
 //! Codex live-configuration preparation.
 
 pub(crate) mod mcp_document;
-pub use mcp_document::{McpDocument, McpDocumentParseError, McpRemoval};
+pub use mcp_document::{McpDocument, McpDocumentParseError, McpEntry, McpRemoval};
 
 use std::{collections::HashSet, error::Error, fmt};
 

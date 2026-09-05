@@ -1,6 +1,6 @@
 use cc_switch_core::{
-    codex::McpDocument, project_mcp_server, AppType, McpServerProjection,
-    MAX_OPERATION_CONTENT_BYTES,
+    codex::{McpDocument, McpEntry},
+    project_mcp_server, AppType, McpServerProjection, MAX_OPERATION_CONTENT_BYTES,
 };
 use serde_json::json;
 
@@ -8,9 +8,10 @@ use serde_json::json;
 fn native_edits_keep_table_style_siblings_and_unrelated_provider_data() {
     let source = "model = 'keep' # comment\nmcp_servers = { old = { command = 'old' } }\n\n[model_providers.private]\ntoken = 'synthetic-secret'\n\n[mcp.servers.legacy]\ncommand = 'legacy'\n";
     let mut document = McpDocument::parse(source).unwrap();
-    assert!(!document
-        .upsert_native_server("added.id", "command = 'node'\n[oauth]\nscopes = ['read']\n")
-        .unwrap());
+    assert!(!document.upsert_server(
+        "added.id",
+        McpEntry::parse("command = 'node'\n[oauth]\nscopes = ['read']\n").unwrap()
+    ));
     let text = document.render();
     assert!(text.starts_with("model = 'keep' # comment\nmcp_servers = {"));
     assert!(text.contains("[model_providers.private]\ntoken = 'synthetic-secret'"));
@@ -51,16 +52,15 @@ fn native_repair_and_legacy_cleanup_are_explicit_and_do_not_change_strict_defaul
             McpServerProjection::Remove
         )
         .is_err());
-        assert!(document
-            .upsert_native_server("id", "future = { keep = [1, true] }\n")
-            .unwrap());
+        assert!(document.upsert_server(
+            "id",
+            McpEntry::parse("future = { keep = [1, true] }\n").unwrap()
+        ));
     }
     let source =
         "[mcp]\nkeep = true\n[mcp.servers.a]\ncommand = 'a'\n[mcp.servers.b]\ncommand = 'b'\n";
     let mut native = McpDocument::parse(source).unwrap();
-    assert!(!native
-        .upsert_native_server("a", "command = 'updated'\n")
-        .unwrap());
+    assert!(!native.upsert_server("a", McpEntry::parse("command = 'updated'\n").unwrap()));
     assert!(native.render().contains("[mcp.servers.b]"));
     assert!(native.clear_legacy_servers());
     assert!(!native.clear_legacy_servers());
@@ -89,32 +89,66 @@ fn native_repair_and_legacy_cleanup_are_explicit_and_do_not_change_strict_defaul
 fn native_replacement_and_parse_failures_have_defined_mutation_boundaries() {
     let source = "# retained\nmodel = 'keep'\n[mcp_servers.old]\ncommand = 'old'\n";
     let mut document = McpDocument::parse(source).unwrap();
-    assert!(document.upsert_native_server("bad", "command = [").is_err());
+    assert!(McpEntry::parse("command = [").is_err());
     assert_eq!(document.render(), source);
-    assert!(document
-        .replace_native_servers([("first", "command = 'ok'"), ("bad", "command = [")])
-        .is_err());
-    assert_eq!(document.render(), source);
-    document
-        .replace_native_servers([
-            ("z", "value = 1979-05-27T07:32:00Z\n"),
-            ("a", "value = 9223372036854775807\n"),
-            ("z", "value = 'last'\n"),
-        ])
-        .unwrap();
+    document.replace_servers([
+        (
+            "date",
+            McpEntry::parse("value = 1979-05-27T07:32:00Z\n").unwrap(),
+        ),
+        ("z", McpEntry::parse("value = 'first'\n").unwrap()),
+        (
+            "a",
+            McpEntry::parse("value = 9223372036854775807\n").unwrap(),
+        ),
+        ("z", McpEntry::parse("value = 'last'\n").unwrap()),
+    ]);
     let text = document.render();
     assert!(text.starts_with("# retained\nmodel = 'keep'\n"));
     let parsed: toml_edit::DocumentMut = text.parse().unwrap();
     assert_eq!(parsed["mcp_servers"]["z"]["value"].as_str(), Some("last"));
+    assert!(parsed["mcp_servers"]["date"]["value"]
+        .as_datetime()
+        .is_some());
     assert_eq!(
         parsed["mcp_servers"]["a"]["value"].as_integer(),
         Some(i64::MAX)
     );
-    document.replace_native_servers([]).unwrap();
+    document.replace_servers([]);
     assert!(document.render().contains("[mcp_servers]"));
     assert!(document.clear_servers());
     assert!(!document.clear_servers());
     assert_eq!(document.render(), "# retained\nmodel = 'keep'\n");
+}
+
+#[test]
+fn native_entry_edits_keep_insertion_order_and_reject_values_before_mutation() {
+    let mut entry =
+        McpEntry::parse("url = 'https://test.invalid'\n[http_headers]\nKEY = 'synthetic'\n")
+            .unwrap();
+    entry.insert_native_value("timeout", "42").unwrap();
+    entry.insert_native_value("timeout", "43").unwrap();
+    entry
+        .insert_native_value("future", "{ scopes = ['read'], opaque = true }")
+        .unwrap();
+    assert!(entry.insert_native_value("url", "[").is_err());
+    assert_eq!(format!("{entry:?}"), "McpEntry(<redacted>)");
+    let mut document = McpDocument::parse("mcp_servers = {}\n").unwrap();
+    document.upsert_server("echo", entry);
+    let text = document.render();
+    assert!(text.find("http_headers").unwrap() < text.find("timeout").unwrap());
+    let parsed: toml_edit::DocumentMut = text.parse().unwrap();
+    assert_eq!(
+        parsed["mcp_servers"]["echo"]["url"].as_str(),
+        Some("https://test.invalid")
+    );
+    assert_eq!(
+        parsed["mcp_servers"]["echo"]["timeout"].as_integer(),
+        Some(43)
+    );
+    assert!(parsed["mcp_servers"]["echo"]["future"]["opaque"]
+        .as_bool()
+        .unwrap());
 }
 
 #[test]
