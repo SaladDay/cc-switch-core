@@ -52,6 +52,49 @@ pub enum McpConfigTarget {
     Hermes,
 }
 
+impl McpConfigTarget {
+    /// Converts one native entry to the shared transport field names.
+    ///
+    /// This is a structural codec, not validation or catalog import. Extension
+    /// fields may remain in the result; hosts choose which fields to import and
+    /// read native enablement separately. Use [`validate_mcp_server`] to check a
+    /// connection, or [`import_mcp_servers`] for validated document import.
+    pub fn decode_server(self, entry: &Value) -> Result<Value, McpConfigError> {
+        match self {
+            Self::Claude => from_json_flavor(JsonFlavor::Claude, entry).map(|entry| entry.0),
+            Self::Gemini => from_json_flavor(JsonFlavor::Gemini, entry).map(|entry| entry.0),
+            Self::OpenCode => from_json_flavor(JsonFlavor::OpenCode, entry).map(|entry| entry.0),
+            Self::Hermes => from_hermes(entry),
+            Self::Codex | Self::GrokBuild => {
+                let mut server = server_object(entry)?.clone();
+                normalize_toml_server(&mut server);
+                Ok(Value::Object(server))
+            }
+        }
+    }
+
+    /// Converts shared transport fields into a new native entry.
+    ///
+    /// This does not validate a connection or merge an existing live entry.
+    /// Native enablement defaults to on where the format needs it. Hosts retain
+    /// their field-selection and validation policies; use [`project_mcp_server`]
+    /// for validated, loss-aware updates to an existing document.
+    pub fn encode_server(self, server: &Value) -> Result<Value, McpConfigError> {
+        match self {
+            Self::Claude => to_json_flavor(JsonFlavor::Claude, server, None),
+            Self::Gemini => to_json_flavor(JsonFlavor::Gemini, server, None),
+            Self::OpenCode => to_json_flavor(JsonFlavor::OpenCode, server, None),
+            Self::Hermes => to_hermes(server, None, true),
+            Self::Codex | Self::GrokBuild => {
+                let item = unified_to_toml_server(server, self == Self::GrokBuild, None)?;
+                item_to_json(&item).map_err(|_| {
+                    McpConfigError::InvalidServer("entry cannot be represented as JSON".to_owned())
+                })
+            }
+        }
+    }
+}
+
 /// Native document that stores one application's MCP configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -1190,7 +1233,7 @@ fn to_json_flavor(
     server: &Value,
     existing: Option<&Value>,
 ) -> Result<Value, McpConfigError> {
-    let unified = server.as_object().expect("validated server object");
+    let unified = server_object(server)?;
     match flavor {
         JsonFlavor::Claude => {
             let mut output = existing
@@ -1229,7 +1272,7 @@ fn to_json_flavor(
                     copy_fields(unified, &mut output, &["headers"]);
                 }
                 "sse" => copy_fields(unified, &mut output, &["url", "headers"]),
-                _ => unreachable!("validated transport"),
+                other => return Err(unsupported_transport(other)),
             }
             let has_configured_timeout = GEMINI_TIMEOUT_FIELDS
                 .iter()
@@ -1266,8 +1309,13 @@ fn to_json_flavor(
             {
                 "stdio" => {
                     output.insert("type".to_owned(), Value::String("local".to_owned()));
-                    let mut command =
-                        vec![unified.get("command").expect("validated command").clone()];
+                    let mut command = vec![Value::String(
+                        unified
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                    )];
                     command.extend(
                         unified
                             .get("args")
@@ -1283,15 +1331,12 @@ fn to_json_flavor(
                 }
                 "http" | "sse" => {
                     output.insert("type".to_owned(), Value::String("remote".to_owned()));
-                    output.insert(
-                        "url".to_owned(),
-                        unified.get("url").expect("validated url").clone(),
-                    );
+                    copy_fields(unified, &mut output, &["url"]);
                     if let Some(headers) = unified.get("headers") {
                         output.insert("headers".to_owned(), headers.clone());
                     }
                 }
-                _ => unreachable!("validated transport"),
+                other => return Err(unsupported_transport(other)),
             }
             output.insert("enabled".to_owned(), Value::Bool(true));
             Ok(Value::Object(output))
@@ -1433,16 +1478,20 @@ fn import_toml_section(
             entry.enabled = false;
         }
         let object = entry.server.as_object_mut().expect("TOML entry object");
-        if let Some(headers) = object.remove("http_headers") {
-            object.insert("headers".to_owned(), headers);
-        }
-        if !object.contains_key("type") && object.contains_key("url") {
-            object.insert("type".to_owned(), Value::String("http".to_owned()));
-        } else {
-            infer_transport(object);
-        }
+        normalize_toml_server(object);
     }
     Ok(imports)
+}
+
+fn normalize_toml_server(object: &mut Map<String, Value>) {
+    if let Some(headers) = object.remove("http_headers") {
+        object.insert("headers".to_owned(), headers);
+    }
+    if !object.contains_key("type") && object.contains_key("url") {
+        object.insert("type".to_owned(), Value::String("http".to_owned()));
+    } else {
+        infer_transport(object);
+    }
 }
 
 fn toml_section_contains(
@@ -1730,7 +1779,7 @@ fn unified_to_toml_server(
     grok: bool,
     existing: Option<Item>,
 ) -> Result<Item, McpConfigError> {
-    let source = server.as_object().expect("validated server object");
+    let source = server_object(server)?;
     let mut output = match existing {
         Some(Item::Value(toml_edit::Value::InlineTable(table))) => Item::Table(table.into_table()),
         Some(item) => item,
@@ -1904,7 +1953,7 @@ fn import_hermes(app: &AppType, contents: Option<&[u8]>) -> Result<Vec<McpImport
         let Some(id) = id.as_str() else { continue };
         let json = serde_json::to_value(server)
             .map_err(|_| invalid_document(app, "MCP entry cannot be represented as JSON"))?;
-        if let Ok(server) = from_hermes(id, &json) {
+        if let Ok(server) = from_hermes(&json) {
             imports.push(McpImport {
                 id: id.to_owned(),
                 server,
@@ -2076,10 +2125,8 @@ fn hermes_projection(
         .map_err(|_| invalid_document(app, "MCP entry cannot be written as YAML"))
 }
 
-fn from_hermes(id: &str, value: &Value) -> Result<Value, McpConfigError> {
-    let object = value.as_object().ok_or_else(|| {
-        McpConfigError::InvalidServer(format!("Hermes entry '{id}' must be an object"))
-    })?;
+fn from_hermes(value: &Value) -> Result<Value, McpConfigError> {
+    let object = server_object(value)?;
     let mut output = object.clone();
     clear_fields(
         &mut output,
@@ -2094,9 +2141,9 @@ fn from_hermes(id: &str, value: &Value) -> Result<Value, McpConfigError> {
         output.insert("type".to_owned(), Value::String("sse".to_owned()));
         copy_fields(object, &mut output, &["url", "headers"]);
     } else {
-        return Err(McpConfigError::InvalidServer(format!(
-            "Hermes entry '{id}' has neither command nor url"
-        )));
+        return Err(McpConfigError::InvalidServer(
+            "Hermes entry has neither command nor url".to_owned(),
+        ));
     }
     Ok(Value::Object(output))
 }
@@ -2106,7 +2153,7 @@ fn to_hermes(
     existing: Option<&Value>,
     enabled: bool,
 ) -> Result<Value, McpConfigError> {
-    let unified = server.as_object().expect("validated server object");
+    let unified = server_object(server)?;
     let mut output = existing
         .and_then(Value::as_object)
         .cloned()
@@ -2125,10 +2172,20 @@ fn to_hermes(
     {
         "stdio" => copy_fields(unified, &mut output, &["command", "args", "env"]),
         "http" | "sse" => copy_fields(unified, &mut output, &["url", "headers"]),
-        _ => unreachable!("validated transport"),
+        other => return Err(unsupported_transport(other)),
     }
     output.insert("enabled".to_owned(), Value::Bool(enabled));
     Ok(Value::Object(output))
+}
+
+fn server_object(value: &Value) -> Result<&Map<String, Value>, McpConfigError> {
+    value
+        .as_object()
+        .ok_or_else(|| McpConfigError::InvalidServer("the definition must be an object".to_owned()))
+}
+
+fn unsupported_transport(transport: &str) -> McpConfigError {
+    McpConfigError::InvalidServer(format!("unsupported transport '{transport}'"))
 }
 
 fn clear_fields(target: &mut Map<String, Value>, keys: &[&str]) {
