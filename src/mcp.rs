@@ -12,6 +12,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike};
 
 use crate::{AppType, LogicalTarget, MAX_OPERATION_CONTENT_BYTES};
 
+mod gemini_codec;
 mod json_patch;
 
 const MAX_MCP_ID_BYTES: usize = 128;
@@ -52,7 +53,7 @@ pub enum McpConfigTarget {
     Hermes,
 }
 
-/// Field selection when decoding a native MCP entry.
+/// Field selection and inference when decoding a native MCP entry.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum McpEntryDecodePolicy {
@@ -64,6 +65,26 @@ pub enum McpEntryDecodePolicy {
     /// the caller. Explicit invalid types are retained for caller validation.
     /// Other native formats currently reject this policy.
     TransportFields,
+    /// Preserve Gemini fields and infer a missing or non-string type from string
+    /// command/URL fields. `httpUrl` always becomes `url` with type `http`.
+    /// No connection validation or metadata filtering is performed. Other native
+    /// formats currently reject this policy.
+    InferFromStringFields,
+}
+
+/// Field selection when encoding a new native MCP entry.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum McpEntryEncodePolicy {
+    /// Keep the existing native codec's field selection and timeout rules.
+    #[default]
+    Canonical,
+    /// Preserve unconsumed Gemini fields, including metadata. Rename an HTTP URL
+    /// and remove the shared `type` field. Timeouts use numeric seconds before
+    /// milliseconds, truncate fractional milliseconds, and saturate to `u64`.
+    /// Unused millisecond alternatives remain present. Other formats reject this
+    /// policy; callers retain wrapper and metadata selection.
+    PreserveFields,
 }
 
 impl McpConfigTarget {
@@ -86,6 +107,37 @@ impl McpConfigTarget {
             }
             McpEntryDecodePolicy::TransportFields => {
                 Err(McpConfigError::UnsupportedEntryPolicy { target: self })
+            }
+            McpEntryDecodePolicy::InferFromStringFields if self == Self::Gemini => {
+                let mut output = server_object(entry)?.clone();
+                gemini_codec::decode_fields(&mut output, gemini_codec::TypeInference::StringFields);
+                Ok(Value::Object(output))
+            }
+            McpEntryDecodePolicy::InferFromStringFields => {
+                Err(McpConfigError::UnsupportedEntryPolicy { target: self })
+            }
+        }
+    }
+
+    /// Encodes an entry using an explicit field policy, without selecting a
+    /// catalog wrapper, validating a connection, or reading a document.
+    ///
+    /// The Gemini preserving policy derives `timeout` as the maximum of the
+    /// existing numeric timeout, startup timeout (default 10 seconds), and tool
+    /// timeout (default 60 seconds). Negative numbers saturate to zero. Fields
+    /// outside the selected transport remain intact, even with an invalid type.
+    pub fn encode_server_with_policy(
+        self,
+        server: &Value,
+        policy: McpEntryEncodePolicy,
+    ) -> Result<Value, McpConfigError> {
+        match policy {
+            McpEntryEncodePolicy::Canonical => self.encode_server(server),
+            McpEntryEncodePolicy::PreserveFields if self == Self::Gemini => Ok(
+                gemini_codec::encode_preserving_fields(server_object(server)?),
+            ),
+            McpEntryEncodePolicy::PreserveFields => {
+                Err(McpConfigError::UnsupportedEntryEncodingPolicy { target: self })
             }
         }
     }
@@ -347,6 +399,8 @@ pub enum McpConfigError {
     UnsupportedApp { app_id: String },
     #[error("native MCP format '{target:?}' does not support this entry decoding policy")]
     UnsupportedEntryPolicy { target: McpConfigTarget },
+    #[error("native MCP format '{target:?}' does not support this entry encoding policy")]
+    UnsupportedEntryEncodingPolicy { target: McpConfigTarget },
     #[error("MCP server id is invalid: {0}")]
     InvalidId(String),
     #[error("MCP server definition is invalid: {0}")]
@@ -1212,12 +1266,7 @@ fn from_json_flavor(flavor: JsonFlavor, value: &Value) -> Result<(Value, bool), 
     match flavor {
         JsonFlavor::Claude => infer_transport(&mut output),
         JsonFlavor::Gemini => {
-            if let Some(url) = output.remove("httpUrl") {
-                output.insert("url".to_owned(), url);
-                output.insert("type".to_owned(), Value::String("http".to_owned()));
-            } else {
-                infer_transport(&mut output);
-            }
+            gemini_codec::decode_fields(&mut output, gemini_codec::TypeInference::FieldPresence);
         }
         JsonFlavor::OpenCode => {
             enabled = output

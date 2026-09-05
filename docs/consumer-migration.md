@@ -99,5 +99,22 @@ collection tolerance, legacy-section precedence, catalog metadata, and enablemen
 The CLI production import uses the shared codec and removes the replaced
 transport conversion. Compatibility tests, two independent blind reviews, and
 a final independent review after a test-only refinement passed.
+
+The next Gemini MCP slice shares entry import and export in the CLI's real
+`read_mcp_servers_map` / `set_mcp_servers_map` calls. The explicit policies retain
+unconsumed fields, string-based type inference, and saturating seconds-first
+timeouts. Default Core/Lite codecs keep their existing rules. Parsing, document
+bounds, non-object entry tolerance, wrapper/metadata selection, catalog enablement,
+and file publication remain host-owned. No provider, proxy, Skill, or UI behavior
+belongs in this slice.
+
+The intended full-product boundary is the same native entry codec, independent
+of simple provider forms. Rich synthetic entry fixtures test unconsumed fields;
+they do not establish full-product parity. The full product's field selection
+and timeout rules still require baseline verification before adoption. This is
+an additive Rust API change, not a wire/schema, dependency, or Rust-version change.
+Consumers can keep their previous pins without a data migration. Acceptance
+requires baseline-derived CLI comparisons, real caller tests, unchanged default
+codec conformance, and two independent blind reviews before publication.
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.
