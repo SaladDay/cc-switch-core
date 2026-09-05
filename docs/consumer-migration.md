@@ -135,7 +135,7 @@ localized-error comparisons, real import tests, strict-default conformance, and
 two independent blind reviews. Consumer rollback reverts the integration and pin
 together; no data migration is needed for this slice.
 
-Codex native MCP document operations are the next slice. The CLI's bulk sync,
+Codex native MCP document operations are shared. The CLI's bulk sync,
 single-entry sync, and removal retain their distinct initialization, parsing,
 legacy cleanup, logging, and file-publication rules. Core handles native table
 replacement, tolerant upsert/removal, and explicitly requested legacy cleanup.
@@ -155,6 +155,29 @@ this contract, not full-product parity; that product has not been inspected or
 integrated. This additive API changes no schema, wire contract, dependencies, or
 MSRV. Lite retains its strict projection path. Consumers adopt reviewed pins;
 rollback reverts caller changes and pins together without a data migration.
+
+This connection passed byte-for-byte CLI baseline comparisons, Core/Lite
+regressions, two fresh independent reviews after the final correction, and Core
+multi-platform and Lite CI. Core revision `0ed213d`, CLI local commit `0593724d`,
+and Lite PR #39 record the accepted versions. The CLI branch was not pushed.
+
+Claude model-key migration and live metadata cleanup are the next provider
+slice. Core owns these in-memory transformations on native JSON. The CLI retains
+the existing import, backfill, effective-settings, temporary-launch and live-write
+call sites, including when each transformation runs. Model-key migration is
+explicit: Core/Lite's default import and projection do not start applying it.
+Existing role values, malformed shapes, string whitespace, unknown fields, output
+key order and the changed result must match the previous CLI implementation.
+
+The intended full-product boundary is native settings, not a simple form. Rich
+synthetic fixtures cover permissions, hooks and opaque authentication alongside
+these transformations; full-product call order and compatibility remain unverified.
+Paths, parsing, common-config selection, proxy/auth workflows, persistence and
+transactions stay with the host. No new registry or product-mode flags are needed
+for these Claude-specific operations. Acceptance requires baseline comparisons,
+real provider/temporary-launch tests, unchanged default codecs, and double review.
+The additive Rust API changes no defaults, wire/schema, dependencies or MSRV.
+Rollback reverts CLI delegates and pins together; no data migration is introduced.
 
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.

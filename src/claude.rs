@@ -90,7 +90,15 @@ impl Error for PrepareLiveSnapshotError {}
 /// Claude Code's `settings.json`.
 pub fn prepare_live_settings(settings: &Value) -> Value {
     let mut live = settings.clone();
-    if let Some(object) = live.as_object_mut() {
+    strip_internal_metadata(&mut live);
+    live
+}
+
+/// Removes only the four top-level CC Switch metadata fields in place.
+/// Non-object settings and nested fields are left unchanged. This does not
+/// validate settings or normalize model keys.
+pub fn strip_internal_metadata(settings: &mut Value) {
+    if let Some(object) = settings.as_object_mut() {
         for key in [
             "api_format",
             "apiFormat",
@@ -100,7 +108,70 @@ pub fn prepare_live_settings(settings: &Value) -> Value {
             object.remove(key);
         }
     }
-    live
+}
+
+/// Fills absent Claude model-role keys and removes `ANTHROPIC_SMALL_FAST_MODEL`.
+///
+/// Haiku prefers the legacy small/fast model, then `ANTHROPIC_MODEL`; Sonnet and
+/// Opus prefer the reverse. Only string sources are used, without trimming.
+/// Existing role keys, even non-string values, and unrelated fields are retained.
+/// A legacy key is removed regardless of its value. Returns whether anything
+/// changed; settings without an object-valued `env` are left unchanged.
+///
+/// Hosts opt into this migration explicitly. Preparing a live snapshot does not
+/// invoke it or choose when stored provider settings should be migrated.
+///
+/// ```
+/// use cc_switch_core::claude::normalize_model_keys;
+/// use serde_json::json;
+///
+/// let mut settings = json!({"env": {
+///     "ANTHROPIC_MODEL": "main",
+///     "ANTHROPIC_SMALL_FAST_MODEL": "fast"
+/// }});
+/// assert!(normalize_model_keys(&mut settings));
+/// assert_eq!(settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "fast");
+/// assert_eq!(settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "main");
+/// assert!(!normalize_model_keys(&mut settings));
+/// ```
+pub fn normalize_model_keys(settings: &mut Value) -> bool {
+    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let model = env
+        .get("ANTHROPIC_MODEL")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let small_fast = env
+        .get("ANTHROPIC_SMALL_FAST_MODEL")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut changed = false;
+    for (key, fallback) in [
+        (
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            small_fast.as_ref().or(model.as_ref()),
+        ),
+        (
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            model.as_ref().or(small_fast.as_ref()),
+        ),
+        (
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            model.as_ref().or(small_fast.as_ref()),
+        ),
+    ] {
+        if let Some(value) = fallback {
+            if let serde_json::map::Entry::Vacant(entry) = env.entry(key) {
+                entry.insert(Value::String(value.clone()));
+                changed = true;
+            }
+        }
+    }
+    if env.remove("ANTHROPIC_SMALL_FAST_MODEL").is_some() {
+        changed = true;
+    }
+    changed
 }
 
 /// Validates and prepares the canonical Claude Code live snapshot.
