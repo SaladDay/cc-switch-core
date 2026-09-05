@@ -236,6 +236,7 @@ enum RollbackBehavior {
 pub struct OperationReceipt<R> {
     applied: Vec<AppliedWrite<R>>,
     rollback_behavior: RollbackBehavior,
+    maximum_content_bytes: usize,
 }
 
 impl<R> OperationReceipt<R> {
@@ -247,7 +248,13 @@ impl<R> OperationReceipt<R> {
     where
         H: OperationHost<Resource = R>,
     {
-        let failures = rollback_applied(host, &self.applied, self.rollback_behavior, None);
+        let failures = rollback_applied(
+            host,
+            &self.applied,
+            self.rollback_behavior,
+            None,
+            self.maximum_content_bytes,
+        );
         if failures.is_empty() {
             Ok(())
         } else {
@@ -279,7 +286,30 @@ pub fn execute_operation_plan<H>(
 where
     H: OperationHost,
 {
-    execute_operation_plan_with_rollback(plan, host, RollbackBehavior::BestEffort)
+    execute_operation_plan_with_content_limit(plan, host, MAX_OPERATION_CONTENT_BYTES)
+}
+
+/// Executes a locally constructed plan with an explicit per-document bound.
+///
+/// Hosts that already accept larger native files can choose a bound from their
+/// observed and prepared documents. The same bound applies to validation,
+/// observations, failure recovery, and receipt rollback. This does not relax
+/// [`OperationPlan::decode_json`] or the default execution limits. Do not use it
+/// to bypass validation of an untrusted serialized plan.
+pub fn execute_operation_plan_with_content_limit<H>(
+    plan: &OperationPlan,
+    host: &mut H,
+    maximum_content_bytes: usize,
+) -> Result<OperationReceipt<H::Resource>, OperationExecutionError<H::Error>>
+where
+    H: OperationHost,
+{
+    execute_operation_plan_with_rollback(
+        plan,
+        host,
+        RollbackBehavior::BestEffort,
+        maximum_content_bytes,
+    )
 }
 
 /// Executes a plan whose earlier writes are prerequisites of later writes.
@@ -294,18 +324,24 @@ pub fn execute_dependency_ordered_plan<H>(
 where
     H: OperationHost,
 {
-    execute_operation_plan_with_rollback(plan, host, RollbackBehavior::DependencyOrdered)
+    execute_operation_plan_with_rollback(
+        plan,
+        host,
+        RollbackBehavior::DependencyOrdered,
+        MAX_OPERATION_CONTENT_BYTES,
+    )
 }
 
 fn execute_operation_plan_with_rollback<H>(
     plan: &OperationPlan,
     host: &mut H,
     rollback_behavior: RollbackBehavior,
+    maximum_content_bytes: usize,
 ) -> Result<OperationReceipt<H::Resource>, OperationExecutionError<H::Error>>
 where
     H: OperationHost,
 {
-    plan.validate()
+    plan.validate_with_content_limit(maximum_content_bytes)
         .map_err(|error| execution_error(OperationFailure::InvalidPlan(error)))?;
 
     let mut prepared = Vec::with_capacity(plan.writes.len());
@@ -333,9 +369,13 @@ where
     }
 
     for prepared_write in &mut prepared {
-        let original =
-            read_for_execution(host, &prepared_write.resource, prepared_write.write.target)
-                .map_err(execution_error)?;
+        let original = read_for_execution(
+            host,
+            &prepared_write.resource,
+            prepared_write.write.target,
+            maximum_content_bytes,
+        )
+        .map_err(execution_error)?;
         if !prepared_write.write.expected.matches(original.as_deref()) {
             return Err(execution_error(OperationFailure::Conflict {
                 target: prepared_write.write.target,
@@ -376,6 +416,7 @@ where
                     &applied,
                     rollback_behavior,
                     Some(target),
+                    maximum_content_bytes,
                 ));
             }
             Err(source) => {
@@ -386,6 +427,7 @@ where
                     &applied,
                     rollback_behavior,
                     None,
+                    maximum_content_bytes,
                 ));
             }
         }
@@ -394,6 +436,7 @@ where
     Ok(OperationReceipt {
         applied,
         rollback_behavior,
+        maximum_content_bytes,
     })
 }
 
@@ -401,22 +444,23 @@ fn read_for_execution<H>(
     host: &mut H,
     resource: &H::Resource,
     target: LogicalTarget,
+    maximum_content_bytes: usize,
 ) -> Result<Option<Vec<u8>>, OperationFailure<H::Error>>
 where
     H: OperationHost,
 {
     match host
-        .read(resource, MAX_OPERATION_CONTENT_BYTES)
+        .read(resource, maximum_content_bytes)
         .map_err(|source| OperationFailure::Read { target, source })?
     {
         OperationRead::Missing => Ok(None),
-        OperationRead::Contents(contents) if contents.len() <= MAX_OPERATION_CONTENT_BYTES => {
+        OperationRead::Contents(contents) if contents.len() <= maximum_content_bytes => {
             Ok(Some(contents))
         }
         OperationRead::Contents(_) | OperationRead::TooLarge => {
             Err(OperationFailure::ObservedContentTooLarge {
                 target,
-                limit: MAX_OPERATION_CONTENT_BYTES,
+                limit: maximum_content_bytes,
             })
         }
     }
@@ -435,13 +479,20 @@ fn failure_with_rollback<H>(
     applied: &[AppliedWrite<H::Resource>],
     rollback_behavior: RollbackBehavior,
     blocked_by: Option<LogicalTarget>,
+    maximum_content_bytes: usize,
 ) -> OperationExecutionError<H::Error>
 where
     H: OperationHost,
 {
     OperationExecutionError {
         failure,
-        rollback_failures: rollback_applied(host, applied, rollback_behavior, blocked_by),
+        rollback_failures: rollback_applied(
+            host,
+            applied,
+            rollback_behavior,
+            blocked_by,
+            maximum_content_bytes,
+        ),
     }
 }
 
@@ -450,6 +501,7 @@ fn rollback_applied<H>(
     applied: &[AppliedWrite<H::Resource>],
     behavior: RollbackBehavior,
     mut blocked_by: Option<LogicalTarget>,
+    maximum_content_bytes: usize,
 ) -> Vec<OperationRollbackFailure<H::Error>>
 where
     H: OperationHost,
@@ -473,23 +525,23 @@ where
         ) {
             Ok(CompareExchangeOutcome::Applied) => {}
             Ok(CompareExchangeOutcome::Conflict) => {
-                match host.read(&applied_write.resource, MAX_OPERATION_CONTENT_BYTES) {
+                match host.read(&applied_write.resource, maximum_content_bytes) {
                     Ok(OperationRead::Missing) if applied_write.original.is_none() => {}
                     Ok(OperationRead::Contents(contents))
-                        if contents.len() <= MAX_OPERATION_CONTENT_BYTES
+                        if contents.len() <= maximum_content_bytes
                             && applied_write.original.as_deref() == Some(contents.as_slice()) => {}
                     Ok(OperationRead::Contents(contents))
-                        if contents.len() > MAX_OPERATION_CONTENT_BYTES =>
+                        if contents.len() > maximum_content_bytes =>
                     {
                         failures.push(OperationRollbackFailure::ObservedContentTooLarge {
                             target: applied_write.target,
-                            limit: MAX_OPERATION_CONTENT_BYTES,
+                            limit: maximum_content_bytes,
                         });
                     }
                     Ok(OperationRead::TooLarge) => {
                         failures.push(OperationRollbackFailure::ObservedContentTooLarge {
                             target: applied_write.target,
-                            limit: MAX_OPERATION_CONTENT_BYTES,
+                            limit: maximum_content_bytes,
                         });
                     }
                     Ok(OperationRead::Missing | OperationRead::Contents(_)) => {
@@ -958,6 +1010,80 @@ mod tests {
         assert_eq!(
             host.document(LogicalTarget::CodexConfig),
             Some(&b"config"[..])
+        );
+    }
+
+    #[test]
+    fn explicit_content_limit_preserves_default_and_wire_bounds() {
+        let large = "x".repeat(MAX_OPERATION_CONTENT_BYTES + 1);
+        let plan = codex_plan(&[(LogicalTarget::CodexConfig, b"old", &large)]);
+        let mut host = FakeHost::default().with_document(LogicalTarget::CodexConfig, b"old");
+        assert!(execute_operation_plan(&plan, &mut host).is_err());
+        assert!(OperationPlan::decode_json(&serde_json::to_vec(&plan).unwrap()).is_err());
+        assert_eq!(host.exchanges, 0);
+
+        let receipt = execute_operation_plan_with_content_limit(&plan, &mut host, large.len())
+            .expect("host accepts larger native files");
+        assert_eq!(
+            host.document(LogicalTarget::CodexConfig),
+            Some(large.as_bytes())
+        );
+        receipt.rollback(&mut host).unwrap();
+        assert_eq!(
+            host.document(LogicalTarget::CodexConfig),
+            Some(b"old".as_slice())
+        );
+    }
+
+    #[test]
+    fn explicit_content_limit_checks_prepared_and_observed_bytes_before_writing() {
+        let plan = codex_plan(&[(LogicalTarget::CodexConfig, b"long-old", "new")]);
+        let mut host = FakeHost::default().with_document(LogicalTarget::CodexConfig, b"long-old");
+        let error = execute_operation_plan_with_content_limit(&plan, &mut host, 2).unwrap_err();
+        assert!(matches!(
+            error.failure(),
+            OperationFailure::InvalidPlan(OperationPlanError::ContentTooLarge { limit: 2, .. })
+        ));
+        let error = execute_operation_plan_with_content_limit(&plan, &mut host, 3).unwrap_err();
+        assert!(matches!(
+            error.failure(),
+            OperationFailure::ObservedContentTooLarge { limit: 3, .. }
+        ));
+        assert_eq!(host.exchanges, 0);
+    }
+
+    #[test]
+    fn explicit_content_limit_is_retained_for_failure_and_receipt_recovery() {
+        let large = "x".repeat(MAX_OPERATION_CONTENT_BYTES + 1);
+        let plan = codex_plan(&[
+            (LogicalTarget::CodexAuth, large.as_bytes(), "new-auth"),
+            (LogicalTarget::CodexConfig, large.as_bytes(), "new-config"),
+        ]);
+        let mut host = FakeHost::default()
+            .with_document(LogicalTarget::CodexAuth, large.as_bytes())
+            .with_document(LogicalTarget::CodexConfig, large.as_bytes());
+        host.fail_exchange = Some(2);
+        let error =
+            execute_operation_plan_with_content_limit(&plan, &mut host, large.len()).unwrap_err();
+        assert!(
+            error.rollback_failures().is_empty(),
+            "unchanged large config counts as restored"
+        );
+        assert_eq!(
+            host.document(LogicalTarget::CodexAuth),
+            Some(large.as_bytes())
+        );
+
+        host.fail_exchange = None;
+        let receipt =
+            execute_operation_plan_with_content_limit(&plan, &mut host, large.len()).unwrap();
+        host.set_document(LogicalTarget::CodexConfig, large.as_bytes());
+        receipt
+            .rollback(&mut host)
+            .expect("already restored large config is accepted");
+        assert_eq!(
+            host.document(LogicalTarget::CodexAuth),
+            Some(large.as_bytes())
         );
     }
 

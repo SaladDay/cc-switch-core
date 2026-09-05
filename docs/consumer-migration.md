@@ -55,8 +55,19 @@ Provider migration starts with Codex auth observation. The CLI retains opaque
 nonempty snapshot payloads, including timestamps; Lite uses credential-aware
 checks. Shared observations must support both without changing either policy.
 Auth observation has passed compatibility tests and independent double review.
-Codex bearer-token routing is the next migration slice: shared native reads and
-writes must retain each host's accepted TOML table syntax, token precedence, and
-error behavior. Authentication policy and file execution are outside this slice.
+Codex bearer-token routing has also passed compatibility tests and double review.
+Shared reads and writes retain each host's accepted TOML table syntax, token
+precedence, and error behavior.
+
+The next slice connects CLI Codex two-file auth/config writes to Core execution. The CLI
+keeps path resolution, permission policy, accepted JSON/TOML syntax, and native
+file sizes. Core owns conditional writes and guarded recovery; the CLI must not
+repeat an unconditional snapshot restore after a Core-managed write failure.
+Single-file replacement stays host-owned and does not acquire a read-permission
+requirement. Conditional Windows replacements must not delete the old file before
+publishing its replacement; Core's existing atomic file writer provides that primitive.
+Model-catalog publication and rollback after later MCP/snapshot work remain host
+workflows, not part of this slice. The default execution and wire size limits
+remain unchanged; trusted local plans may use an explicit host-selected bound.
 The rest of native provider projection/import and Skill deployment remain pending.
 No stage above is marked complete yet.

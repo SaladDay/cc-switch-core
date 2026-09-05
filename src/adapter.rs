@@ -139,7 +139,17 @@ pub trait AppAdapter: sealed::Sealed + fmt::Debug + Send + Sync {
 
     /// Validates that an operation plan belongs to this adapter.
     fn validate_plan(&self, plan: &OperationPlan) -> Result<(), OperationPlanError> {
-        plan.validate_for(self.descriptor().app())?;
+        self.validate_plan_with_content_limit(plan, crate::MAX_OPERATION_CONTENT_BYTES)
+    }
+
+    /// Validates a locally constructed plan under a host-selected content bound.
+    /// Serialized plans must still pass the fixed wire-contract limits.
+    fn validate_plan_with_content_limit(
+        &self,
+        plan: &OperationPlan,
+        maximum_content_bytes: usize,
+    ) -> Result<(), OperationPlanError> {
+        plan.validate_for(self.descriptor().app(), maximum_content_bytes)?;
         if let Some(target) = plan
             .writes
             .iter()

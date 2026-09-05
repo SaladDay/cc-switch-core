@@ -22,7 +22,7 @@ pub const OPERATION_CONTRACT_MAJOR: u32 = 1;
 /// Maximum writes accepted in one built-in application plan.
 pub const MAX_OPERATION_WRITES: usize = 4;
 
-/// Maximum UTF-8 payload accepted for one planned write.
+/// Default and wire-contract maximum UTF-8 payload for one planned write.
 pub const MAX_OPERATION_CONTENT_BYTES: usize = 1024 * 1024;
 
 /// Maximum accepted JSON frame for a serialized operation plan.
@@ -274,17 +274,29 @@ impl OperationPlan {
 
     /// Validates the shared structural and ownership invariants.
     pub fn validate(&self) -> Result<(), OperationPlanError> {
+        self.validate_with_content_limit(MAX_OPERATION_CONTENT_BYTES)
+    }
+
+    pub(crate) fn validate_with_content_limit(
+        &self,
+        maximum_content_bytes: usize,
+    ) -> Result<(), OperationPlanError> {
         let descriptor = builtin_app_registry()
             .descriptors()
             .find(|descriptor| descriptor.id() == self.app_id)
             .ok_or_else(|| OperationPlanError::UnknownApp {
                 app_id: self.app_id.clone(),
             })?;
-        builtin_app_adapter(descriptor.app()).validate_plan(self)
+        builtin_app_adapter(descriptor.app())
+            .validate_plan_with_content_limit(self, maximum_content_bytes)
     }
 
     /// Validates this plan for a specific built-in adapter.
-    pub(crate) fn validate_for(&self, app: &AppType) -> Result<(), OperationPlanError> {
+    pub(crate) fn validate_for(
+        &self,
+        app: &AppType,
+        maximum_content_bytes: usize,
+    ) -> Result<(), OperationPlanError> {
         if self.contract_major != OPERATION_CONTRACT_MAJOR {
             return Err(OperationPlanError::UnsupportedContract {
                 actual: self.contract_major,
@@ -320,11 +332,11 @@ impl OperationPlan {
             if write
                 .contents
                 .as_ref()
-                .is_some_and(|contents| contents.len() > MAX_OPERATION_CONTENT_BYTES)
+                .is_some_and(|contents| contents.len() > maximum_content_bytes)
             {
                 return Err(OperationPlanError::ContentTooLarge {
                     target: write.target,
-                    limit: MAX_OPERATION_CONTENT_BYTES,
+                    limit: maximum_content_bytes,
                 });
             }
             if write.contents.is_none() && !write.target.allows_removal() {
