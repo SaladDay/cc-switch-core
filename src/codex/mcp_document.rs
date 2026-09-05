@@ -140,6 +140,8 @@ impl McpDocument {
     /// Returns whether a malformed, user-authored collection was replaced.
     /// Native entries have already been parsed; legacy entries are not
     /// touched unless the host calls `clear_legacy_servers` separately.
+    /// Horizontal whitespace in an empty inline collection stays before its
+    /// first entry. Multiline whitespace and comments remain at the end.
     pub fn upsert_server(&mut self, id: &str, entry: McpEntry) -> bool {
         let mut repaired = false;
         if self
@@ -154,11 +156,35 @@ impl McpDocument {
                 .is_some_and(|item| !item.is_none());
             self.document["mcp_servers"] = Item::Table(Table::new());
         }
-        self.document
+        let leading = self
+            .document
+            .get_mut("mcp_servers")
+            .and_then(Item::as_inline_table_mut)
+            .filter(|table| table.is_empty())
+            .and_then(|table| {
+                let whitespace = table.trailing().as_str()?;
+                if whitespace.is_empty()
+                    || !whitespace.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+                {
+                    return None;
+                }
+                let leading = format!("{whitespace} ");
+                table.set_trailing("");
+                Some(leading)
+            });
+        let servers = self
+            .document
             .get_mut("mcp_servers")
             .and_then(Item::as_table_like_mut)
-            .expect("native MCP collection initialized")
-            .insert(id, Item::Table(entry.table));
+            .expect("native MCP collection initialized");
+        servers.insert(id, Item::Table(entry.table));
+        if let Some(leading) = leading {
+            servers
+                .key_mut(id)
+                .expect("native MCP entry inserted")
+                .leaf_decor_mut()
+                .set_prefix(leading);
+        }
         repaired
     }
 

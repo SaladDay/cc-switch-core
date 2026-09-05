@@ -152,6 +152,28 @@ fn native_entry_edits_keep_insertion_order_and_reject_values_before_mutation() {
 }
 
 #[test]
+fn native_empty_inline_collection_keeps_horizontal_whitespace_before_first_entry() {
+    for whitespace in ["", " ", "   ", "\t", " \t  "] {
+        let source = format!("mcp_servers = {{{whitespace}}}\n");
+        let mut document = McpDocument::parse(&source).unwrap();
+        document.upsert_server("echo", McpEntry::parse("command = 'echo'\n").unwrap());
+        assert_eq!(
+            document.render(),
+            format!("mcp_servers = {{{whitespace} echo = {{ command = 'echo' }} }}\n")
+        );
+    }
+    let mut document = McpDocument::parse("mcp_servers = { # keep comment\n}\n").unwrap();
+    document.upsert_server("echo", McpEntry::parse("command = 'echo'\n").unwrap());
+    let text = document.render();
+    assert!(text.contains("# keep comment\n"));
+    let parsed: toml_edit::DocumentMut = text.parse().unwrap();
+    assert_eq!(
+        parsed["mcp_servers"]["echo"]["command"].as_str(),
+        Some("echo")
+    );
+}
+
+#[test]
 fn native_parsing_has_no_implicit_size_or_blank_policy() {
     assert!(McpDocument::parse("\u{a0}").is_err());
     let error = McpDocument::parse("token = 'synthetic-secret'\nbad = [").unwrap_err();
