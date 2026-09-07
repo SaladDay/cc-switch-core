@@ -1376,7 +1376,6 @@ fn preserve_live_mcp_toml(
 }
 
 fn serialize_env(env: &BTreeMap<String, String>) -> Result<String, NativePlanError> {
-    let mut lines = Vec::with_capacity(env.len());
     for (key, value) in env {
         if !valid_env_key(key) || value.contains(['\r', '\n', '\0']) {
             return Err(invalid_provider(
@@ -1384,9 +1383,11 @@ fn serialize_env(env: &BTreeMap<String, String>) -> Result<String, NativePlanErr
                 "environment contains an unsafe key or value",
             ));
         }
-        lines.push(format!("{key}={value}"));
     }
-    Ok(lines.join("\n"))
+    Ok(gemini::render_literal_env_assignments(
+        env.iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    ))
 }
 
 fn valid_env_key(key: &str) -> bool {
@@ -1843,6 +1844,44 @@ mod tests {
             .find(|write| write.target == target)
             .and_then(|write| write.contents.as_deref())
             .expect("target has a content write")
+    }
+
+    #[test]
+    fn gemini_plan_keeps_env_validation_separate_from_literal_rendering() {
+        let documents = document_set(AppType::Gemini, &[]);
+        let prepare = |env: Value| {
+            standard_plan(
+                AppType::Gemini,
+                NativeAction::Apply,
+                "official",
+                json!({"env": env}),
+                NativeProviderMode::Official,
+                &documents,
+                None,
+            )
+        };
+        let plan = prepare(json!({"Z": "'quoted'", "A": "x=y", "0_NAME": ""})).unwrap();
+        assert_eq!(
+            write_contents(&plan, LogicalTarget::GeminiEnv),
+            "0_NAME=\nA=x=y\nZ='quoted'",
+        );
+        let plan = prepare(json!({})).unwrap();
+        assert_eq!(write_contents(&plan, LogicalTarget::GeminiEnv), "");
+        for (name, value) in [
+            ("", "opaque"),
+            ("变量", "opaque"),
+            ("bad=name", "opaque"),
+            ("BAD-NAME", "opaque"),
+            ("A", "opaque\nvalue"),
+            ("A", "opaque\rvalue"),
+            ("A", "opaque\0value"),
+        ] {
+            let error = prepare(json!({name: value})).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("environment contains an unsafe key or value"));
+            assert!(!error.to_string().contains("opaque"));
+        }
     }
 
     #[test]

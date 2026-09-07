@@ -3,8 +3,8 @@
 mod env;
 mod settings;
 pub use env::{
-    parse_env_assignments, select_string_env_values, EnvAssignmentError, EnvAssignmentErrorKind,
-    EnvAssignmentSyntax,
+    parse_env_assignments, render_literal_env_assignments, select_string_env_values,
+    EnvAssignmentError, EnvAssignmentErrorKind, EnvAssignmentSyntax,
 };
 pub use settings::SettingsOverlay;
 

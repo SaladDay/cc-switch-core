@@ -2,6 +2,35 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+/// Render literal assignments in key order, separated by LF with no final LF.
+/// Duplicate names retain their input order. Nothing is trimmed, quoted or escaped.
+/// This formatter does not validate names, credentials or embedded CR/LF/NUL;
+/// callers must apply their write policy before passing untrusted input.
+///
+/// ```
+/// use cc_switch_core::gemini::render_literal_env_assignments;
+/// assert_eq!(
+///     render_literal_env_assignments([("Z", "'literal'"), ("A", "x=y")]),
+///     "A=x=y\nZ='literal'",
+/// );
+/// ```
+pub fn render_literal_env_assignments<'a>(
+    assignments: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
+    let mut assignments: Vec<_> = assignments.into_iter().collect();
+    assignments.sort_by(|left, right| left.0.cmp(right.0));
+    let mut output = String::new();
+    for (index, (key, value)) in assignments.into_iter().enumerate() {
+        if index != 0 {
+            output.push('\n');
+        }
+        output.push_str(key);
+        output.push('=');
+        output.push_str(value);
+    }
+    output
+}
+
 /// Select literal string entries from an optional native `env` object.
 /// Missing/non-object values yield no entries; non-string entries are omitted.
 /// This field selector does not validate credentials, names or env-file safety.

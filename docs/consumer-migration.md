@@ -390,3 +390,24 @@ baselines are requirements to compare, not defaults to impose on another consume
 
 The rest of native provider projection/import and Skill deployment remain pending.
 No overall migration stage above is marked complete yet.
+
+### Gemini env rendering
+
+The registered default projection and CLI's real `serialize_env_file` /
+`write_gemini_env_atomic` path share literal assignment rendering. Names are sorted;
+values are unchanged, with LF separators and no final LF. Core's default planner
+still rejects unsafe names and CR/LF/NUL values before rendering. The CLI retains
+its existing native acceptance and diagnostics. Formatting is not validation.
+
+This removes the duplicate serializer without changing filesystem execution,
+MCP synchronization, authentication, database transactions or recovery. The full
+product can use the same formatter after applying its own validation policy;
+synthetic literal fixtures do not prove full-product compatibility. This additive
+API changes no wire/schema contract, dependencies, MSRV or projection defaults.
+Rollback reverts the caller and dependency pin together; no data migration is needed.
+
+Execution remains a separate gate: CLI MCP synchronization can write the same
+Gemini settings document again after provider publication. A provider-only receipt
+cannot classify those later host writes as its own. Define ownership across both
+operations before replacing the switching transaction's recovery; do not add a
+rollback bypass or adopt whatever bytes happen to be present as a new precondition.
