@@ -478,3 +478,40 @@ journal. CLI's Gemini adoption must test real follow-ups and failures separately
 full-product compatibility is still unverified. Existing execution defaults,
 wire/schema contracts, dependencies and Rust requirements do not change. Hosts
 that need separate commit points can keep separate receipts and existing pins.
+
+### Shared live-file locking
+
+The next gate has two reviewable slices. First, `fs::SharedLiveConfigLock`
+provides the existing Lite advisory-lock protocol as a common primitive. It
+accepts a host-resolved dedicated lock path, tries once, distinguishes contention
+from I/O failure, and owns the file handle until dropped. It does not truncate,
+rename or delete the lock file. Unix permissions remain `0600`; existing symlink
+paths are followed. All cooperating hosts must retain a stable file and aliases.
+Writers that ignore the lock, replace its inode, or change its symlink target are
+outside this advisory protocol. No environment or settings lookup moves into Core.
+
+The concrete adoption sites are Lite's `LiveConfig::lock_file` and CLI's ordinary
+`ProviderService::switch_gemini_coordinated`. Lite can replace its local file-lock
+implementation while retaining its process mutex, errors and receipt lifetime.
+CLI must acquire the same guard after its database write transaction and before
+the first native observation, retaining it through commit or compensation. A
+future full-product host can use the same primitive without adopting Lite's form,
+feature restrictions or transaction implementation; that consumer is not yet
+authorized for inspection or migration.
+
+Second, migrate those real callers and test contention in both CLI/Lite
+directions, unchanged data when acquisition fails, and release after success,
+native failure and database commit failure. Audit transaction lifetimes on both
+sides: dropping a failed database transaction before native compensation does not
+satisfy the intended order. Keep final host settings and independent Skill work
+outside a provider transaction unless their own contracts are migrated explicitly.
+Do not wrap legacy whole-catalog saves in a lock and call that coordination.
+
+`tests/shared_live_lock.rs` validates the primitive with separate processes using
+Core and Lite's existing `fs4` protocol, plus release, contents, permissions,
+stable aliases and I/O errors. It is not a real-consumer workflow test. The first
+slice adds the synchronous `fs4` dependency; Rust 1.85.0 and existing serialized,
+schema and execution contracts remain unchanged. Consumer adoption, shared
+database/native recovery, all-writer safety and full-product parity are not
+established by this primitive test. Both slices require local validation and
+fresh independent double-blind review.

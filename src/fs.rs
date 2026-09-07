@@ -1,5 +1,8 @@
 //! Safe file-reading and atomic-writing primitives.
 
+mod live_lock;
+pub use live_lock::{SharedLiveConfigLock, SharedLiveConfigLockError};
+
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
