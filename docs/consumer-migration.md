@@ -453,14 +453,28 @@ The next production steps are ordered by the real CLI call boundary:
 3. Verify shared resource identities and database/file lock order with CLI/Lite
    contention tests before claiming cross-consumer coordination. Cover incomplete
    recovery, errors after publication, and a provider-owned file written more than
-   once. Preserve host-accepted sizes: the current dependency-ordered entry point
-   has the default content limit, while explicit larger bounds are available only
-   on the best-effort entry point. Resolve both requirements together at adoption;
-   do not silently lower a host's limit or weaken dependency recovery.
+   once. Preserve host-accepted sizes with
+   `execute_dependency_ordered_plan_with_content_limit`; the default entry point
+   retains its original limit. Do not silently lower a host's limit or weaken
+   dependency recovery.
 
 These are the same native execution boundaries intended for a future full-product
 host; Lite's feature set does not define them. That host still needs authorized
 baselines for its own workflow and compensation policy. Each production step needs
-local validation and fresh double-blind review. This contract-test slice changes
-no production API, default, dependency, wire, schema or MSRV, and replaces no
-consumer writer yet. CLI and Lite pins need no update for tests and documentation.
+local validation and fresh double-blind review. The preceding contract-test-only
+stage changed no production API, default, dependency, wire, schema or MSRV, and
+replaced no consumer writer. That stage required no CLI or Lite pin update.
+
+Repeated whole-document follow-ups must not retain a copy of every intermediate
+version. `OperationReceipt::try_coalesce_last_write` provides a restricted option:
+one follow-up write on the same final logical target and physical resource, whose
+original bytes equal the preceding owned write. It retains the earliest original,
+latest written contents, dependency order and larger size bound. Rejected
+follow-ups are returned intact for separate recovery. Only combine writes that
+share one recovery boundary; individual intermediate restoration is then lost.
+
+This is a product-neutral receipt operation, not a host transaction, lock or crash
+journal. CLI's Gemini adoption must test real follow-ups and failures separately;
+full-product compatibility is still unverified. Existing execution defaults,
+wire/schema contracts, dependencies and Rust requirements do not change. Hosts
+that need separate commit points can keep separate receipts and existing pins.

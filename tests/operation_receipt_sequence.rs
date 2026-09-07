@@ -170,6 +170,58 @@ fn a_failed_followup_recovers_before_the_earlier_receipt_is_restored() {
 }
 
 #[test]
+fn coalesced_receipt_survives_later_publication_and_recovery_failures() {
+    for publish_before_failure in [false, true] {
+        for recovery_failure in [None, Some(false), Some(true)] {
+            let mut host = Host::seeded();
+            let mut combined =
+                execute_dependency_ordered_plan(&provider_plan(), &mut host).unwrap();
+            let mcp = execute_operation_plan(&mcp_plan(), &mut host).unwrap();
+            combined.try_coalesce_last_write(mcp).unwrap();
+            host.failures.insert(4, publish_before_failure);
+            if let Some(publish_before_error) = recovery_failure {
+                host.failures.insert(5, publish_before_error);
+            }
+            let failure = execute_operation_plan(
+                &plan(&[(SETTINGS, MCP_SETTINGS, NEXT_MCP_SETTINGS)]),
+                &mut host,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                failure.failure(),
+                OperationFailure::Write {
+                    target: SETTINGS,
+                    ..
+                }
+            ));
+            assert_eq!(
+                !failure.rollback_failures().is_empty(),
+                publish_before_failure && recovery_failure.is_some()
+            );
+            if publish_before_failure && recovery_failure == Some(false) {
+                let error = combined.rollback(&mut host).unwrap_err();
+                assert!(matches!(
+                    error.failures(),
+                    [
+                        OperationRollbackFailure::Changed { target: SETTINGS },
+                        OperationRollbackFailure::Blocked {
+                            target: ENV,
+                            dependency: SETTINGS
+                        },
+                    ]
+                ));
+                assert_eq!(host.contents(ENV), PROVIDER_ENV.as_bytes());
+                assert_eq!(host.contents(SETTINGS), NEXT_MCP_SETTINGS.as_bytes());
+            } else {
+                combined.rollback(&mut host).unwrap();
+                assert_eq!(host.contents(ENV), OLD_ENV.as_bytes());
+                assert_eq!(host.contents(SETTINGS), OLD_SETTINGS.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
 fn failed_followup_recovery_keeps_both_errors_and_blocks_incompatible_restoration() {
     let mut host = Host::seeded();
     let provider = execute_dependency_ordered_plan(&provider_plan(), &mut host).unwrap();

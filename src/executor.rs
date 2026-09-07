@@ -244,6 +244,45 @@ impl<R> OperationReceipt<R> {
         self.applied.is_empty()
     }
 
+    /// Combines a consecutive single-write follow-up on this receipt's last target.
+    ///
+    /// Both target and resource must match, and the follow-up's original bytes
+    /// must equal our last written bytes. The earliest original and latest written
+    /// contents are retained; intermediate versions are released. Rollback goes
+    /// directly to that original, keeping this receipt's dependency order and the
+    /// larger content bound. This does not authorize an intervening external edit.
+    /// Only combine writes that share a recovery boundary: intermediate versions
+    /// can no longer be restored individually after a successful combination.
+    ///
+    /// Empty follow-ups are harmless. Other follow-ups are returned intact, with
+    /// this receipt unchanged, so the host can still recover them separately.
+    /// Hold the same host synchronization boundary throughout both operations.
+    pub fn try_coalesce_last_write(&mut self, mut followup: Self) -> Result<(), Self>
+    where
+        R: Eq,
+    {
+        if followup.is_empty() {
+            return Ok(());
+        }
+        let [next] = followup.applied.as_slice() else {
+            return Err(followup);
+        };
+        let Some(previous) = self.applied.last_mut() else {
+            return Err(followup);
+        };
+        if previous.target != next.target
+            || previous.resource != next.resource
+            || previous.written != next.original
+        {
+            return Err(followup);
+        }
+        previous.written = followup.applied.pop().expect("one follow-up write").written;
+        self.maximum_content_bytes = self
+            .maximum_content_bytes
+            .max(followup.maximum_content_bytes);
+        Ok(())
+    }
+
     pub fn rollback<H>(self, host: &mut H) -> Result<(), OperationRollbackError<H::Error>>
     where
         H: OperationHost<Resource = R>,
@@ -911,6 +950,180 @@ mod tests {
         receipt.rollback(&mut host).expect("rollback receipt");
 
         assert_eq!(host.exchange_order, vec![auth, config, config, auth]);
+    }
+
+    #[test]
+    fn coalesced_followups_keep_bounded_records_and_dependency_recovery() {
+        let original = "o".repeat(MAX_OPERATION_CONTENT_BYTES + 1);
+        let bound = original.len() + 8;
+        for external_edit in [false, true] {
+            let mut host = FakeHost::default()
+                .with_document(LogicalTarget::CodexAuth, b"old-auth")
+                .with_document(LogicalTarget::CodexConfig, original.as_bytes());
+            let plan = codex_plan(&[
+                (LogicalTarget::CodexAuth, b"old-auth", "next-auth"),
+                (
+                    LogicalTarget::CodexConfig,
+                    original.as_bytes(),
+                    "next-config",
+                ),
+            ]);
+            let mut receipt =
+                execute_dependency_ordered_plan_with_content_limit(&plan, &mut host, bound)
+                    .unwrap();
+            for index in 0..64 {
+                let before = host.document(LogicalTarget::CodexConfig).unwrap().to_vec();
+                let next = format!("{original}-{index}");
+                let plan = codex_plan(&[(LogicalTarget::CodexConfig, &before, &next)]);
+                let followup =
+                    execute_operation_plan_with_content_limit(&plan, &mut host, bound).unwrap();
+                receipt.try_coalesce_last_write(followup).unwrap();
+                assert_eq!(receipt.applied.len(), 2);
+                let config = receipt.applied.last().unwrap();
+                assert_eq!(config.original.as_deref(), Some(original.as_bytes()));
+                assert_eq!(config.written.as_deref(), Some(next.as_bytes()));
+                let retained: usize = receipt
+                    .applied
+                    .iter()
+                    .map(|write| {
+                        write.original.as_ref().map_or(0, Vec::len)
+                            + write.written.as_ref().map_or(0, Vec::len)
+                    })
+                    .sum();
+                assert!(
+                    retained < 2 * bound + 32,
+                    "intermediate documents must not accumulate"
+                );
+            }
+            if external_edit {
+                host.set_document(LogicalTarget::CodexConfig, b"external");
+                let error = receipt.rollback(&mut host).unwrap_err();
+                assert!(matches!(
+                    error.failures()[1],
+                    OperationRollbackFailure::Blocked {
+                        target: LogicalTarget::CodexAuth,
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    host.document(LogicalTarget::CodexConfig),
+                    Some(&b"external"[..])
+                );
+                assert_eq!(
+                    host.document(LogicalTarget::CodexAuth),
+                    Some(&b"next-auth"[..])
+                );
+            } else {
+                receipt.rollback(&mut host).unwrap();
+                assert_eq!(
+                    host.document(LogicalTarget::CodexConfig),
+                    Some(original.as_bytes())
+                );
+                assert_eq!(
+                    host.document(LogicalTarget::CodexAuth),
+                    Some(&b"old-auth"[..])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coalescing_rejects_non_tail_resources_targets_and_discontinuous_bytes() {
+        for case in 0..5 {
+            let mut host = FakeHost::default()
+                .with_document(LogicalTarget::CodexAuth, b"old-auth")
+                .with_document(LogicalTarget::CodexConfig, b"old-config");
+            let mut receipt = execute_dependency_ordered_plan(
+                &codex_plan(&[
+                    (LogicalTarget::CodexAuth, b"old-auth", "next-auth"),
+                    (LogicalTarget::CodexConfig, b"old-config", "next-config"),
+                ]),
+                &mut host,
+            )
+            .unwrap();
+            let mut plan =
+                codex_plan(&[(LogicalTarget::CodexConfig, b"next-config", "final-config")]);
+            match case {
+                0 => plan = codex_plan(&[(LogicalTarget::CodexAuth, b"next-auth", "final-auth")]),
+                1 => {
+                    host.resources.insert(LogicalTarget::CodexConfig, 99);
+                    host.documents.insert(99, b"next-config".to_vec());
+                }
+                2 => {
+                    host.resources.insert(
+                        LogicalTarget::GeminiSettings,
+                        resource_for(LogicalTarget::CodexConfig),
+                    );
+                    plan.app_id = "gemini".into();
+                    plan.writes[0].target = LogicalTarget::GeminiSettings;
+                }
+                3 => {
+                    host.set_document(LogicalTarget::CodexConfig, b"external");
+                    plan.writes[0].expected = ContentExpectation::for_contents(Some(b"external"));
+                }
+                _ => {
+                    plan = codex_plan(&[
+                        (LogicalTarget::CodexAuth, b"next-auth", "final-auth"),
+                        (LogicalTarget::CodexConfig, b"next-config", "final-config"),
+                    ])
+                }
+            }
+            let followup = execute_operation_plan(&plan, &mut host).unwrap();
+            let rejected = receipt.try_coalesce_last_write(followup).unwrap_err();
+            assert_eq!(receipt.applied.len(), 2);
+            assert_eq!(
+                receipt.applied[1].written.as_deref(),
+                Some(&b"next-config"[..])
+            );
+            rejected.rollback(&mut host).unwrap();
+            if case == 3 {
+                assert!(receipt.rollback(&mut host).is_err());
+                assert_eq!(
+                    host.document(LogicalTarget::CodexConfig),
+                    Some(&b"external"[..])
+                );
+            } else {
+                receipt.rollback(&mut host).unwrap();
+                assert_eq!(
+                    host.documents[&resource_for(LogicalTarget::CodexConfig)],
+                    b"old-config"
+                );
+                assert_eq!(
+                    host.document(LogicalTarget::CodexAuth),
+                    Some(&b"old-auth"[..])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coalescing_preserves_missing_contents_and_the_largest_bound() {
+        let mut host = FakeHost::default();
+        let mut plan = OperationPlan {
+            contract_major: OPERATION_CONTRACT_MAJOR,
+            app_id: "codex".into(),
+            writes: vec![PlannedWrite {
+                target: LogicalTarget::CodexAuth,
+                expected: ContentExpectation::Missing,
+                contents: Some("short".into()),
+            }],
+        };
+        let mut receipt = execute_operation_plan_with_content_limit(&plan, &mut host, 5).unwrap();
+        plan.writes[0].expected = ContentExpectation::for_contents(Some(b"short"));
+        plan.writes[0].contents = None;
+        let followup = execute_operation_plan_with_content_limit(&plan, &mut host, 5).unwrap();
+        receipt.try_coalesce_last_write(followup).unwrap();
+        plan.writes[0].expected = ContentExpectation::Missing;
+        let empty = execute_operation_plan_with_content_limit(&plan, &mut host, 5).unwrap();
+        receipt.try_coalesce_last_write(empty).unwrap();
+        plan.writes[0].contents = Some("longer contents".into());
+        let followup = execute_operation_plan_with_content_limit(&plan, &mut host, 15).unwrap();
+        receipt.try_coalesce_last_write(followup).unwrap();
+        assert_eq!(receipt.maximum_content_bytes, 15);
+        assert_eq!(receipt.applied.len(), 1);
+        assert!(receipt.applied[0].original.is_none());
+        receipt.rollback(&mut host).unwrap();
+        assert!(host.document(LogicalTarget::CodexAuth).is_none());
     }
 
     #[test]
