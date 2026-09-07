@@ -29,7 +29,16 @@ with the host. The first model-fetch slice adds declarative endpoint/header and
 response rules. Optional defaults now use the existing registry while leaving
 provider/authentication overrides with the host; that slice passed CLI/Lite
 acceptance. Response-only callers can reuse the decoder without selecting request
-rules. The worker-channel and legacy public-API acceptance slice is in progress.
+rules. Worker-channel and legacy public-API acceptance passed two independent
+reviews, CLI compatibility tests, and Core/Lite CI; see the consumer record.
+
+Gemini native import distinguishes a validated provider from an env-backed native
+snapshot. The default import retains credential checks and object validation;
+the explicit snapshot policy preserves Unicode literal assignments and arbitrary
+settings JSON without classifying login state. Neither path reduces native data
+to the simple form. A future full-product reader can use these contracts, but its
+actual grammar, missing-file policy and diagnostics still need approved baselines.
+Reading a snapshot does not relax write validation or authorize an auth change.
 
 Behavior differences require named, typed choices such as validation responsibility,
 field selection, or native ownership. Do not introduce `is_lite`, `cli_mode`, or a

@@ -277,5 +277,40 @@ regressions and double review. The additive decoder API changes no defaults,
 wire/schema, dependencies or MSRV. Lite only adopts the reviewed pin; rollback
 reverts the CLI delegate and consumer pins without a data migration.
 
+The model-fetch acceptance slice passed two independent blind reviews. Core
+`4dafd0af` passed CI `34088602804`; Lite PR #43 adopted that revision and passed
+exact-head CI `34088627022`. CLI acceptance is local commit `83b4d114` on the
+migration branch, not a remote release. Whole-CLI strict Clippy still has existing
+out-of-scope findings; no clean whole-CLI lint claim is made.
+
+## Gemini native provider migration
+
+1. **Read/import:** share assignment parsing and env-backed native snapshot import
+   through the registered Gemini adapter. Replace CLI's live reader and initial
+   provider import assembly. Preserve strict Core defaults, tolerant CLI grammar,
+   localized errors, env-before-settings I/O, accepted JSON shapes and sizes,
+   unknown settings, catalog classification and persistence order. Test against
+   the previous reader, including both actual CLI entry points. Lite retains its
+   strict default and only adopts the reviewed pin.
+2. **Write planning:** compare the CLI's existing native write behavior with Core
+   using isolated fixtures before replacing anything. Define exact field ownership,
+   authentication selection, common-config preprocessing and malformed-input rules.
+   Share reusable transformation only; keep product choices in the host. Do not
+   narrow native snapshots to Lite's form or discard future/advanced settings.
+3. **Execution acceptance:** establish file order, stale-read conflicts and recovery
+   for the actual host write path, then replace it and remove the old implementation.
+   Verify database/file compensation separately; shared execution is not an atomic
+   SQLite/filesystem transaction. Each step requires fresh double blind review.
+
+The current change is step 1 only. It does not change file writes, auth workflows,
+common configuration, proxy behavior, MCP/Skill operations, UI or shared schema.
+The assignment codec exposes grammar, not product flags; callers choose whether
+to reject invalid lines. Snapshot import has no credential classification and
+does not imply write validity. The API is additive; dependency versions, wire
+formats and MSRV are unchanged. Rollback restores CLI readers and consumer pins
+together, with no data migration. Synthetic rich-settings fixtures check a future
+consumer contract, not full-product compatibility. No full-product repository is
+inspected or changed by this slice.
+
 The rest of native provider projection/import and Skill deployment remain pending.
-No stage above is marked complete yet.
+No overall migration stage above is marked complete yet.

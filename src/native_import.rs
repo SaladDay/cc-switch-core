@@ -72,6 +72,11 @@ pub struct CodexImportPolicy {
 #[non_exhaustive]
 pub enum NativeImportPolicy {
     Codex(CodexImportPolicy),
+    /// Import an observed Gemini .env snapshot, skipping malformed assignments
+    /// under the Unicode literal grammar. Settings may be any JSON value.
+    /// Requires .env; does not validate credentials or classify login state.
+    /// This read policy does not relax native write validation.
+    GeminiEnvSnapshot,
 }
 
 /// Native Hermes section from which an imported provider originated.
@@ -277,7 +282,12 @@ pub(crate) fn import_codex_policy(
     documents: &LiveDocumentSet,
     policy: &NativeImportPolicy,
 ) -> ProjectResult<Vec<NativeImportCandidate>> {
-    let NativeImportPolicy::Codex(policy) = policy;
+    let NativeImportPolicy::Codex(policy) = policy else {
+        return Err(NativeImportError::UnsupportedPolicy {
+            app_id: app.as_str().to_owned(),
+        }
+        .into());
+    };
     import_codex_with_policy(app, documents, policy)
 }
 
@@ -395,6 +405,45 @@ pub(crate) fn import_gemini(
         } else {
             NativeProviderMode::Custom
         }),
+        NativeImportContext::None,
+    )?])
+}
+
+pub(crate) fn import_gemini_policy(
+    app: &AppType,
+    documents: &LiveDocumentSet,
+    policy: &NativeImportPolicy,
+) -> ProjectResult<Vec<NativeImportCandidate>> {
+    if *policy != NativeImportPolicy::GeminiEnvSnapshot {
+        return Err(NativeImportError::UnsupportedPolicy {
+            app_id: app.as_str().to_owned(),
+        }
+        .into());
+    }
+    let text = optional_text(documents, LogicalTarget::GeminiEnv, "Gemini")?
+        .ok_or_else(|| missing("Gemini .env"))?;
+    let env: Map<String, Value> =
+        gemini::parse_env_assignments(text, gemini::EnvAssignmentSyntax::UnicodeLiteral)
+            .filter_map(Result::ok)
+            .map(|(key, value)| (key.to_owned(), Value::String(value.to_owned())))
+            .collect();
+    let config = observed_contents(documents, LogicalTarget::GeminiSettings)?
+        .map(|contents| {
+            serde_json::from_slice::<Value>(contents).map_err(|_| {
+                invalid_document(
+                    LogicalTarget::GeminiSettings,
+                    "Gemini JSON could not be parsed",
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_else(|| json!({}));
+    Ok(vec![candidate(
+        app.clone(),
+        "default",
+        "Imported Gemini",
+        json!({"env": env, "config": config}),
+        None,
         NativeImportContext::None,
     )?])
 }
@@ -823,45 +872,24 @@ fn required_json5_object(
 }
 
 fn parse_env(contents: &str, target: LogicalTarget) -> ProjectResult<Map<String, Value>> {
-    let mut env = Map::new();
-    for (index, line) in contents.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, value) = line.split_once('=').ok_or_else(|| {
-            invalid_document(
-                target,
-                format!("Gemini .env line {} has no '=' separator", index + 1),
-            )
-        })?;
-        let key = key.trim();
-        if !valid_env_key(key) {
-            return Err(invalid_document(
-                target,
-                format!(
-                    "Gemini .env line {} has an invalid variable name",
-                    index + 1
-                ),
-            ));
-        }
-        let value = value.trim();
-        if value.contains(['\r', '\n', '\0']) {
-            return Err(invalid_document(
-                target,
-                format!("Gemini .env line {} has an invalid value", index + 1),
-            ));
-        }
-        env.insert(key.to_owned(), Value::String(value.to_owned()));
-    }
-    Ok(env)
-}
-
-fn valid_env_key(key: &str) -> bool {
-    !key.is_empty()
-        && key
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    gemini::parse_env_assignments(contents, gemini::EnvAssignmentSyntax::Portable)
+        .map(|assignment| {
+            assignment
+                .map(|(key, value)| (key.to_owned(), Value::String(value.to_owned())))
+                .map_err(|error| {
+                    let reason = match error.kind {
+                        gemini::EnvAssignmentErrorKind::MissingSeparator => "no '=' separator",
+                        gemini::EnvAssignmentErrorKind::EmptyKey
+                        | gemini::EnvAssignmentErrorKind::InvalidKey => "an invalid variable name",
+                        gemini::EnvAssignmentErrorKind::InvalidValue => "an invalid value",
+                    };
+                    invalid_document(
+                        target,
+                        format!("Gemini .env line {} has {reason}", error.line),
+                    )
+                })
+        })
+        .collect()
 }
 
 fn nested_object<'a>(

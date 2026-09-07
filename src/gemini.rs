@@ -1,5 +1,10 @@
 //! Gemini live-configuration projection.
 
+mod env;
+pub use env::{
+    parse_env_assignments, EnvAssignmentError, EnvAssignmentErrorKind, EnvAssignmentSyntax,
+};
+
 use std::{collections::BTreeMap, fmt};
 
 use serde_json::{Map, Value};
@@ -52,7 +57,8 @@ pub(crate) const INTEGRATION: AppIntegration = AppIntegration::new(
         simple_provider::project_gemini,
         false,
     ),
-    NativeImportBehavior::new(native_import::import_gemini),
+    NativeImportBehavior::new(native_import::import_gemini)
+        .with_policy(native_import::import_gemini_policy),
     NativeProjectionBehavior::new(
         projection::gemini_plan,
         None,
