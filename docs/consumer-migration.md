@@ -554,3 +554,15 @@ That host retains paths, native execution and compensation order; its baseline
 and actual adoption remain unverified. This additive Rust API changes no existing
 defaults, wire/schema, dependencies or MSRV. Consumers can keep their current
 pins; rollback restores the caller and pin together without a data migration.
+
+### Native MCP entries in host-owned documents
+
+`McpConfigTarget::capture_native_entry` and
+`restore_native_entry_with_policy` let a host retain the same opaque native
+snapshot without adopting Core's complete-document parser or default size limit.
+They support the removable-snapshot targets (Claude and Gemini), validate snapshot
+shape/target, and reuse document restoration's field ownership rules. The caller
+still chooses the document, entry ID, connection validation, encoding policy,
+size limit and write/rollback boundary. Existing document APIs keep their limits
+and behavior. This is a common codec bridge for desktop, CLI and Lite consumers,
+not a claim that their standalone MCP workflows have all migrated.

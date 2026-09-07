@@ -19,6 +19,9 @@ mod connection;
 mod gemini_codec;
 mod json_patch;
 
+#[cfg(test)]
+mod entry_snapshot_tests;
+
 pub use connection::{validate_mcp_connection, McpConnectionError};
 
 const MAX_MCP_ID_BYTES: usize = 128;
@@ -146,6 +149,52 @@ impl McpConfigTarget {
                 Err(McpConfigError::UnsupportedEntryEncodingPolicy { target: self })
             }
         }
+    }
+
+    /// Captures one raw native entry for applications whose disabled state
+    /// removes that entry. The host owns document parsing, entry selection and
+    /// size limits. Connection fields are not validated by this structural API.
+    pub fn capture_native_entry(self, entry: &str) -> Result<McpNativeSnapshot, McpConfigError> {
+        let snapshot = McpNativeSnapshot {
+            target: self,
+            entry_json: entry.to_owned(),
+        };
+        validate_snapshot(self, &snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// Restores a captured native entry with current connection fields.
+    ///
+    /// This has the same extension-preservation rules as document restoration,
+    /// but leaves document limits, IDs and catalog wrappers to the host. The
+    /// snapshot must belong to this target. Encoding follows the requested entry
+    /// policy; this is not connection validation or a live-file write.
+    ///
+    /// ```
+    /// use cc_switch_core::{McpConfigTarget, McpEntryEncodePolicy};
+    /// use serde_json::json;
+    /// let target = McpConfigTarget::Gemini;
+    /// let snapshot = target.capture_native_entry(r#"{"trust":true}"#)?;
+    /// let restored = target.restore_native_entry_with_policy(
+    ///     &snapshot, &json!({"command":"example"}), McpEntryEncodePolicy::Canonical,
+    /// )?;
+    /// assert!(restored.contains("\"trust\":true"));
+    /// # Ok::<(), cc_switch_core::McpConfigError>(())
+    /// ```
+    pub fn restore_native_entry_with_policy(
+        self,
+        snapshot: &McpNativeSnapshot,
+        server: &Value,
+        policy: McpEntryEncodePolicy,
+    ) -> Result<String, McpConfigError> {
+        validate_snapshot(self, snapshot)?;
+        let flavor = match self {
+            Self::Claude => JsonFlavor::Claude,
+            Self::Gemini => JsonFlavor::Gemini,
+            _ => unreachable!("validated removable snapshot target"),
+        };
+        let desired = self.encode_server_with_policy(server, policy)?;
+        merge_json_entry(flavor, server, Some(&snapshot.entry_json), desired, true)
     }
 
     /// Converts one native entry to the shared transport field names.
