@@ -324,11 +324,27 @@ pub fn execute_dependency_ordered_plan<H>(
 where
     H: OperationHost,
 {
+    execute_dependency_ordered_plan_with_content_limit(plan, host, MAX_OPERATION_CONTENT_BYTES)
+}
+
+/// Executes dependent native writes with a host-selected document bound.
+///
+/// Like [`execute_operation_plan_with_content_limit`], this is for locally
+/// constructed plans, not for bypassing wire validation. The bound also applies
+/// to recovery and retained receipts; dependency ordering is unchanged.
+pub fn execute_dependency_ordered_plan_with_content_limit<H>(
+    plan: &OperationPlan,
+    host: &mut H,
+    maximum_content_bytes: usize,
+) -> Result<OperationReceipt<H::Resource>, OperationExecutionError<H::Error>>
+where
+    H: OperationHost,
+{
     execute_operation_plan_with_rollback(
         plan,
         host,
         RollbackBehavior::DependencyOrdered,
-        MAX_OPERATION_CONTENT_BYTES,
+        maximum_content_bytes,
     )
 }
 
@@ -895,6 +911,107 @@ mod tests {
         receipt.rollback(&mut host).expect("rollback receipt");
 
         assert_eq!(host.exchange_order, vec![auth, config, config, auth]);
+    }
+
+    #[test]
+    fn dependent_explicit_bound_recovers_large_native_documents() {
+        let original = "o".repeat(MAX_OPERATION_CONTENT_BYTES + 1);
+        let replacement = "n".repeat(MAX_OPERATION_CONTENT_BYTES + 2);
+        let plan = codex_plan(&[
+            (LogicalTarget::CodexAuth, original.as_bytes(), &replacement),
+            (
+                LogicalTarget::CodexConfig,
+                original.as_bytes(),
+                &replacement,
+            ),
+        ]);
+        let host = || {
+            FakeHost::default()
+                .with_document(LogicalTarget::CodexAuth, original.as_bytes())
+                .with_document(LogicalTarget::CodexConfig, original.as_bytes())
+        };
+        let mut too_small = host();
+        assert!(execute_dependency_ordered_plan(&plan, &mut too_small).is_err());
+        assert_eq!(too_small.exchanges, 0);
+        assert!(execute_dependency_ordered_plan_with_content_limit(
+            &plan,
+            &mut too_small,
+            replacement.len() - 1,
+        )
+        .is_err());
+        assert_eq!(too_small.exchanges, 0);
+
+        let mut complete = host();
+        let receipt = execute_dependency_ordered_plan_with_content_limit(
+            &plan,
+            &mut complete,
+            replacement.len(),
+        )
+        .unwrap();
+        receipt.rollback(&mut complete).unwrap();
+        for published_before_error in [false, true] {
+            let mut failed = host();
+            failed.fail_exchange = Some(2);
+            failed.apply_failed_exchange = published_before_error;
+            let error = execute_dependency_ordered_plan_with_content_limit(
+                &plan,
+                &mut failed,
+                replacement.len(),
+            )
+            .unwrap_err();
+            assert!(matches!(error.failure(), OperationFailure::Write { .. }));
+            assert!(error.rollback_failures().is_empty());
+            for target in [LogicalTarget::CodexAuth, LogicalTarget::CodexConfig] {
+                assert_eq!(failed.document(target), Some(original.as_bytes()));
+                assert_eq!(complete.document(target), Some(original.as_bytes()));
+            }
+        }
+    }
+
+    #[test]
+    fn dependent_explicit_bound_preserves_dependency_and_recovery_limits() {
+        let original = "o".repeat(MAX_OPERATION_CONTENT_BYTES + 1);
+        let plan = codex_plan(&[
+            (LogicalTarget::CodexAuth, b"auth", "next-auth"),
+            (
+                LogicalTarget::CodexConfig,
+                original.as_bytes(),
+                "next-config",
+            ),
+        ]);
+        for external in [b"external".to_vec(), vec![b'x'; original.len() + 1]] {
+            let mut host = FakeHost::default()
+                .with_document(LogicalTarget::CodexAuth, b"auth")
+                .with_document(LogicalTarget::CodexConfig, original.as_bytes());
+            let receipt = execute_dependency_ordered_plan_with_content_limit(
+                &plan,
+                &mut host,
+                original.len(),
+            )
+            .unwrap();
+            host.set_document(LogicalTarget::CodexConfig, &external);
+            let error = receipt.rollback(&mut host).unwrap_err();
+            assert!(matches!(
+                error.failures().last(),
+                Some(OperationRollbackFailure::Blocked {
+                    target: LogicalTarget::CodexAuth,
+                    dependency: LogicalTarget::CodexConfig,
+                })
+            ));
+            if external.len() > original.len() {
+                assert!(
+                    matches!(error.failures()[0], OperationRollbackFailure::ObservedContentTooLarge { limit, .. } if limit == original.len())
+                );
+            }
+            assert_eq!(
+                host.document(LogicalTarget::CodexAuth),
+                Some(&b"next-auth"[..])
+            );
+            assert_eq!(
+                host.document(LogicalTarget::CodexConfig),
+                Some(external.as_slice())
+            );
+        }
     }
 
     #[test]
