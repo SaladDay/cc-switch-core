@@ -411,3 +411,56 @@ Gemini settings document again after provider publication. A provider-only recei
 cannot classify those later host writes as its own. Define ownership across both
 operations before replacing the switching transaction's recovery; do not add a
 rollback bypass or adopt whatever bytes happen to be present as a new precondition.
+
+### Consecutive writes and receipt ownership
+
+Use the existing executor and ordered host-held receipts for consecutive native
+operations before considering another transaction abstraction. A provider plan
+can write env and settings, followed by an MCP plan for the same settings resource.
+Undo the MCP receipt first, then the provider receipt. Each step still compares
+exact bytes; the host must not relabel a later arbitrary observation as its own
+write. Plans with dependent documents need dependency-ordered recovery, so a
+settings conflict cannot restore credentials into an incompatible remaining state.
+
+`tests/operation_receipt_sequence.rs` exercises the public executor with a
+synthetic host and fixed native bytes. It verifies reverse-order exact recovery
+after multiple follow-ups, failure before and after publication, incomplete
+follow-up recovery, conflicts between or after the plans, and refusal to treat an
+untracked later write as owned. This proves the bounded composition contract,
+not a production transaction or full-product parity.
+Paths, locks, database state, host auth flags, crash recovery and size-policy
+selection are deliberately absent from that host.
+
+The next production steps are ordered by the real CLI call boundary:
+
+1. Make Gemini MCP document publication observable and recoverable at
+   `gemini_mcp::set_mcp_servers_map`. Preserve native entry conversion, metadata
+   selection, JSON acceptance and host paths; retain original bytes at the existing
+   read, rather than re-serializing a parsed backup. For read-modify-write callers,
+   carry the first observation used to derive the server map through publication;
+   observing again only inside the setter must not authorize a stale map. Its
+   standalone caller may finish its own receipt, but a provider workflow must retain
+   every successful follow-up receipt and every incomplete recovery error. Do not add global or
+   thread-local receipt collection. Keep other Apps' synchronization behavior out
+   of this change.
+2. Connect the ordinary Gemini switch in `run_staged_transaction` /
+   `apply_prepared_post_commit_action` only after its MCP follow-up writes can
+   participate. Retain observations and the shared lock through the database/file
+   outcome, reverse native receipts in order, and keep database/auth-flag
+   compensation explicitly host-owned. Never run the old unconditional native
+   backup restore after guarded recovery. Force-write remains a separate caller
+   until its no-old-env-read contract is resolved.
+3. Verify shared resource identities and database/file lock order with CLI/Lite
+   contention tests before claiming cross-consumer coordination. Cover incomplete
+   recovery, errors after publication, and a provider-owned file written more than
+   once. Preserve host-accepted sizes: the current dependency-ordered entry point
+   has the default content limit, while explicit larger bounds are available only
+   on the best-effort entry point. Resolve both requirements together at adoption;
+   do not silently lower a host's limit or weaken dependency recovery.
+
+These are the same native execution boundaries intended for a future full-product
+host; Lite's feature set does not define them. That host still needs authorized
+baselines for its own workflow and compensation policy. Each production step needs
+local validation and fresh double-blind review. This contract-test slice changes
+no production API, default, dependency, wire, schema or MSRV, and replaces no
+consumer writer yet. CLI and Lite pins need no update for tests and documentation.
