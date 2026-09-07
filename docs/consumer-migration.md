@@ -302,7 +302,15 @@ out-of-scope findings; no clean whole-CLI lint claim is made.
    Verify database/file compensation separately; shared execution is not an atomic
    SQLite/filesystem transaction. Each step requires fresh double blind review.
 
-The current change is step 1 only. It does not change file writes, auth workflows,
+The read/import slice passed two independent blind reviews. Core `1153d83f`
+passed CI `34091675162`; Lite PR #44 passed exact-head CI `34091762164` and merged.
+CLI acceptance is local commit `f92fed11`, not a remote release. All 184
+Gemini-related CLI tests pass with a canonical temporary directory. Two transcript
+index tests fail under macOS's symlinked default temp path on both the unchanged
+CLI baseline and the candidate, and pass with a canonical path; no transcript
+code was changed.
+
+That slice does not change file writes, auth workflows,
 common configuration, proxy behavior, MCP/Skill operations, UI or shared schema.
 The assignment codec exposes grammar, not product flags; callers choose whether
 to reject invalid lines. Snapshot import has no credential classification and
@@ -311,6 +319,27 @@ formats and MSRV are unchanged. Rollback restores CLI readers and consumer pins
 together, with no data migration. Synthetic rich-settings fixtures check a future
 consumer contract, not full-product compatibility. No full-product repository is
 inspected or changed by this slice.
+
+Step 2 shares string env-field selection and a typed top-level settings overlay.
+The registered Core default planner and CLI preparation use the same primitives.
+An overlay may select authentication before applying its owned fields; the strict
+Core path continues to select authentication after applying the provider fields.
+These are explicit operation stages, not product flags. Selecting auth in an
+overlay owns its entire top-level `security` field; unrelated top-level fields
+remain untouched. The CLI's existing preprocessing may supply retained native
+security fields before that operation and is tested as part of the real path.
+
+CLI's effective-snapshot builder and write preparation now share the overlay;
+the env conversion wrapper shares field selection. Credential requirements,
+sync gates, common-config policy, missing/non-object file handling and localized
+diagnostics remain in the host. Native I/O order and execution are unchanged.
+Independent copies of the prior preparation and effective-snapshot transformations
+check values, errors and key order, alongside real force-write and sync tests.
+Core's strict default is compared with its prior implementation across malformed
+and rich native inputs. These fixtures do not establish full-product parity.
+This additive API changes no dependency versions, MSRV, schema or wire contract.
+Rollback restores the CLI delegates and pins together, without a data migration.
+Execution acceptance remains step 3, not a claim made by this change.
 
 The rest of native provider projection/import and Skill deployment remain pending.
 No overall migration stage above is marked complete yet.

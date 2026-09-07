@@ -1,9 +1,12 @@
 //! Gemini live-configuration projection.
 
 mod env;
+mod settings;
 pub use env::{
-    parse_env_assignments, EnvAssignmentError, EnvAssignmentErrorKind, EnvAssignmentSyntax,
+    parse_env_assignments, select_string_env_values, EnvAssignmentError, EnvAssignmentErrorKind,
+    EnvAssignmentSyntax,
 };
+pub use settings::SettingsOverlay;
 
 use std::{collections::BTreeMap, fmt};
 
@@ -141,52 +144,37 @@ pub fn prepare_live_snapshot(
         return Err(PrepareLiveSnapshotError::MissingApiKey);
     }
 
-    let mut settings = match existing_settings {
-        Some(value) if value.is_object() => value.clone(),
+    let existing = match existing_settings {
+        Some(Value::Object(settings)) => settings.clone(),
         Some(_) => return Err(PrepareLiveSnapshotError::ExistingSettingsNotObject),
-        None => Value::Object(Map::new()),
+        None => Map::new(),
     };
-    match provider.get("config") {
-        Some(Value::Object(config)) => {
-            let target = settings
-                .as_object_mut()
-                .ok_or(PrepareLiveSnapshotError::ExistingSettingsNotObject)?;
-            for (key, value) in config {
-                target.insert(key.clone(), value.clone());
-            }
-        }
-        Some(Value::Null) | None => {}
-        Some(_) => return Err(PrepareLiveSnapshotError::ConfigNotObject),
-    }
+    let mut settings = SettingsOverlay::from_config(provider.get("config"))?.apply_to(existing);
     set_selected_auth_type(&mut settings, auth_mode.selected_type())?;
 
-    Ok(PreparedLiveSnapshot { env, settings })
+    Ok(PreparedLiveSnapshot {
+        env,
+        settings: Value::Object(settings),
+    })
 }
 
 fn project_env(env: Option<&Value>) -> Result<BTreeMap<String, String>, PrepareLiveSnapshotError> {
     let Some(env) = env else {
         return Ok(BTreeMap::new());
     };
-    let env = env
+    let object = env
         .as_object()
         .ok_or(PrepareLiveSnapshotError::EnvNotObject)?;
-    env.iter()
-        .map(|(key, value)| {
-            value
-                .as_str()
-                .map(|value| (key.clone(), value.to_owned()))
-                .ok_or(PrepareLiveSnapshotError::EnvValueNotString)
-        })
-        .collect()
+    if object.values().any(|value| !value.is_string()) {
+        return Err(PrepareLiveSnapshotError::EnvValueNotString);
+    }
+    Ok(select_string_env_values(Some(env)))
 }
 
 fn set_selected_auth_type(
-    settings: &mut Value,
+    settings: &mut Map<String, Value>,
     selected_type: &str,
 ) -> Result<(), PrepareLiveSnapshotError> {
-    let settings = settings
-        .as_object_mut()
-        .ok_or(PrepareLiveSnapshotError::ExistingSettingsNotObject)?;
     let security = object_field(settings, "security")?;
     let auth = object_field(security, "auth")?;
     auth.insert(

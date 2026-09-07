@@ -40,6 +40,14 @@ to the simple form. A future full-product reader can use these contracts, but it
 actual grammar, missing-file policy and diagnostics still need approved baselines.
 Reading a snapshot does not relax write validation or authorize an auth change.
 
+Gemini write preparation shares field selection and a typed settings overlay
+below the registered default planner. Hosts can compose native operations in
+their required order: selecting authentication in an incoming overlay owns its
+whole `security` field; selecting after the merge can retain existing security
+fields when the provider does not own that key. Keep those ownership choices
+explicit and verify the full product's order before adoption. String-only env
+selection is not credential validation or permission to write arbitrary env text.
+
 Behavior differences require named, typed choices such as validation responsibility,
 field selection, or native ownership. Do not introduce `is_lite`, `cli_mode`, or a
 collection of product-specific flags. Keep current defaults unchanged. Add an

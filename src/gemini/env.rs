@@ -1,4 +1,17 @@
+use serde_json::Value;
+use std::collections::BTreeMap;
 use thiserror::Error;
+
+/// Select literal string entries from an optional native `env` object.
+/// Missing/non-object values yield no entries; non-string entries are omitted.
+/// This field selector does not validate credentials, names or env-file safety.
+pub fn select_string_env_values(env: Option<&Value>) -> BTreeMap<String, String> {
+    env.and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_owned())))
+        .collect()
+}
 
 /// Grammar for assignment lines, without shell expansion or quote removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
