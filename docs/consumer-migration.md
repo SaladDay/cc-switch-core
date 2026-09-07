@@ -515,3 +515,42 @@ schema and execution contracts remain unchanged. Consumer adoption, shared
 database/native recovery, all-writer safety and full-product parity are not
 established by this primitive test. Both slices require local validation and
 fresh independent double-blind review.
+
+## MCP commit and native recovery
+
+The shared MCP guard must keep its complete catalog/link verification while
+allowing hosts to restore native files before releasing a failed transaction.
+Lite's real `upsert_with_live`, `toggle_with_live` and `delete_with_live` are the
+first adoption targets. Its previous consuming commit releases the database before
+native recovery, both on verification conflict and on a deferred-constraint
+COMMIT failure. Isolated tests reproduce those two failures through the real Store
+and native services; existing normal tests did not check the recovery lock boundary.
+
+1. Add `McpTransactionGuard::commit_preserving_on_error`. Success consumes the
+   guard; failure returns the poisoned guard and original error. The host restores
+   native state under its live-file lock, then explicitly rolls back the database
+   and reports both recovery failures. The existing `commit` behavior remains
+   unchanged. Both entry points use the same complete verification; no raw
+   connection access, post-write baseline, retry bypass or product flag is added.
+2. Adopt that contract in Lite's three native-writing MCP operations, preserving
+   catalog selection, link ownership, native conversion and no-op rules. Validate
+   exact native/catalog recovery, locks during recovery, release, retries and
+   recovery-error reporting. Native observation-only import is not this slice.
+3. Migrate CLI's standalone MCP workflow with its own observed native inputs and
+   scoped database write set. The new Store API alone does not replace that
+   workflow or coordinate its legacy writers. Test actual CLI/Lite contention
+   before claiming cross-consumer MCP acceptance.
+
+Each step requires local tests and two fresh blind reviews. Core's contract tests
+cover successful commit, deferred COMMIT failure, verification conflict, poisoned
+writes, SQLite-triggered abort, explicit rollback and drop release. Synthetic
+future-App and host-extension rows test preservation, not full-product parity.
+If SQLite itself aborts, the guard cannot retain database protection; no atomic
+database/filesystem or noncooperating-writer guarantee is introduced.
+
+The intended full-product boundary is the same guarded MCP catalog/link update,
+independent of its UI, feature set, native settings and recovery implementation.
+That host retains paths, native execution and compensation order; its baseline
+and actual adoption remain unverified. This additive Rust API changes no existing
+defaults, wire/schema, dependencies or MSRV. Consumers can keep their current
+pins; rollback restores the caller and pin together without a data migration.

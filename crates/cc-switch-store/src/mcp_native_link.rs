@@ -241,22 +241,55 @@ impl<'connection> McpTransactionGuard<'connection> {
 
     /// Verifies all tracked rows and commits only when no cross-table drift remains.
     pub fn commit(self) -> Result<(), SharedStoreError> {
-        let verification = if self.failed {
-            Err(SharedStoreError::McpTransactionConflict)
-        } else {
-            read_expected_database_state(&self.transaction).and_then(|actual| {
-                (actual == self.expected)
-                    .then_some(())
-                    .ok_or(SharedStoreError::McpTransactionConflict)
-            })
-        };
-        if let Err(error) = verification {
+        if let Err(error) = self.verify_commit() {
             if !self.transaction.is_autocommit() {
                 self.transaction.rollback()?;
             }
             return Err(error);
         }
         self.transaction.commit().map_err(SharedStoreError::from)
+    }
+
+    /// Verifies and commits, returning the guard with the error on failure.
+    ///
+    /// Unlike [`Self::commit`], this does not roll back or drop a failed
+    /// transaction before returning. A host can retain its live-file lock and
+    /// restore native files before explicitly rolling back the returned guard.
+    /// The guard is poisoned: subsequent writes or commit attempts are rejected.
+    /// Dropping it still requests rollback. SQLite can itself abort a transaction;
+    /// this API cannot retain database protection after such an abort and does not
+    /// make database and filesystem changes atomic.
+    ///
+    /// Success consumes the guard. Failure returns `(guard, original_error)`;
+    /// callers should report native and database recovery failures separately.
+    ///
+    /// ```
+    /// # use cc_switch_store::McpTransactionGuard;
+    /// # fn finish(guard: McpTransactionGuard<'_>, restore_native: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    /// match guard.commit_preserving_on_error() {
+    ///     Ok(()) => Ok(()),
+    ///     Err((guard, error)) => {
+    ///         // Retain the host's live-file lock throughout native recovery.
+    ///         let native_failure = restore_native().err();
+    ///         let database_failure = guard.rollback().err();
+    ///         Err(format!("{error}; native recovery: {native_failure:?}; database recovery: {database_failure:?}"))
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    pub fn commit_preserving_on_error(mut self) -> Result<(), (Self, SharedStoreError)> {
+        let result = self.verify_commit().and_then(|()| {
+            self.transaction
+                .execute_batch("COMMIT")
+                .map_err(SharedStoreError::from)
+        });
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.failed = true;
+                Err((self, error))
+            }
+        }
     }
 
     /// Rolls back the guarded transaction explicitly.
@@ -266,6 +299,16 @@ impl<'connection> McpTransactionGuard<'connection> {
         } else {
             self.transaction.rollback().map_err(SharedStoreError::from)
         }
+    }
+
+    fn verify_commit(&self) -> Result<(), SharedStoreError> {
+        if self.failed {
+            return Err(SharedStoreError::McpTransactionConflict);
+        }
+        let actual = read_expected_database_state(&self.transaction)?;
+        (actual == self.expected)
+            .then_some(())
+            .ok_or(SharedStoreError::McpTransactionConflict)
     }
 
     fn prepare_write(&mut self) -> Result<(), SharedStoreError> {
@@ -858,6 +901,8 @@ fn verify_binary_primary_key(connection: &Connection) -> Result<(), SharedStoreE
 mod tests {
     use super::*;
     use crate::{begin_immediate_transaction, ensure_mcp_server_schema, SharedDatabase};
+
+    mod recovery;
 
     fn initialized_database() -> (tempfile::TempDir, SharedDatabase) {
         let directory = tempfile::tempdir().expect("temporary directory");
