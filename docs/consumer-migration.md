@@ -341,5 +341,52 @@ This additive API changes no dependency versions, MSRV, schema or wire contract.
 Rollback restores the CLI delegates and pins together, without a data migration.
 Execution acceptance remains step 3, not a claim made by this change.
 
+The preparation slice passed two independent blind reviews. Core `9f7be30e`
+passed three-platform CI `34095956872`; Lite PR #45 passed exact-head CI
+`34096025123`, including its production build, and merged. CLI acceptance is
+local commit `dc0b6ced`, not a remote release. Parent validation passed all 189
+Gemini-related library tests and 71 provider-service tests. Existing whole-CLI
+strict Clippy findings remain outside the changed code. Build targets were cleaned.
+
+### Execution compatibility gate
+
+Step 3 starts with CLI `dc0b6ced` execution baselines, not an executor replacement.
+The real force-write and provider-switch entry points have different contracts:
+
+| Boundary | Current CLI behavior | Consequence for shared execution |
+| --- | --- | --- |
+| Force write | Reads settings during preparation, but does not read the old env file | Requiring an env observation would reject previously accepted unreadable or non-UTF-8 files |
+| Provider switch | Captures parsed env/settings before preparation and database publication | Retain exact observations at the existing read boundary; a parsed backup is not a byte-level precondition |
+| Native publication | Writes env, then settings, then the host auth flag; no stale-content check | Core's conditional executor cannot be substituted without an explicit conflict-policy decision |
+| Native or host-flag failure | Direct application leaves earlier writes; the switching transaction restores its database/configuration snapshot and native backup | One layer must own compensation; do not follow Core recovery with an unconditional native restore |
+| Later MCP failure | Switch restores native values and provider selection, but retains the updated host auth flag | A native receipt does not cover every later host side effect |
+| Native restore | Re-serializes parsed values and can overwrite subsequent edits | Exact-byte guarded rollback is a different contract, not an already verified behavior |
+
+The baseline suite exercises these production paths without changing them.
+It also checks replacement of leaf symlinks without writing their referents,
+env/directory permissions, partial writes and edits between preparation/application
+or application/restoration. These tests record existing limitations, not desirable
+Core guarantees. They must change deliberately when an accepted execution design
+changes that policy; do not weaken Core to preserve unsafe rollback.
+
+Continue step 3 in this order:
+
+1. Capture and verify the baseline above. Keep this change test/documentation-only;
+   do not add a new planner policy, wire variant, writer or shared lock yet.
+2. Define the observed-write boundary and receipt lifetime for the real switching
+   transaction. Reuse Core's executor and retain host-owned path/security/error
+   binding. Keep force-write I/O distinct until its read requirements are resolved.
+   Cover native failure and later host failure before removing the old recovery.
+3. Integrate cross-process coordination across the affected transaction, not just
+   one file writer. Lite uses the shared live-config lock; the current CLI Codex
+   executor uses a process-local mutex. Reconcile database/file lock order and
+   resource identity with cross-consumer contention tests before claiming safety.
+
+Each implemented change still requires local validation and two fresh blind
+reviews. No production contract, dependency pin, schema or MSRV changes in the
+baseline-only gate. Lite needs no dependency update for documentation alone.
+The full product's own write and recovery behavior remains unverified; these CLI
+baselines are requirements to compare, not defaults to impose on another consumer.
+
 The rest of native provider projection/import and Skill deployment remain pending.
 No overall migration stage above is marked complete yet.

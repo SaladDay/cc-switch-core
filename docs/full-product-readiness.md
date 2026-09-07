@@ -48,6 +48,16 @@ fields when the provider does not own that key. Keep those ownership choices
 explicit and verify the full product's order before adoption. String-only env
 selection is not credential validation or permission to write arbitrary env text.
 
+Execution adoption needs its own compatibility gate. An unconditional native
+writer and a conditional plan have different read requirements and failure
+results. CLI Gemini's force-write path does not observe the old env file, while
+its switching workflow captures a parsed backup. Do not turn that parsed backup
+into a byte-level precondition or treat a Core receipt as a complete host
+transaction. The [execution baseline](consumer-migration.md#execution-compatibility-gate)
+tracks these differences, later host side effects, and the still-unverified
+cross-product lock boundary. Preserve Core's guarded recovery contract; resolve
+consumer behavior explicitly instead of adding an unconditional wire-plan variant.
+
 Behavior differences require named, typed choices such as validation responsibility,
 field selection, or native ownership. Do not introduce `is_lite`, `cli_mode`, or a
 collection of product-specific flags. Keep current defaults unchanged. Add an
