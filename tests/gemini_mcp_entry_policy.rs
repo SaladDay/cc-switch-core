@@ -41,6 +41,8 @@ fn registered_default_codecs_and_unsupported_policies_remain_explicit() {
                     matches!(target.decode_server_with_policy(&input, McpEntryDecodePolicy::InferFromStringFields),
                     Err(McpConfigError::UnsupportedEntryPolicy {target: actual}) if actual == target)
                 );
+            }
+            if !matches!(target, McpConfigTarget::Claude | McpConfigTarget::Gemini) {
                 assert!(
                     matches!(target.encode_server_with_policy(&input, McpEntryEncodePolicy::PreserveFields),
                     Err(McpConfigError::UnsupportedEntryEncodingPolicy {target: actual}) if actual == target)

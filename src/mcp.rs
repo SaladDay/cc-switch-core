@@ -88,11 +88,12 @@ pub enum McpEntryEncodePolicy {
     /// Keep the existing native codec's field selection and timeout rules.
     #[default]
     Canonical,
-    /// Preserve unconsumed Gemini fields, including metadata. Rename an HTTP URL
-    /// and remove the shared `type` field. Timeouts use numeric seconds before
-    /// milliseconds, truncate fractional milliseconds, and saturate to `u64`.
-    /// Unused millisecond alternatives remain present. Other formats reject this
-    /// policy; callers retain wrapper and metadata selection.
+    /// Preserve native fields, including metadata; callers select wrappers and
+    /// metadata before encoding. Claude keeps the object's fields unchanged.
+    /// Gemini renames an HTTP URL and removes the shared `type` field. Timeouts
+    /// use numeric seconds before milliseconds, truncate fractional milliseconds,
+    /// and saturate to `u64`. Unused millisecond alternatives remain present.
+    /// Other formats reject this policy.
     PreserveFields,
 }
 
@@ -167,6 +168,8 @@ impl McpConfigTarget {
     /// existing numeric timeout, startup timeout (default 10 seconds), and tool
     /// timeout (default 60 seconds). Negative numbers saturate to zero. Fields
     /// outside the selected transport remain intact, even with an invalid type.
+    /// Claude's preserving policy is an object-shape check and field-preserving
+    /// copy; it does not unwrap `server` or remove UI-named native extensions.
     pub fn encode_server_with_policy(
         self,
         server: &Value,
@@ -174,6 +177,9 @@ impl McpConfigTarget {
     ) -> Result<Value, McpConfigError> {
         match policy {
             McpEntryEncodePolicy::Canonical => self.encode_server(server),
+            McpEntryEncodePolicy::PreserveFields if self == Self::Claude => {
+                Ok(Value::Object(server_object(server)?.clone()))
+            }
             McpEntryEncodePolicy::PreserveFields if self == Self::Gemini => Ok(
                 gemini_codec::encode_preserving_fields(server_object(server)?),
             ),
