@@ -97,6 +97,38 @@ pub enum McpEntryEncodePolicy {
 }
 
 impl McpConfigTarget {
+    /// Reads the entry-local enablement flag of one existing native entry,
+    /// without decoding or validating its connection. The entry must be an
+    /// object; absence belongs to the host's document lookup, not to this API.
+    ///
+    /// Claude and Gemini use presence as enablement. Other formats default a
+    /// missing `enabled` field to true. Codex and Grok Build reject non-boolean
+    /// flags; OpenCode and Hermes treat them as true, matching document import.
+    /// Hosts retaining a more tolerant import policy may handle these errors
+    /// explicitly. This does not activate an entry or select a catalog record.
+    ///
+    /// This is **not** effective document state: Grok Build's top-level
+    /// `disabled_mcp_servers` can override a true entry-local flag. Use
+    /// [`import_mcp_servers`] for effective state including document overrides;
+    /// that API owns the override rules, so hosts need not reimplement them.
+    pub fn entry_enabled_flag(self, entry: &Value) -> Result<bool, McpConfigError> {
+        let object = server_object(entry)?;
+        match self {
+            Self::Claude | Self::Gemini => Ok(true),
+            Self::OpenCode | Self::Hermes => Ok(object
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)),
+            Self::Codex | Self::GrokBuild => match object.get("enabled") {
+                Some(Value::Bool(enabled)) => Ok(*enabled),
+                None => Ok(true),
+                Some(_) => Err(McpConfigError::InvalidServer(
+                    "MCP server 'enabled' fields must be booleans".to_owned(),
+                )),
+            },
+        }
+    }
+
     /// Decodes an entry with explicit field selection, without validating a
     /// connection, choosing catalog metadata, or reading a document.
     ///
@@ -1298,10 +1330,7 @@ fn from_json_flavor(flavor: JsonFlavor, value: &Value) -> Result<(Value, bool), 
             gemini_codec::decode_fields(&mut output, gemini_codec::TypeInference::FieldPresence);
         }
         JsonFlavor::OpenCode => {
-            enabled = output
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
+            enabled = McpConfigTarget::OpenCode.entry_enabled_flag(value)?;
             let transport = output
                 .get("type")
                 .and_then(Value::as_str)
@@ -1702,21 +1731,18 @@ fn append_toml_imports(
 ) -> Result<(), McpConfigError> {
     for (id, item) in entries.iter() {
         let mut server = item_to_json(item)
-            .and_then(|value| value.as_object().cloned().ok_or(()))
+            .and_then(|value| value.is_object().then_some(value).ok_or(()))
             .map_err(|_| invalid_document(app, "MCP server entries must be tables"))?;
-        let enabled = match server.remove("enabled") {
-            Some(Value::Bool(enabled)) => enabled,
-            Some(_) => {
-                return Err(invalid_document(
-                    app,
-                    "MCP server 'enabled' fields must be booleans",
-                ));
-            }
-            None => true,
-        };
+        let enabled = require_target(app)?
+            .entry_enabled_flag(&server)
+            .map_err(|_| invalid_document(app, "MCP server 'enabled' fields must be booleans"))?;
+        server
+            .as_object_mut()
+            .expect("validated native table")
+            .remove("enabled");
         output.push(McpImport {
             id: id.to_owned(),
-            server: Value::Object(server),
+            server,
             enabled,
             native_snapshot: None,
         });
@@ -2143,7 +2169,7 @@ fn import_hermes(app: &AppType, contents: Option<&[u8]>) -> Result<Vec<McpImport
             imports.push(McpImport {
                 id: id.to_owned(),
                 server,
-                enabled: json.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                enabled: McpConfigTarget::Hermes.entry_enabled_flag(&json)?,
                 native_snapshot: None,
             });
         }
