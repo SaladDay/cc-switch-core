@@ -580,3 +580,29 @@ Hosts retain same-ID policy, diagnostics, native observation and cache publicati
 Lite and the future full-product host can use this same read boundary without
 adopting CLI merge rules. This additive API alone does not migrate any consumer,
 change a schema or default, or establish native-file or full-product compatibility.
+
+### MCP execution without provider-target aliases
+
+`execute_mcp_write_with_content_limit` executes a locally projected MCP document
+through `OperationHost<McpConfigTarget>`. The host resolves the actual resource
+from the App's MCP contract; Claude's host-defined MCP file must not be bound as
+`LogicalTarget::ClaudeSettings`. Provider targets and serialized operation plans
+are unchanged. Existing hosts and receipts retain `LogicalTarget` as their
+default target parameter.
+
+MCP and provider writes share preflight checks, conditional exchange, uncertain
+write recovery and retained receipt rollback. The caller supplies an explicit
+document bound and validated text. Core rejects malformed expectations and
+oversized replacements before resource access. This API cannot request deletion
+of an MCP document, but rollback can remove a newly created file. Paths, native
+syntax/field policies, permissions and locks remain host-owned; hold the locks
+through database commit or native recovery.
+
+The next consumer gate replaces the non-Gemini `McpService::toggle_app` snapshot
+save and corresponding standalone native writes in CLI. This Core step provides
+their common execution boundary, not that migration itself. Registry-driven
+tests run projected documents for every declared MCP target through publication
+and recovery. CLI/Lite compile checks against this source establish existing API
+compatibility only; they do not establish adoption of the new MCP entry point.
+The future full-product host uses the same contract with its own resolved paths
+and transaction lifecycle. No full-product behavior is asserted or changed here.

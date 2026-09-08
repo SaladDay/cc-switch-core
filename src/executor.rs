@@ -9,7 +9,8 @@ use std::{error::Error, fmt};
 use thiserror::Error;
 
 use crate::{
-    LogicalTarget, OperationPlan, OperationPlanError, PlannedWrite, MAX_OPERATION_CONTENT_BYTES,
+    ContentExpectation, LogicalTarget, McpConfigTarget, OperationPlan, OperationPlanError,
+    MAX_OPERATION_CONTENT_BYTES,
 };
 
 /// Product-owned resource access used by the shared operation executor.
@@ -22,12 +23,14 @@ use crate::{
 /// Filesystems generally cannot exclude programs that ignore that primitive.
 /// The host must document that platform limit and hold its application lock for
 /// the complete plan/receipt lifecycle.
-pub trait OperationHost {
+/// The default target type retains the provider-plan API. MCP publication uses
+/// `OperationHost<McpConfigTarget>` to resolve its own document resource.
+pub trait OperationHost<Target = LogicalTarget> {
     type Resource: Eq;
     type Error;
 
     /// Resolves a logical target to a stable, host-owned resource identity.
-    fn resolve(&mut self, target: LogicalTarget) -> Result<Self::Resource, Self::Error>;
+    fn resolve(&mut self, target: Target) -> Result<Self::Resource, Self::Error>;
 
     /// Reads exact bytes under an allocation and I/O bound.
     fn read(
@@ -81,33 +84,34 @@ pub enum CompareExchangeOutcome {
 /// The primary reason an operation could not complete.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum OperationFailure<E> {
+pub enum OperationFailure<E, Target = LogicalTarget> {
     #[error("operation plan is invalid: {0}")]
     InvalidPlan(#[source] OperationPlanError),
+    #[error("target {target:?} has a malformed content expectation")]
+    InvalidExpectation { target: Target },
+    #[error("planned target {target:?} exceeds the {limit}-byte content limit")]
+    PlannedContentTooLarge { target: Target, limit: usize },
     #[error("failed to resolve logical target {target:?}: {source}")]
     Resolve {
-        target: LogicalTarget,
+        target: Target,
         #[source]
         source: E,
     },
     #[error("logical targets {first:?} and {second:?} resolve to the same resource")]
-    AliasedTargets {
-        first: LogicalTarget,
-        second: LogicalTarget,
-    },
+    AliasedTargets { first: Target, second: Target },
     #[error("failed to read logical target {target:?}: {source}")]
     Read {
-        target: LogicalTarget,
+        target: Target,
         #[source]
         source: E,
     },
     #[error("logical target {target:?} exceeds the {limit}-byte observation limit")]
-    ObservedContentTooLarge { target: LogicalTarget, limit: usize },
+    ObservedContentTooLarge { target: Target, limit: usize },
     #[error("logical target {target:?} changed while the operation was being prepared")]
-    Conflict { target: LogicalTarget },
+    Conflict { target: Target },
     #[error("failed to write logical target {target:?}: {source}")]
     Write {
-        target: LogicalTarget,
+        target: Target,
         #[source]
         source: E,
     },
@@ -116,56 +120,58 @@ pub enum OperationFailure<E> {
 /// One target that could not be safely restored.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum OperationRollbackFailure<E> {
+pub enum OperationRollbackFailure<E, Target = LogicalTarget> {
     #[error("failed to read logical target {target:?} during rollback: {source}")]
     Read {
-        target: LogicalTarget,
+        target: Target,
         #[source]
         source: E,
     },
     #[error(
         "logical target {target:?} exceeds the {limit}-byte observation limit during rollback"
     )]
-    ObservedContentTooLarge { target: LogicalTarget, limit: usize },
+    ObservedContentTooLarge { target: Target, limit: usize },
     #[error("logical target {target:?} changed after the operation wrote it; external contents were preserved")]
-    Changed { target: LogicalTarget },
+    Changed { target: Target },
     #[error("failed to restore logical target {target:?}: {source}")]
     Write {
-        target: LogicalTarget,
+        target: Target,
         #[source]
         source: E,
     },
     #[error(
         "logical target {target:?} was not restored because dependency {dependency:?} could not be confirmed restored"
     )]
-    Blocked {
-        target: LogicalTarget,
-        dependency: LogicalTarget,
-    },
+    Blocked { target: Target, dependency: Target },
 }
 
 /// An operation failure together with any incomplete rollback work.
 #[derive(Debug)]
-pub struct OperationExecutionError<E> {
-    failure: OperationFailure<E>,
-    rollback_failures: Vec<OperationRollbackFailure<E>>,
+pub struct OperationExecutionError<E, Target = LogicalTarget> {
+    failure: OperationFailure<E, Target>,
+    rollback_failures: Vec<OperationRollbackFailure<E, Target>>,
 }
 
-impl<E> OperationExecutionError<E> {
-    pub fn failure(&self) -> &OperationFailure<E> {
+impl<E, Target> OperationExecutionError<E, Target> {
+    pub fn failure(&self) -> &OperationFailure<E, Target> {
         &self.failure
     }
 
-    pub fn rollback_failures(&self) -> &[OperationRollbackFailure<E>] {
+    pub fn rollback_failures(&self) -> &[OperationRollbackFailure<E, Target>] {
         &self.rollback_failures
     }
 
-    pub fn into_parts(self) -> (OperationFailure<E>, Vec<OperationRollbackFailure<E>>) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        OperationFailure<E, Target>,
+        Vec<OperationRollbackFailure<E, Target>>,
+    ) {
         (self.failure, self.rollback_failures)
     }
 }
 
-impl<E: fmt::Display> fmt::Display for OperationExecutionError<E> {
+impl<E: fmt::Display, Target: fmt::Debug> fmt::Display for OperationExecutionError<E, Target> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.failure)?;
         if !self.rollback_failures.is_empty() {
@@ -179,7 +185,9 @@ impl<E: fmt::Display> fmt::Display for OperationExecutionError<E> {
     }
 }
 
-impl<E: Error + 'static> Error for OperationExecutionError<E> {
+impl<E: Error + 'static, Target: fmt::Debug + 'static> Error
+    for OperationExecutionError<E, Target>
+{
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.failure)
     }
@@ -187,21 +195,21 @@ impl<E: Error + 'static> Error for OperationExecutionError<E> {
 
 /// Failures encountered while explicitly rolling back a completed operation.
 #[derive(Debug)]
-pub struct OperationRollbackError<E> {
-    failures: Vec<OperationRollbackFailure<E>>,
+pub struct OperationRollbackError<E, Target = LogicalTarget> {
+    failures: Vec<OperationRollbackFailure<E, Target>>,
 }
 
-impl<E> OperationRollbackError<E> {
-    pub fn failures(&self) -> &[OperationRollbackFailure<E>] {
+impl<E, Target> OperationRollbackError<E, Target> {
+    pub fn failures(&self) -> &[OperationRollbackFailure<E, Target>] {
         &self.failures
     }
 
-    pub fn into_failures(self) -> Vec<OperationRollbackFailure<E>> {
+    pub fn into_failures(self) -> Vec<OperationRollbackFailure<E, Target>> {
         self.failures
     }
 }
 
-impl<E> fmt::Display for OperationRollbackError<E> {
+impl<E, Target> fmt::Display for OperationRollbackError<E, Target> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
@@ -211,16 +219,22 @@ impl<E> fmt::Display for OperationRollbackError<E> {
     }
 }
 
-impl<E: Error + 'static> Error for OperationRollbackError<E> {}
+impl<E: Error + 'static, Target: fmt::Debug> Error for OperationRollbackError<E, Target> {}
 
-struct PreparedWrite<'a, R> {
-    write: &'a PlannedWrite,
+struct WriteView<'a, Target> {
+    target: Target,
+    expected: &'a ContentExpectation,
+    contents: Option<&'a str>,
+}
+
+struct PreparedWrite<'a, R, Target> {
+    write: &'a WriteView<'a, Target>,
     resource: R,
     original: Option<Vec<u8>>,
 }
 
-struct AppliedWrite<R> {
-    target: LogicalTarget,
+struct AppliedWrite<R, Target> {
+    target: Target,
     resource: R,
     original: Option<Vec<u8>>,
     written: Option<Vec<u8>>,
@@ -233,13 +247,13 @@ enum RollbackBehavior {
 }
 
 /// A successful operation that can still be rolled back by its host.
-pub struct OperationReceipt<R> {
-    applied: Vec<AppliedWrite<R>>,
+pub struct OperationReceipt<R, Target = LogicalTarget> {
+    applied: Vec<AppliedWrite<R, Target>>,
     rollback_behavior: RollbackBehavior,
     maximum_content_bytes: usize,
 }
 
-impl<R> OperationReceipt<R> {
+impl<R, Target: Copy + Eq> OperationReceipt<R, Target> {
     pub fn is_empty(&self) -> bool {
         self.applied.is_empty()
     }
@@ -283,9 +297,9 @@ impl<R> OperationReceipt<R> {
         Ok(())
     }
 
-    pub fn rollback<H>(self, host: &mut H) -> Result<(), OperationRollbackError<H::Error>>
+    pub fn rollback<H>(self, host: &mut H) -> Result<(), OperationRollbackError<H::Error, Target>>
     where
-        H: OperationHost<Resource = R>,
+        H: OperationHost<Target, Resource = R>,
     {
         let failures = rollback_applied(
             host,
@@ -302,9 +316,9 @@ impl<R> OperationReceipt<R> {
     }
 }
 
-impl<R> fmt::Debug for OperationReceipt<R> {
+impl<R, Target: fmt::Debug> fmt::Debug for OperationReceipt<R, Target> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let targets: Vec<_> = self.applied.iter().map(|write| write.target).collect();
+        let targets: Vec<_> = self.applied.iter().map(|write| &write.target).collect();
         formatter
             .debug_struct("OperationReceipt")
             .field("targets", &targets)
@@ -399,17 +413,93 @@ where
     plan.validate_with_content_limit(maximum_content_bytes)
         .map_err(|error| execution_error(OperationFailure::InvalidPlan(error)))?;
 
-    let mut prepared = Vec::with_capacity(plan.writes.len());
-    for write in &plan.writes {
+    let writes = plan
+        .writes
+        .iter()
+        .map(|write| WriteView {
+            target: write.target,
+            expected: &write.expected,
+            contents: write.contents.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    execute_writes(&writes, host, rollback_behavior, maximum_content_bytes)
+}
+
+/// Publishes one locally projected MCP document with guarded recovery.
+///
+/// The host resolves the MCP resource through its application's contract,
+/// including host-defined resources such as Claude's MCP file. This does not
+/// add MCP files to provider targets or change the serialized plan contract.
+/// Hosts must validate document syntax and retain their path, permission and
+/// synchronization policies. Hold those protections until the receipt is
+/// committed by the host or rolled back, including database failure recovery.
+///
+/// The explicit bound applies to replacement bytes, preflight observations and
+/// rollback. Hosts accepting larger files may derive it from their observed and
+/// prepared documents. This is not an untrusted serialized-plan entry point.
+/// An MCP collection may be empty, but this API does not delete its containing
+/// native document. Rollback can remove a file that was originally absent.
+pub fn execute_mcp_write_with_content_limit<H>(
+    target: McpConfigTarget,
+    expected: &ContentExpectation,
+    contents: &str,
+    host: &mut H,
+    maximum_content_bytes: usize,
+) -> Result<
+    OperationReceipt<H::Resource, McpConfigTarget>,
+    OperationExecutionError<H::Error, McpConfigTarget>,
+>
+where
+    H: OperationHost<McpConfigTarget>,
+{
+    if let ContentExpectation::Sha256 { digest } = expected {
+        if !crate::operation::valid_sha256(digest) {
+            return Err(execution_error(OperationFailure::InvalidExpectation {
+                target,
+            }));
+        }
+    }
+    if contents.len() > maximum_content_bytes {
+        return Err(execution_error(OperationFailure::PlannedContentTooLarge {
+            target,
+            limit: maximum_content_bytes,
+        }));
+    }
+    execute_writes(
+        &[WriteView {
+            target,
+            expected,
+            contents: Some(contents),
+        }],
+        host,
+        RollbackBehavior::BestEffort,
+        maximum_content_bytes,
+    )
+}
+
+fn execute_writes<H, Target: Copy + Eq>(
+    writes: &[WriteView<'_, Target>],
+    host: &mut H,
+    rollback_behavior: RollbackBehavior,
+    maximum_content_bytes: usize,
+) -> Result<OperationReceipt<H::Resource, Target>, OperationExecutionError<H::Error, Target>>
+where
+    H: OperationHost<Target>,
+{
+    let mut prepared = Vec::with_capacity(writes.len());
+    for write in writes {
         let resource = host.resolve(write.target).map_err(|source| {
             execution_error(OperationFailure::Resolve {
                 target: write.target,
                 source,
             })
         })?;
-        if let Some(existing) = prepared
-            .iter()
-            .find(|existing: &&PreparedWrite<'_, H::Resource>| existing.resource == resource)
+        if let Some(existing) =
+            prepared
+                .iter()
+                .find(|existing: &&PreparedWrite<'_, H::Resource, Target>| {
+                    existing.resource == resource
+                })
         {
             return Err(execution_error(OperationFailure::AliasedTargets {
                 first: existing.write.target,
@@ -445,7 +535,6 @@ where
         let written = prepared_write
             .write
             .contents
-            .as_deref()
             .map(str::as_bytes)
             .map(ToOwned::to_owned);
         if written.is_none() && prepared_write.original.is_none() {
@@ -495,14 +584,15 @@ where
     })
 }
 
-fn read_for_execution<H>(
+fn read_for_execution<H, Target>(
     host: &mut H,
     resource: &H::Resource,
-    target: LogicalTarget,
+    target: Target,
     maximum_content_bytes: usize,
-) -> Result<Option<Vec<u8>>, OperationFailure<H::Error>>
+) -> Result<Option<Vec<u8>>, OperationFailure<H::Error, Target>>
 where
-    H: OperationHost,
+    H: OperationHost<Target>,
+    Target: Copy,
 {
     match host
         .read(resource, maximum_content_bytes)
@@ -521,23 +611,25 @@ where
     }
 }
 
-fn execution_error<E>(failure: OperationFailure<E>) -> OperationExecutionError<E> {
+fn execution_error<E, Target>(
+    failure: OperationFailure<E, Target>,
+) -> OperationExecutionError<E, Target> {
     OperationExecutionError {
         failure,
         rollback_failures: Vec::new(),
     }
 }
 
-fn failure_with_rollback<H>(
+fn failure_with_rollback<H, Target: Copy + Eq>(
     host: &mut H,
-    failure: OperationFailure<H::Error>,
-    applied: &[AppliedWrite<H::Resource>],
+    failure: OperationFailure<H::Error, Target>,
+    applied: &[AppliedWrite<H::Resource, Target>],
     rollback_behavior: RollbackBehavior,
-    blocked_by: Option<LogicalTarget>,
+    blocked_by: Option<Target>,
     maximum_content_bytes: usize,
-) -> OperationExecutionError<H::Error>
+) -> OperationExecutionError<H::Error, Target>
 where
-    H: OperationHost,
+    H: OperationHost<Target>,
 {
     OperationExecutionError {
         failure,
@@ -551,15 +643,15 @@ where
     }
 }
 
-fn rollback_applied<H>(
+fn rollback_applied<H, Target: Copy + Eq>(
     host: &mut H,
-    applied: &[AppliedWrite<H::Resource>],
+    applied: &[AppliedWrite<H::Resource, Target>],
     behavior: RollbackBehavior,
-    mut blocked_by: Option<LogicalTarget>,
+    mut blocked_by: Option<Target>,
     maximum_content_bytes: usize,
-) -> Vec<OperationRollbackFailure<H::Error>>
+) -> Vec<OperationRollbackFailure<H::Error, Target>>
 where
-    H: OperationHost,
+    H: OperationHost<Target>,
 {
     let mut failures = Vec::new();
     for applied_write in applied.iter().rev() {
