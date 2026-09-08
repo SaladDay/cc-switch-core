@@ -15,6 +15,8 @@ use crate::{
     source_fingerprint, SharedStoreError,
 };
 
+mod provider;
+
 /// Canonical ownership and native-snapshot table shared by CC Switch products.
 pub const MCP_NATIVE_LINKS_TABLE: &str = "mcp_native_links";
 
@@ -79,15 +81,24 @@ struct ExpectedMcpDatabaseState {
 pub struct McpTransactionGuard<'connection> {
     transaction: Transaction<'connection>,
     expected: ExpectedMcpDatabaseState,
+    expected_providers: Option<provider::ProviderFingerprints>,
     failed: bool,
 }
 
 impl<'connection> McpTransactionGuard<'connection> {
     /// Starts an immediate transaction and captures both MCP tables before any write.
     pub fn begin(connection: &'connection mut Connection) -> Result<Self, SharedStoreError> {
-        let mut transaction =
-            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::from_transaction(transaction)
+    }
+
+    fn from_transaction(
+        mut transaction: Transaction<'connection>,
+    ) -> Result<Self, SharedStoreError> {
         transaction.set_drop_behavior(DropBehavior::Rollback);
+        if transaction.is_autocommit() {
+            return Err(SharedStoreError::McpTransactionConflict);
+        }
         verify_mcp_server_write_contract(&transaction)?;
         verify_mcp_native_link_schema(&transaction)?;
         verify_delete_trigger(&transaction)?;
@@ -95,6 +106,7 @@ impl<'connection> McpTransactionGuard<'connection> {
         Ok(Self {
             transaction,
             expected,
+            expected_providers: None,
             failed: false,
         })
     }
@@ -312,22 +324,24 @@ impl<'connection> McpTransactionGuard<'connection> {
     }
 
     fn verify_commit(&self) -> Result<(), SharedStoreError> {
-        if self.failed {
+        if self.failed || self.transaction.is_autocommit() {
             return Err(SharedStoreError::McpTransactionConflict);
         }
         let actual = read_expected_database_state(&self.transaction)?;
-        (actual == self.expected)
-            .then_some(())
-            .ok_or(SharedStoreError::McpTransactionConflict)
+        if actual != self.expected {
+            return Err(SharedStoreError::McpTransactionConflict);
+        }
+        if let Some(expected) = &self.expected_providers {
+            if &provider::read_fingerprints(&self.transaction)? != expected {
+                return Err(SharedStoreError::McpTransactionConflict);
+            }
+        }
+        Ok(())
     }
 
     fn prepare_write(&mut self) -> Result<(), SharedStoreError> {
-        if self.failed {
-            return Err(SharedStoreError::McpTransactionConflict);
-        }
-        match read_expected_database_state(&self.transaction) {
-            Ok(actual) if actual == self.expected => Ok(()),
-            Ok(_) => self.poison(SharedStoreError::McpTransactionConflict),
+        match self.verify_commit() {
+            Ok(()) => Ok(()),
             Err(error) => self.poison(error),
         }
     }
@@ -912,6 +926,7 @@ mod tests {
     use super::*;
     use crate::{begin_immediate_transaction, ensure_mcp_server_schema, SharedDatabase};
 
+    mod composition;
     mod reading;
     mod recovery;
 
