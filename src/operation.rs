@@ -471,7 +471,7 @@ fn sha256(contents: &[u8]) -> String {
     encoded
 }
 
-fn valid_sha256(digest: &str) -> bool {
+pub(crate) fn valid_sha256(digest: &str) -> bool {
     digest.len() == 64
         && digest
             .bytes()
