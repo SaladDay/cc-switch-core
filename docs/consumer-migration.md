@@ -566,3 +566,17 @@ still chooses the document, entry ID, connection validation, encoding policy,
 size limit and write/rollback boundary. Existing document APIs keep their limits
 and behavior. This is a common codec bridge for desktop, CLI and Lite consumers,
 not a claim that their standalone MCP workflows have all migrated.
+
+### Catalog reads within an MCP transaction
+
+`McpTransactionGuard::read_servers` reads the complete current catalog without
+exposing the underlying connection. It uses the existing row mapping, binary
+name/ID order and host-field fingerprints; an ignored read error poisons commit.
+It does not reset the guard's original two-table verification baseline.
+
+The immediate caller is the next CLI import slice: merge host-parsed entries
+against fresh MCP rows instead of persisting a stale whole-product snapshot.
+Hosts retain same-ID policy, diagnostics, native observation and cache publication.
+Lite and the future full-product host can use this same read boundary without
+adopting CLI merge rules. This additive API alone does not migrate any consumer,
+change a schema or default, or establish native-file or full-product compatibility.

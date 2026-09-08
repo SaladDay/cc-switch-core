@@ -110,6 +110,16 @@ impl<'connection> McpTransactionGuard<'connection> {
         }
     }
 
+    /// Reads the current catalog in binary name/ID order, including this
+    /// transaction's writes. Rows retain fingerprints of all host-owned fields.
+    /// A read failure prevents commit even if the caller ignores the error.
+    pub fn read_servers(&mut self) -> Result<Vec<crate::McpServerRow>, SharedStoreError> {
+        match read_mcp_server_rows(&self.transaction) {
+            Ok(rows) => Ok(rows),
+            Err(error) => self.poison(error),
+        }
+    }
+
     /// Reads one native link from the guarded transaction.
     pub fn read_native_link(
         &mut self,
@@ -902,6 +912,7 @@ mod tests {
     use super::*;
     use crate::{begin_immediate_transaction, ensure_mcp_server_schema, SharedDatabase};
 
+    mod reading;
     mod recovery;
 
     fn initialized_database() -> (tempfile::TempDir, SharedDatabase) {
