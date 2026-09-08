@@ -65,9 +65,6 @@ fn entry_snapshots_reject_invalid_shapes_cross_target_and_unsupported_policies()
         .restore_native_entry_with_policy(&snapshot, &server, McpEntryEncodePolicy::Canonical)
         .is_err());
     assert!(McpConfigTarget::Claude
-        .restore_native_entry_with_policy(&snapshot, &server, McpEntryEncodePolicy::PreserveFields)
-        .is_err());
-    assert!(McpConfigTarget::Claude
         .restore_native_entry_with_policy(&snapshot, &Value::Null, McpEntryEncodePolicy::Canonical)
         .is_err());
 }

@@ -567,6 +567,34 @@ size limit and write/rollback boundary. Existing document APIs keep their limits
 and behavior. This is a common codec bridge for desktop, CLI and Lite consumers,
 not a claim that their standalone MCP workflows have all migrated.
 
+#### Claude field-preserving entry policy
+
+Claude's explicit `McpEntryEncodePolicy::PreserveFields` accepts an object and
+retains its fields and order without interpreting catalog wrappers or metadata.
+Snapshot restoration uses that encoding while retaining Core's existing rule:
+current managed connection fields replace the old connection, and captured native
+extensions take precedence over incoming extension values. The default canonical
+encoder and complete-document APIs keep their current filtering and validation.
+
+The immediate consumer is CLI's pending standalone Claude MCP toggle migration.
+Its current `claude_mcp::set_mcp_servers_map` unwraps one `server` layer and filters
+UI fields. A second, native `server` key inside that layer survives today. The
+host must keep that selection rule before calling Core, including on restoration;
+it must not repeat Core's snapshot merge to work around canonical filtering.
+This prerequisite does not migrate the CLI caller or its bulk replacement setter.
+CLI remains pinned to `6e28a2366351bde9e120be7e6a0a6ea9954f1040`; Lite remains
+pinned to `7b7cfae53d997d7dd686427c3537dd359e560fe7` and uses its existing defaults.
+
+The same field-preserving boundary is available to a future desktop host with
+rich native entries, independent of simple forms. Synthetic fixtures cover that
+contract, not full-product parity; no full-product source has been inspected.
+Paths, override migration, validation, catalog field selection, native publication
+and recovery remain host responsibilities. No schema, wire representation,
+dependency, MSRV or default changes belong to this slice. Adoption and its tests
+will update consumer pins; rollback restores the caller and pin together without
+a data migration. Local tests and fresh independent double review are required
+before this Core prerequisite is published.
+
 ### Catalog reads within an MCP transaction
 
 `McpTransactionGuard::read_servers` reads the complete current catalog without
