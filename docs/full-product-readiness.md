@@ -64,6 +64,10 @@ collection of product-specific flags. Keep current defaults unchanged. Add an
 option only for a demonstrated behavior difference and test it independently;
 reassess the abstraction if options merely preserve duplicate implementations.
 
+The [Skill deployment plan](skill-deployment-composition.md) applies this boundary
+to directory copies, links, native controls and cross-consumer ownership. Its
+gates must pass before claiming that CLI and Lite share the Skill write workflow.
+
 ## Four steps and their boundaries
 
 1. **Record compatibility requirements before extending an API.** For each slice,
